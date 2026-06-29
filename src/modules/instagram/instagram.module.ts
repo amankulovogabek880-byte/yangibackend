@@ -104,7 +104,7 @@ export class InstagramService {
   }
 
   async processWebhook(tenantId: string, body: any, signature?: string) {
-    if (body?.object !== 'instagram') return { ok: true };
+    if (body?.object !== 'instagram' && body?.object !== 'page') return { ok: true };
     // Meta signature verification (X-Hub-Signature-256)
     if (signature && process.env.NODE_ENV === 'production') {
       const config = await this.getConfig(tenantId);
@@ -120,6 +120,7 @@ export class InstagramService {
         } catch {}
       }
     }
+    this.logger.log('Instagram webhook received: ' + JSON.stringify(body).slice(0, 300));
     const entries: any[] = body?.entry || [];
     for (const entry of entries) {
       for (const event of (entry?.messaging || [])) {
