@@ -1,17 +1,18 @@
+
 {
   "name": "omoncrm-backend",
   "version": "4.0.0",
   "description": "TourCRM v4 - Production-grade Multi-Tenant SaaS CRM for Travel Agencies",
   "scripts": {
-    "build": "nest build",
-    "start": "nest start",
-    "start:dev": "nest start --watch",
+    "build": "npx nest build",
+    "start": "npx nest start",
+    "start:dev": "npx nest start --watch",
     "start:prod": "node dist/src/main",
     "db:push": "prisma db push",
     "db:seed": "ts-node prisma/seed.ts",
     "db:reset": "prisma db push --force-reset && npm run db:seed",
     "db:backup": "ts-node src/scripts/backup.ts",
-    "postinstall": "prisma generate && prisma db push --accept-data-loss",
+    "postinstall": "prisma generate",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
@@ -61,7 +62,8 @@
     "twilio": "^5.2.2",
     "ua-parser-js": "^1.0.38",
     "uuid": "^11.0.0",
-    "winston": "^3.14.2"
+    "winston": "^3.14.2",
+    "@nestjs/cli": "^10.4.4"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.4.4",
