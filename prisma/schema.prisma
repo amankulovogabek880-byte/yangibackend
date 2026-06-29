@@ -1,0 +1,1693 @@
+// TourCRM v3 — Production Schema
+// Travel agency CRM SaaS for Uzbekistan market
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ENUMS
+// ═══════════════════════════════════════════════════════════════
+
+enum Role {
+  PLATFORM_OWNER
+  TENANT_ADMIN
+  MANAGER
+  AGENT
+  ACCOUNTANT
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  LOCKED
+}
+
+enum TenantStatus {
+  ACTIVE
+  TRIAL
+  SUSPENDED
+}
+
+enum SubscriptionPlan {
+  FREE
+  STARTER
+  PROFESSIONAL
+  ENTERPRISE
+}
+
+enum ClientStatus {
+  ACTIVE
+  INACTIVE
+  BLACKLISTED
+}
+
+enum ClientTier {
+  REGULAR
+  SILVER
+  GOLD
+  VIP
+}
+
+enum LeadSource {
+  TELEGRAM
+  INSTAGRAM
+  WHATSAPP
+  REFERRAL
+  WALKIN
+  WEBSITE
+  CALL
+  FACEBOOK
+  GOOGLE_ADS
+  OTHER
+}
+
+enum Language {
+  UZ
+  RU
+  EN
+}
+
+// v8: Telefon provayder turlari
+enum PhoneProvider {
+  STUB         // simulyatsiya (demo uchun)
+  TEL_LINK     // tel: link (brauzerda telefon ochiladi - bepul, oddiy)
+  TWILIO       // Twilio (xalqaro, AQSh raqami)
+  ONLINEPBX    // OnlinePBX.uz (O'zbek raqami, recording + WebRTC)
+  MYATI        // MyAti.uz (alternativa)
+  CUSTOM_SIP   // Shaxsiy server (Asterisk / FreePBX / FusionPBX)
+}
+
+// v8: Lead taqsimlash strategiyasi
+enum LeadAssignmentStrategy {
+  MANUAL       // Qo'lda
+  ROUND_ROBIN  // Navbat bilan
+  LEAST_BUSY   // Eng kam bandi
+}
+
+enum Currency {
+  USD
+  UZS
+  EUR
+  RUB
+}
+
+// Kanban pipeline statuses
+enum PipelineStage {
+  NEW_LEAD
+  CONTACTED
+  INTERESTED
+  OFFER_SENT
+  NEGOTIATION
+  DEPOSIT_PAID
+  CONFIRMED
+  TRAVELING
+  COMPLETED
+  LOST
+}
+
+enum LostReason {
+  PRICE
+  TIMING
+  COMPETITOR
+  NOT_INTERESTED
+  NO_RESPONSE
+  OTHER
+}
+
+enum BookingStatus {
+  DRAFT
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum TourType {
+  PACKAGE
+  INDIVIDUAL
+  GROUP
+  VISA_SUPPORT
+  HOTEL_ONLY
+  FLIGHT_ONLY
+  CRUISE
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  CARD
+  PAYME
+  CLICK
+  UZUM
+  CRYPTO
+  OTHER
+}
+
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageType {
+  TEXT
+  PHOTO
+  DOCUMENT
+  VOICE
+  VIDEO
+  STICKER
+  LOCATION
+  CONTACT
+  FORWARD
+  SYSTEM
+}
+
+enum Channel {
+  TELEGRAM
+  WHATSAPP
+  INSTAGRAM
+  EMAIL
+  WEB
+  PHONE
+  MANUAL
+}
+
+enum CallDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum CallStatus {
+  QUEUED
+  INITIATED
+  RINGING
+  ANSWERED
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  NO_ANSWER
+  BUSY
+  MISSED
+  CANCELED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+enum NotificationType {
+  LEAD_ASSIGNED
+  LEAD_NEW
+  NEW_MESSAGE
+  TASK_DUE
+  TASK_ASSIGNED
+  FOLLOWUP_DUE
+  BOOKING_CREATED
+  BOOKING_UPDATED
+  PAYMENT_RECEIVED
+  CALL_MISSED
+  CALL_INCOMING
+  CALL_COMPLETED
+  STAGE_CHANGED
+  MENTION
+  SYSTEM
+  // ─── SECURITY (v4) ───
+  SECURITY_NEW_LOGIN
+  SECURITY_FAILED_LOGIN
+  SECURITY_2FA_ENABLED
+  SECURITY_PASSWORD_CHANGED
+  SECURITY_SUSPICIOUS_ACTIVITY
+  // ─── v9 ───
+  APPROVAL_REQUESTED
+  APPROVAL_APPROVED
+  APPROVAL_REJECTED
+  CLIENT_ASSIGNED
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  TELEGRAM
+  SMS
+}
+
+enum AuditAction {
+  CREATE
+  READ
+  UPDATE
+  DELETE
+  LOGIN
+  LOGOUT
+  EXPORT
+  IMPORT
+  STAGE_CHANGE
+  ASSIGN
+}
+
+enum DocumentCategory {
+  PASSPORT
+  VISA
+  TICKET
+  CONTRACT
+  INVOICE
+  RECEIPT
+  PHOTO
+  OTHER
+}
+
+enum KpiPeriod {
+  DAILY
+  WEEKLY
+  MONTHLY
+  QUARTERLY
+  YEARLY
+}
+
+enum KpiMetric {
+  REVENUE
+  BOOKINGS
+  NEW_CLIENTS
+  CONVERSIONS
+  CALLS
+  MESSAGES
+  TASKS_COMPLETED
+}
+
+enum AutomationTrigger {
+  LEAD_CREATED
+  STAGE_CHANGED
+  BOOKING_CREATED
+  PAYMENT_RECEIVED
+  NO_RESPONSE_24H
+  NO_RESPONSE_7D
+  TAG_ADDED
+  CALL_MISSED
+}
+
+enum AutomationAction {
+  ASSIGN_AGENT
+  SEND_NOTIFICATION
+  CREATE_TASK
+  CREATE_FOLLOWUP
+  SEND_TELEGRAM_MESSAGE
+  ADD_TAG
+  CHANGE_STAGE
+  SET_PRIORITY
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TENANT (Kompaniya)
+// ═══════════════════════════════════════════════════════════════
+
+model Tenant {
+  id        String           @id @default(cuid())
+  name      String
+  slug      String           @unique
+  status    TenantStatus     @default(TRIAL)
+  plan      SubscriptionPlan @default(FREE)
+  logoUrl   String?
+  brandColor String?         @default("#3d7eff")
+  timezone  String           @default("Asia/Tashkent")
+  locale    Language         @default(UZ)
+  currency  Currency         @default(USD)
+  settings  Json             @default("{}")
+
+  // v8: PHONE PROVIDER (Click2Call uchun)
+  phoneProvider     PhoneProvider @default(STUB)
+  phoneConfig       Json          @default("{}")
+
+  // v8: LEAD ASSIGNMENT
+  leadAssignmentStrategy LeadAssignmentStrategy @default(ROUND_ROBIN)
+
+  // v9: SOURCE-BASED ROUTING (manba bo'yicha agent tayinlash)
+  // Misol: { "WEBSITE": "user-id-1", "INSTAGRAM": "user-id-2", "TELEGRAM": "ROUND_ROBIN" }
+  sourceRouting Json?
+
+  // v8: COMMISSION (foiz)
+  agentCommissionPercent   Float @default(10) // Agent komissiyasi (% foydadan)
+  managerCommissionPercent Float @default(5)  // Manager komissiyasi (% foydadan)
+
+  // v9: KPI TIERS — komissiya pog'onalari (daromadga qarab foiz o'zgaradi)
+  // [{minRevenue: 0, maxRevenue: 2000, commissionPercent: 8}, ...]
+  kpiTiers Json @default("[{\"minRevenue\": 0, \"maxRevenue\": 2000, \"commissionPercent\": 8}, {\"minRevenue\": 2000, \"maxRevenue\": 4000, \"commissionPercent\": 10}, {\"minRevenue\": 4000, \"maxRevenue\": null, \"commissionPercent\": 12}]")
+
+  // Limits per plan
+  maxUsers     Int  @default(3)
+  maxClients   Int  @default(500)
+  maxBookings  Int  @default(50)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  expiresAt DateTime?
+
+  users         User[]
+  clients       Client[]
+  bookings      Booking[]
+  payments      Payment[]
+  invoices      Invoice[]
+  telegramAccts TelegramAccount[]
+  conversations Conversation[]
+  apiKeys       ApiKey[]
+  webhookLogs   WebhookLog[]
+  followUps     FollowUp[]
+  notifications Notification[]
+  calls         Call[]
+  kpis          Kpi[]
+  pipelines     Pipeline[]
+  tasks         Task[]
+  documents     Document[]
+  automations   Automation[]
+  autoReplyRules AutoReplyRule[] @relation("AutoReplyRules")
+  leadForms      LeadForm[]      @relation("LeadForms")
+  auditLogs     AuditLog[]
+  tags          Tag[]
+  customStages  CustomStage[]
+
+  @@index([status])
+  @@map("tenants")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// USER & AUTH
+// ═══════════════════════════════════════════════════════════════
+
+model User {
+  id           String     @id @default(cuid())
+  tenantId     String
+  tenant       Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  email        String
+  passwordHash String
+  name         String
+  role         Role       @default(AGENT)
+  status       UserStatus @default(ACTIVE)
+  phone        String?
+  telegramId   String?
+  avatarUrl    String?
+  language     Language   @default(UZ)
+  timezone     String     @default("Asia/Tashkent")
+
+  // v8: PHONE (Click2Call uchun)
+  callbackPhone String?    // Agent shaxsiy raqami (qo'ng'iroq qaytarish uchun)
+  extension     String?    // ATS ichki raqami (OnlinePBX: 101, 102...)
+
+  // Notification preferences
+  notifyInApp    Boolean @default(true)
+  notifyEmail    Boolean @default(true)
+  notifyTelegram Boolean @default(false)
+
+  // ─── SECURITY (v4) ───
+  twoFactorEnabled  Boolean   @default(false)
+  twoFactorSecret   String?   // encrypted
+  twoFactorBackup   String[]  // encrypted backup codes
+  failedLoginCount  Int       @default(0)
+  lockedUntil       DateTime?
+  passwordChangedAt DateTime  @default(now())
+  mustChangePassword Boolean  @default(false)
+  passwordResetToken String?
+  passwordResetExpires DateTime?
+
+  // Stats (denormalized for speed)
+  totalBookings     Int   @default(0)
+  totalRevenue      Float @default(0)
+  totalClients      Int   @default(0)
+  conversionRate    Float @default(0)
+
+  lastLoginAt  DateTime?
+  lastLoginIp  String?
+  lastSeenAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  assignedClients Client[]          @relation("AssignedAgent")
+  bookings        Booking[]         @relation("BookingAgent")
+  invoices        Invoice[]         @relation("InvoiceAgent")
+  telegramAccounts TelegramAccount[] @relation("UserTelegramAccount")
+  messages        Message[]
+  sessions        UserSession[]
+  followUps       FollowUp[]
+  notifications   Notification[]
+  calls           Call[]            @relation("CallAgent")
+  tasks           Task[]            @relation("TaskAssignee")
+  createdTasks    Task[]            @relation("TaskCreator")
+  auditLogs       AuditLog[]
+  documents       Document[]        @relation("DocumentUploader")
+  templates       MessageTemplate[]
+  kpis            Kpi[]             @relation("KpiAssignee")
+  stageHistory    StageHistory[]
+  loginAttempts   LoginAttempt[]
+  savedFilters    SavedFilter[]
+  checklistItems  BookingChecklist[]
+  agentCommissions   Commission[] @relation("AgentCommissions")
+  managerCommissions Commission[] @relation("ManagerCommissions")
+
+  // v9: Round-Robin lead taqsimlash uchun
+  lastAssignedAt  DateTime?         // Eng oxirgi marta lead tayinlangan vaqt
+
+  // v9: Advanced Round Robin (PAUSE + DAILY LIMIT)
+  isPausedFromAssignment Boolean @default(false) // Ta'til holatida
+  pausedReason      String?       // Nima uchun paused (kasal, ta'tilda, ...)
+  pausedUntil       DateTime?     // Qachagacha pause (null = indefinite)
+  dailyLeadLimit    Int @default(0) // 0 = cheksiz, 5 = 5 ta/kun
+
+  // v9: Approval Workflow
+  requestedApprovals  ApprovalRequest[] @relation("ApprovalRequester")
+  reviewedApprovals   ApprovalRequest[] @relation("ApprovalReviewer")
+
+  @@unique([tenantId, email])
+  @@index([tenantId, role, status])
+  @@map("users")
+}
+
+model UserSession {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash String @unique
+  userAgent    String?
+  ip           String?
+  // ─── SECURITY (v4) ───
+  deviceName   String?  // "Chrome on Windows", "iPhone Safari"
+  country      String?  // "UZ", "US"
+  city         String?
+  isCurrent    Boolean  @default(false)
+  lastActiveAt DateTime @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  revokedReason String?
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("user_sessions")
+}
+
+// Login attempts — brute force tracking
+model LoginAttempt {
+  id        String   @id @default(cuid())
+  email     String
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  ip        String?
+  userAgent String?
+  country   String?
+  success   Boolean
+  reason    String?  // 'wrong_password', 'wrong_email', 'locked', '2fa_failed', 'ok'
+  createdAt DateTime @default(now())
+
+  @@index([email, createdAt])
+  @@index([ip, createdAt])
+  @@map("login_attempts")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CLIENT (Customer)
+// ═══════════════════════════════════════════════════════════════
+
+model Client {
+  id              String       @id @default(cuid())
+  tenantId        String
+  tenant          Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  assignedAgentId String?
+  assignedAgent   User?        @relation("AssignedAgent", fields: [assignedAgentId], references: [id])
+
+  fullName         String
+  phone            String?
+  phone2           String?
+  email            String?
+  // ─── SENSITIVE (v4 encrypted via AES-256-GCM) ───
+  passportNo       String?   // encrypted at rest
+  passportExpiry   DateTime?
+  passportCountry  String?
+  dateOfBirth      DateTime?
+  nationality      String?
+  country          String?     // v5: davlat (mijoz qaysi davlatdan)
+  gender           String?
+  address          String?   // encrypted at rest
+  city             String?
+
+  language         Language     @default(UZ)
+  status           ClientStatus @default(ACTIVE)
+  tier             ClientTier   @default(REGULAR)
+  source           LeadSource   @default(OTHER)
+
+  // Lead scoring & tracking
+  leadScore        Int          @default(0)
+  utmSource        String?
+  utmMedium        String?
+  utmCampaign      String?
+  utmTerm          String?
+  utmContent       String?
+  sourceCampaign   String?
+  referrerUrl      String?
+
+  // Pipeline
+  pipelineStage    PipelineStage @default(NEW_LEAD)
+  pipelineStageAt  DateTime      @default(now())
+  lostReason       LostReason?
+
+  tags             String[]     @default([])
+  notes            String?
+  internalNotes    String?
+
+  // Channels
+  telegramId       String?
+  telegramUsername String?
+  instagramHandle  String?
+  whatsappPhone    String?
+
+  // Family
+  familyMembers    Json         @default("[]") // [{name, relation, dob, passport}]
+  preferences      Json         @default("{}") // {favoriteDestinations, dietaryRestrictions, etc}
+
+  // Stats (denormalized)
+  totalBookings    Int          @default(0)
+  totalRevenue     Float        @default(0)
+  totalSpent       Float        @default(0)
+  avgBookingValue  Float        @default(0)
+  lifetimeValue    Float        @default(0)
+
+  // Timestamps
+  firstContactAt   DateTime?    @default(now())
+  lastContactAt    DateTime?
+  lastBookingAt    DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  bookings      Booking[]
+  payments      Payment[]
+  invoices      Invoice[]
+  conversations Conversation[]
+  timeline      ClientTimeline[]
+  followUps     FollowUp[]
+  calls         Call[]
+  tasks         Task[]
+  documents     Document[]
+  stageHistory  StageHistory[]
+
+  @@index([tenantId, assignedAgentId])
+  @@index([tenantId, status])
+  @@index([tenantId, source])
+  @@index([tenantId, pipelineStage])
+  @@index([tenantId, tier])
+  @@index([phone])
+  @@unique([tenantId, phone])
+  @@index([email])
+  @@index([telegramId])
+  @@map("clients")
+}
+
+model ClientTimeline {
+  id          String   @id @default(cuid())
+  clientId    String
+  client      Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  userId      String?
+  type        String   // 'created', 'call', 'message', 'booking', 'payment', 'stage_change', 'note', 'task', 'document'
+  title       String
+  description String?
+  metadata    Json     @default("{}")
+  createdAt   DateTime @default(now())
+
+  @@index([clientId, createdAt])
+  @@map("client_timeline")
+}
+
+model StageHistory {
+  id         String        @id @default(cuid())
+  clientId   String
+  client     Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  userId     String?
+  user       User?         @relation(fields: [userId], references: [id])
+  fromStage  PipelineStage?
+  toStage    PipelineStage
+  note       String?
+  durationMs BigInt?       // Vaqt avvalgi stage'da o'tkazgan
+  createdAt  DateTime      @default(now())
+
+  @@index([clientId, createdAt])
+  @@map("stage_history")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PIPELINE (Custom Kanban)
+// ═══════════════════════════════════════════════════════════════
+
+model Pipeline {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  stages CustomStage[]
+
+  @@index([tenantId])
+  @@map("pipelines")
+}
+
+model CustomStage {
+  id         String   @id @default(cuid())
+  pipelineId String
+  pipeline   Pipeline @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  tenantId   String
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name       String
+  color      String   @default("#3d7eff")
+  order      Int      @default(0)
+  isClosing  Boolean  @default(false)
+  isLost     Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([pipelineId, order])
+  @@map("custom_stages")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// BOOKING
+// ═══════════════════════════════════════════════════════════════
+
+model Booking {
+  id            String        @id @default(cuid())
+  bookingRef    String        @unique
+  tenantId      String
+  tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clientId      String
+  client        Client        @relation(fields: [clientId], references: [id])
+  agentId       String?
+  agent         User?         @relation("BookingAgent", fields: [agentId], references: [id])
+  tourName      String
+  destination   String
+  country       String?
+  tourType      TourType      @default(PACKAGE)
+  description   String?
+
+  departureDate DateTime?
+  returnDate    DateTime?
+  duration      Int?
+
+  adults        Int           @default(1)
+  children      Int           @default(0)
+  infants       Int           @default(0)
+
+  totalPrice    Float          // Sale Price (mijoz to'laydigan)
+  currency      Currency      @default(USD)
+  paidAmount    Float         @default(0)
+  discount      Float         @default(0)
+  commissionPercent Float         @default(0)  // % komissiya (Commission model ham bor)
+  profit        Float         @default(0)  // Auto: totalPrice - supplierCost - discount
+  commissionAmount Float        @default(0)  // Agent komissiya summasi
+
+  status        BookingStatus @default(DRAFT)
+  statusHistory Json          @default("[]")
+
+  // Included services
+  includesVisa    Boolean @default(false)
+  includesFlights Boolean @default(false)
+  includesHotel   Boolean @default(false)
+  includesMeals   Boolean @default(false)
+  includesTransfer Boolean @default(false)
+  includesInsurance Boolean @default(false)
+
+  // ── HOTEL ──
+  hotelName    String?
+  hotelCity    String?
+  hotelStars   Int?
+  hotelCheckIn  DateTime?
+  hotelCheckOut DateTime?
+  mealPlan     String?
+  roomType     String?
+  hotelAddress String?
+
+  // ── FLIGHT (Borish) ──
+  airline         String?
+  flightNumber    String?
+  departureAirport String?
+  arrivalAirport   String?
+  departureTime    DateTime?
+  arrivalTime      DateTime?
+  flightClass      String?    // economy/business/first
+  pnr              String?
+
+  // ── FLIGHT (Qaytish) ──
+  returnAirline       String?
+  returnFlightNumber  String?
+  returnDepartureTime DateTime?
+  returnArrivalTime   DateTime?
+  returnPnr           String?
+
+  // ── TAXI / TRANSFER ──
+  taxiPickupAddress  String?
+  taxiDropoffAddress String?
+  taxiPickupTime     DateTime?
+  taxiDriverName     String?
+  taxiDriverPhone    String?
+  taxiCompany        String?
+
+  // ── INSURANCE ──
+  insuranceCompany String?
+  insurancePolicyNo String?
+  insuranceStartDate DateTime?
+  insuranceEndDate   DateTime?
+  insuranceCoverage  String?
+
+  // ── VISA ──
+  visaStatus      String?    // pending, approved, rejected, not_required
+  visaType        String?
+  visaNumber      String?
+  visaIssueDate   DateTime?
+  visaExpiryDate  DateTime?
+
+  // ── SUPPLIER (Provider) — FAQAT AGENT VA ADMIN KO'RADI ──
+  supplierName    String?
+  supplierContact String?    // telefon, email
+  supplierCost    Float?     // Provider Cost
+  supplierRef     String?    // Supplier booking reference
+  supplierPaid    Float      @default(0)  // Supplierga to'langan summa
+  supplierNotes   String?
+
+  notes        String?
+  cancelReason String?
+  internalNotes String?      // Faqat agent ko'radi
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  payments  Payment[]
+  tasks     Task[]
+  documents Document[]
+  calls     Call[]
+  invoices  Invoice[]
+  checklist BookingChecklist[]
+  commission Commission?
+  passengers Passenger[]            // v9: Bir nechta yo'lovchi
+  services   BookingService[]       // v9: Xizmatlar (taxi, insurance, ...)
+
+  @@index([tenantId, status])
+  @@index([tenantId, agentId])
+  @@index([tenantId, clientId])
+  @@index([tenantId, departureDate])
+  @@index([tenantId, createdAt])
+  @@map("bookings")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// INVOICE (v5)
+// ═══════════════════════════════════════════════════════════════
+
+model Invoice {
+  id              String        @id @default(cuid())
+  tenantId        String
+  tenant          Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoiceNumber   String        // INV-2026-0001
+  bookingId       String
+  booking         Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  clientId        String
+  client          Client        @relation(fields: [clientId], references: [id])
+  agentId         String?
+  agent           User?         @relation("InvoiceAgent", fields: [agentId], references: [id])
+
+  // ── Moliyaviy ma'lumotlar ──
+  providerCost    Float         @default(0)  // Faqat agent/admin ko'radi
+  salePrice       Float                       // Mijozga sotilgan narx
+  discount        Float         @default(0)
+  taxAmount       Float         @default(0)
+  totalAmount     Float                       // Yakuniy summa
+  paidAmount      Float         @default(0)
+  profit          Float         @default(0)  // salePrice - providerCost - discount
+  currency        Currency      @default(USD)
+
+  // ── Status ──
+  status          InvoiceStatus @default(DRAFT)
+  issuedAt        DateTime      @default(now())
+  dueDate         DateTime?
+  paidAt          DateTime?
+
+  // ── Mijoz uchun ko'rinadigan ──
+  items           Json          @default("[]")  // [{name, qty, price, total}]
+  notes           String?
+
+  // ── Internal (faqat agent ko'radi) ──
+  internalNotes   String?
+
+  // ── PDF ──
+  pdfUrl          String?
+  pdfGeneratedAt  DateTime?
+
+  // ── Telegram orqali yuborilganmi? ──
+  sentViaTelegram Boolean       @default(false)
+  sentAt          DateTime?
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@unique([tenantId, invoiceNumber])
+  @@index([tenantId, status])
+  @@index([bookingId])
+  @@index([clientId])
+  @@map("invoices")
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  SENT
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  CANCELLED
+  REFUNDED
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PAYMENT
+// ═══════════════════════════════════════════════════════════════
+
+model Payment {
+  id           String        @id @default(cuid())
+  tenantId     String
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  bookingId    String
+  booking      Booking       @relation(fields: [bookingId], references: [id])
+  clientId     String
+  client       Client        @relation(fields: [clientId], references: [id])
+
+  amount       Float
+  currency     Currency      @default(USD)
+  uzsRate      Float?
+  method       PaymentMethod @default(CASH)
+  status       PaymentStatus @default(COMPLETED)
+  externalRef  String?
+  receiptUrl   String?
+  note         String?
+
+  paidAt       DateTime      @default(now())
+  createdAt    DateTime      @default(now())
+
+  @@index([tenantId, status])
+  @@index([bookingId])
+  @@index([tenantId, paidAt])
+  @@map("payments")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// COMMUNICATION (Telegram, WhatsApp, Email, etc.)
+// ═══════════════════════════════════════════════════════════════
+
+model TelegramAccount {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // ── v5: Agent personal account (NULL = tenant-wide bot, admin tomonidan ulangan) ──
+  userId      String?
+  user        User?    @relation("UserTelegramAccount", fields: [userId], references: [id], onDelete: Cascade)
+
+  name        String
+  channel     Channel  @default(TELEGRAM)
+  // Bot ulanishi (admin tomonidan, ko'p odamga xizmat qiladi)
+  botToken    String?
+  botUsername String?
+  // Agentning shaxsiy accounti (user-API)
+  isPersonal  Boolean  @default(false)
+  phoneNumber String?  // Agentning Telegram raqami
+  apiId       String?
+  apiHash     String?  // shifrlangan
+  sessionData String?  // shifrlangan
+  isActive    Boolean  @default(true)
+  config      Json     @default("{}")
+  createdAt   DateTime @default(now())
+
+  conversations Conversation[]
+
+  @@index([tenantId])
+  @@index([userId])
+  @@map("telegram_accounts")
+}
+
+model Conversation {
+  id              String           @id @default(cuid())
+  tenantId        String
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  accountId       String?
+  account         TelegramAccount? @relation(fields: [accountId], references: [id])
+  clientId        String?
+  client          Client?          @relation(fields: [clientId], references: [id])
+  assignedAgentId String?
+
+  channel         Channel          @default(TELEGRAM)
+  externalChatId  String           // Telegram chat_id, Instagram thread_id, etc.
+  externalUserId  String?
+  firstName       String?
+  lastName        String?
+  username        String?
+  avatarUrl       String?
+  startPayload    String?
+
+  isResolved      Boolean          @default(false)
+  isPinned        Boolean          @default(false)
+  isMuted         Boolean          @default(false)
+  unreadCount     Int              @default(0)
+  lastMessageAt   DateTime?
+  lastMessageText String?
+  lastMessageType MessageType?
+
+  tags            String[]         @default([])
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  messages Message[]
+
+  @@unique([tenantId, channel, externalChatId])
+  @@index([tenantId, isResolved])
+  @@index([tenantId, assignedAgentId])
+  @@index([tenantId, lastMessageAt])
+  @@map("conversations")
+}
+
+model Message {
+  id             String           @id @default(cuid())
+  conversationId String
+  conversation   Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  agentId        String?
+  agent          User?            @relation(fields: [agentId], references: [id])
+  externalMsgId  String?
+  direction      MessageDirection
+  messageType    MessageType      @default(TEXT)
+  text           String?          @db.Text
+  fileUrl        String?
+  fileMimeType   String?
+  fileSize       Int?
+  thumbnailUrl   String?
+  duration       Int?             // for voice/video
+  caption        String?
+  replyToId      String?
+  forwardedFrom  String?
+  isInternal     Boolean          @default(false)
+  isRead         Boolean          @default(false)
+  isDelivered    Boolean          @default(false)
+  isFailed       Boolean          @default(false)
+  errorMessage   String?
+  createdAt      DateTime         @default(now())
+
+  @@index([conversationId, createdAt])
+  @@index([externalMsgId])
+  @@map("messages")
+}
+
+model MessageTemplate {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  name      String
+  text      String   @db.Text
+  language  Language @default(RU)
+  category  String?
+  // ── v5: Rich content (template'ga rasm, pdf, fayl qo'shish) ──
+  mediaUrl     String?     // asosiy media URL
+  mediaType    String?     // 'image', 'pdf', 'document', 'video'
+  mediaCaption String?
+  attachments  Json     @default("[]")  // [{url, type, name, size}]
+  isActive  Boolean  @default(true)
+  useCount  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, userId])
+  @@map("message_templates")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CALLS
+// ═══════════════════════════════════════════════════════════════
+
+model Call {
+  id           String        @id @default(cuid())
+  tenantId     String
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clientId     String?
+  client       Client?       @relation(fields: [clientId], references: [id])
+  bookingId    String?
+  booking      Booking?      @relation(fields: [bookingId], references: [id])
+  agentId      String?
+  agent        User?         @relation("CallAgent", fields: [agentId], references: [id])
+
+  direction    CallDirection
+  status       CallStatus    @default(QUEUED)
+  providerCallId String?     // Twilio CallSid
+  fromMasked   String?       // Masked number shown to agent
+  toMasked     String?
+  fromRaw      String?       // Encrypted real number
+  toRaw        String?       // Encrypted real number
+  duration     Int           @default(0)  // seconds
+  recordingUrl String?
+  transcript   String?       @db.Text
+  notes        String?
+  startedAt    DateTime?
+  answeredAt   DateTime?
+  endedAt      DateTime?
+  createdAt    DateTime      @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([clientId])
+  @@index([agentId, createdAt])
+  @@map("calls")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TASKS & FOLLOW-UPS
+// ═══════════════════════════════════════════════════════════════
+
+model Task {
+  id          String       @id @default(cuid())
+  tenantId    String
+  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  creatorId   String
+  creator     User         @relation("TaskCreator", fields: [creatorId], references: [id])
+  assigneeId  String
+  assignee    User         @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  clientId    String?
+  client      Client?      @relation(fields: [clientId], references: [id])
+  bookingId   String?
+  booking     Booking?     @relation(fields: [bookingId], references: [id])
+
+  title       String
+  description String?      @db.Text
+  status      TaskStatus   @default(TODO)
+  priority    TaskPriority @default(MEDIUM)
+  dueAt       DateTime?
+  completedAt DateTime?
+
+  // Recurring
+  recurrence  String?      // cron expression
+  parentId    String?
+
+  tags        String[]     @default([])
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([tenantId, assigneeId, status])
+  @@index([dueAt, status])
+  @@map("tasks")
+}
+
+model FollowUp {
+  id          String    @id @default(cuid())
+  tenantId    String
+  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agentId     String
+  agent       User      @relation(fields: [agentId], references: [id])
+  clientId    String?
+  client      Client?   @relation(fields: [clientId], references: [id])
+  title       String
+  note        String?   @db.Text
+  dueAt       DateTime
+  done        Boolean   @default(false)
+  doneAt      DateTime?
+  notifiedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([tenantId, agentId, done])
+  @@index([dueAt, done, notifiedAt])
+  @@map("followups")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DOCUMENTS
+// ═══════════════════════════════════════════════════════════════
+
+model Document {
+  id           String           @id @default(cuid())
+  tenantId     String
+  tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  uploadedById String
+  uploadedBy   User             @relation("DocumentUploader", fields: [uploadedById], references: [id])
+  clientId     String?
+  client       Client?          @relation(fields: [clientId], references: [id])
+  bookingId    String?
+  booking      Booking?         @relation(fields: [bookingId], references: [id])
+
+  name         String
+  category     DocumentCategory @default(OTHER)
+  fileName     String
+  fileUrl      String
+  fileMimeType String
+  fileSize     Int
+  description  String?
+
+  // For passports/visas
+  expiresAt    DateTime?
+  documentNo   String?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([tenantId, clientId])
+  @@index([tenantId, bookingId])
+  @@index([tenantId, category])
+  @@map("documents")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NOTIFICATIONS
+// ═══════════════════════════════════════════════════════════════
+
+model Notification {
+  id        String           @id @default(cuid())
+  tenantId  String
+  tenant    Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String?          @db.Text
+  link      String?
+  metadata  Json             @default("{}")
+  isRead    Boolean          @default(false)
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EMAIL LOG (v4) — har email yuborilishi log qilinadi
+// ═══════════════════════════════════════════════════════════════
+
+model EmailLog {
+  id          String     @id @default(cuid())
+  tenantId    String?
+  toEmail     String
+  toName      String?
+  subject     String
+  templateId  String?
+  status      EmailStatus @default(QUEUED)
+  errorMessage String?
+  providerMsgId String?
+  metadata    Json       @default("{}")
+  sentAt      DateTime?
+  createdAt   DateTime   @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([toEmail])
+  @@map("email_logs")
+}
+
+enum EmailStatus {
+  QUEUED
+  SENT
+  FAILED
+  BOUNCED
+  DELIVERED
+  OPENED
+}
+
+// ═══════════════════════════════════════════════════════════════
+// API KEYS (Public lead import, integrations)
+// ═══════════════════════════════════════════════════════════════
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  tenantId   String
+  tenant     Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name       String
+  keyHash    String    @unique
+  prefix     String
+  scopes     String[]  @default(["leads:write"])
+  isActive   Boolean   @default(true)
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([tenantId])
+  @@map("api_keys")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AUTOMATION (Workflow Builder)
+// ═══════════════════════════════════════════════════════════════
+
+model Automation {
+  id         String            @id @default(cuid())
+  tenantId   String
+  tenant     Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name       String
+  trigger    AutomationTrigger
+  conditions Json              @default("{}")
+  actions    Json              @default("[]") // [{type: AutomationAction, params: {}}]
+  isActive   Boolean           @default(true)
+  runCount   Int               @default(0)
+  lastRunAt  DateTime?
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+
+  @@index([tenantId, trigger, isActive])
+  @@map("automations")
+}
+
+// v9: AUTO-REPLY (Avtomatik javob qoidalari)
+model AutoReplyRule {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation("AutoReplyRules", fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  name        String   // "Telegram xush kelibsiz", va h.k.
+  source      String?  // "TELEGRAM" | "INSTAGRAM" | "WHATSAPP" | "EMAIL" | null (barchasi)
+  channel     String   // "TELEGRAM" | "EMAIL"
+  template    String   // Matn + {{placeholders}}
+  delayMs     Int      @default(0) // 0 = darhol, 3000 = 3 sekunddan keyin
+  isActive    Boolean  @default(true)
+  
+  triggerCount Int     @default(0) // Necha marta ishladi
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  
+  @@index([tenantId, isActive])
+  @@map("auto_reply_rules")
+}
+
+// v9: LEAD FORMS (Web form builder)
+model LeadForm {
+  id          String    @id @default(cuid())
+  tenantId    String
+  tenant      Tenant    @relation("LeadForms", fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  name        String    // "Tur buyurtma formi", "Konsultatsiya"
+  slug        String    // URL-friendly: "tour-booking"
+  description String?   // Form haqida
+  fields      Json      // [{id, name, label, type, required, placeholder, options}]
+  theme       Json      @default("{\"primaryColor\":\"#3d7eff\"}") // Design settings
+  successMsg  String    @default("Rahmat! Tez orada javob beramiz")
+  redirectUrl String?   // Form submit keyin redirect
+  isActive    Boolean   @default(true)
+  
+  submitCount Int       @default(0)
+  lastSubmitAt DateTime?
+  
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  submissions LeadFormSubmission[] @relation("FormSubmissions")
+
+  @@unique([tenantId, slug])
+  @@index([tenantId, isActive])
+  @@map("lead_forms")
+}
+
+// v9: LEAD FORM SUBMISSIONS
+model LeadFormSubmission {
+  id        String   @id @default(cuid())
+  formId    String
+  form      LeadForm @relation("FormSubmissions", fields: [formId], references: [id], onDelete: Cascade)
+  tenantId  String
+  
+  data      Json     // Form javoblar: {field: value}
+  email     String?
+  phone     String?
+  
+  createdAt DateTime @default(now())
+  
+  @@index([formId, tenantId])
+  @@map("lead_form_submissions")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// KPI
+// ═══════════════════════════════════════════════════════════════
+
+model Kpi {
+  id        String    @id @default(cuid())
+  tenantId  String
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId    String?
+  user      User?     @relation("KpiAssignee", fields: [userId], references: [id])
+  metric    KpiMetric
+  period    KpiPeriod @default(MONTHLY)
+  target    Float
+  bonus     Float?
+  startDate DateTime
+  endDate   DateTime
+  notes     String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([tenantId, userId])
+  @@index([tenantId, startDate, endDate])
+  @@map("kpis")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MARKETPLACE (Tour Packages)
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+// TAGS (Shared per tenant)
+// ═══════════════════════════════════════════════════════════════
+
+model Tag {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  color     String   @default("#64748b")
+  category  String?  // 'client', 'booking', 'conversation'
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, name])
+  @@index([tenantId, category])
+  @@map("tags")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AUDIT LOG
+// ═══════════════════════════════════════════════════════════════
+
+model AuditLog {
+  id        String      @id @default(cuid())
+  tenantId  String?
+  tenant    Tenant?     @relation(fields: [tenantId], references: [id])
+  userId    String?
+  user      User?       @relation(fields: [userId], references: [id])
+  action    AuditAction
+  entity    String      // 'client', 'booking', etc.
+  entityId  String?
+  changes   Json?       @default("{}") // before/after
+  metadata  Json        @default("{}")
+  ip        String?
+  userAgent String?
+  createdAt DateTime    @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([userId, createdAt])
+  @@index([entity, entityId])
+  @@map("audit_logs")
+}
+
+// ─── v8: BOOKING CHECKLIST ───
+// Har booking uchun: Passport, Visa, Insurance, Ticket, va h.k.
+model BookingChecklist {
+  id        String   @id @default(cuid())
+  tenantId  String
+  bookingId String
+  booking   Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  item      String   // Passport, Visa, Hotel voucher, ...
+  isDone    Boolean  @default(false)
+  doneAt    DateTime?
+  doneById  String?
+  doneBy    User?    @relation(fields: [doneById], references: [id])
+  notes     String?
+  sortOrder Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([bookingId])
+  @@map("booking_checklists")
+}
+
+// ─── v8: SAVED FILTERS ───
+// Foydalanuvchi o'z filterlarini saqlab qo'yadi
+model SavedFilter {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name      String   // "Hot Leads", "VIP Clients", ...
+  resource  String   // 'clients', 'bookings', 'invoices'
+  filters   Json     // filter parametrlari
+  isPinned  Boolean  @default(false) // Sidebar'da ko'rinadi
+  sortOrder Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, resource])
+  @@map("saved_filters")
+}
+
+// ─── v8: COMMISSION ───
+// Booking yopilganda agent va manager komissiyalari
+model Commission {
+  id          String   @id @default(cuid())
+  tenantId    String
+  bookingId   String   @unique
+  booking     Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  agentId     String
+  agent       User     @relation("AgentCommissions", fields: [agentId], references: [id])
+  managerId   String?
+  manager     User?    @relation("ManagerCommissions", fields: [managerId], references: [id])
+
+  totalProfit       Float  // Booking foydasi
+  agentPercent      Float  // % (Tenant.agentCommissionPercent dan)
+  managerPercent    Float  // % (Tenant.managerCommissionPercent dan)
+  agentAmount       Float  // $ agent oladi
+  managerAmount     Float  // $ manager oladi
+  companyAmount     Float  // $ kompaniyaga qoladi
+
+  isPaid      Boolean  @default(false)
+  paidAt      DateTime?
+  notes       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agentId, createdAt])
+  @@index([tenantId, createdAt])
+  @@map("commissions")
+}
+
+// ═══════════════════════════════════════════════════════════
+// v9: PASSENGER MANAGEMENT
+// Bir nechta yo'lovchi (oilam, do'stlar) bitta booking ichida
+// ═══════════════════════════════════════════════════════════
+model Passenger {
+  id           String   @id @default(cuid())
+  tenantId     String
+  bookingId    String
+  booking      Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  // Shaxsiy ma'lumotlar
+  fullName     String
+  dateOfBirth  DateTime?
+  gender       String?    // male/female/other
+  passengerType PassengerType @default(ADULT)
+
+  // Passport
+  passportNo       String?
+  passportCountry  String?
+  passportExpiry   DateTime?
+  nationality      String?
+
+  // Aloqa
+  phone        String?
+  email        String?
+
+  // Maxsus xizmatlar
+  mealPreference  String?    // vegetarian, halal, kosher, etc.
+  seatPreference  String?    // window, aisle, etc.
+  specialRequest  String?    @db.Text
+
+  // Xarajat
+  pricePerPerson Float?      // Bu yo'lovchi uchun alohida narx (ixtiyoriy)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([bookingId])
+  @@index([tenantId])
+  @@map("passengers")
+}
+
+enum PassengerType {
+  ADULT
+  CHILD
+  INFANT
+  SENIOR
+}
+
+// ═══════════════════════════════════════════════════════════
+// v9: APPROVAL WORKFLOW
+// Chegirma, refund, muhim o'zgarishlar — admin/manager tasdiqi
+// ═══════════════════════════════════════════════════════════
+model ApprovalRequest {
+  id           String        @id @default(cuid())
+  tenantId     String
+
+  // Kim so'ragan
+  requesterId  String
+  requester    User          @relation("ApprovalRequester", fields: [requesterId], references: [id])
+
+  // Kim tasdiqlagan (yoki rad etgan)
+  reviewerId   String?
+  reviewer     User?         @relation("ApprovalReviewer", fields: [reviewerId], references: [id])
+
+  type         ApprovalType
+  status       ApprovalStatus @default(PENDING)
+
+  // Bog'liq entity (Booking, Payment, Client, ...)
+  entityType   String         // 'booking' | 'payment' | 'client' | 'invoice'
+  entityId     String
+
+  // Tafsilotlar
+  title        String
+  reason       String?        @db.Text
+  oldValue     Json?          // Eski qiymat (JSON snapshot)
+  newValue     Json?          // Yangi qiymat (JSON snapshot)
+  amount       Float?         // Pul miqdori (chegirma/refund summasi)
+
+  // Tasdiq/Rad
+  reviewNote   String?        @db.Text
+  reviewedAt   DateTime?
+
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  @@index([tenantId, status])
+  @@index([requesterId])
+  @@index([entityType, entityId])
+  @@map("approval_requests")
+}
+
+enum ApprovalType {
+  DISCOUNT          // Chegirma
+  REFUND            // Pul qaytarish
+  PRICE_CHANGE      // Narx o'zgarishi
+  BOOKING_CANCEL    // Booking bekor qilish
+  PAYMENT_DELETE    // To'lov o'chirish
+  COMMISSION_OVERRIDE // Komissiya foizini o'zgartirish
+  OTHER
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+// ═══════════════════════════════════════════════════════════
+// v9: BOOKING SERVICES
+// Bir bookingda bir nechta xizmat (taxi, insurance, visa, sim, ...)
+// Har biri o'z narxi, sanasi, statusi bilan
+// ═══════════════════════════════════════════════════════════
+model BookingService {
+  id           String   @id @default(cuid())
+  tenantId     String
+  bookingId    String
+  booking      Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  type         ServiceType
+  name         String              // "Aeroport → Hotel taxi"
+  description  String?  @db.Text   // To'liq tafsilot
+
+  // Joylar va vaqt (taxi, transfer kabi)
+  fromLocation String?             // "Airport"
+  toLocation   String?             // "Hilton Hotel"
+  date         DateTime?           // "15 July"
+  time         String?             // "22:00"
+
+  // Pul va miqdor
+  price        Float              // Bitta xizmat narxi
+  quantity     Int      @default(1) // Necha ta
+  totalAmount  Float              // price * quantity
+
+  status       ServiceStatus @default(PENDING)
+  notes        String?  @db.Text   // Qo'shimcha izoh
+
+  // Tegishli provayder
+  providerName String?
+  providerPhone String?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([bookingId])
+  @@index([tenantId, type])
+  @@map("booking_services")
+}
+
+enum ServiceType {
+  TAXI
+  TRANSFER
+  INSURANCE
+  VISA
+  SIM_CARD
+  VIP_MEET
+  GUIDE
+  HOTEL_UPGRADE
+  TOUR_GUIDE
+  EXCURSION
+  RESTAURANT
+  OTHER
+}
+
+enum ServiceStatus {
+  PENDING       // Kutilmoqda
+  CONFIRMED     // Tasdiqlangan
+  COMPLETED     // Bajarilgan
+  CANCELLED     // Bekor qilingan
+}
+
+// ═══════════════════════════════════════════════════════════
+// v9-FINAL: WEBHOOK LOGS (Audit Trail)
+// Har bir public API so'rov shu yerda yoziladi
+// ═══════════════════════════════════════════════════════════
+model WebhookLog {
+  id            String   @id @default(cuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Qaysi API key ishlatildi (yo'q bo'lsa null - noma'lum key)
+  apiKeyId      String?
+  apiKeyPrefix  String?  // ko'rsatish uchun (omon_abc...)
+  apiKeyName    String?  // ko'rsatish uchun
+
+  // So'rov tafsilotlari
+  endpoint      String   // /public/leads/...
+  method        String   @default("POST")
+  requestBody   Json?    // To'liq body
+  responseBody  Json?    // Backend javobi
+  statusCode    Int      @default(200)
+  success       Boolean  @default(false)
+  errorMessage  String?  @db.Text
+
+  // Natija (agar lead yaratilgan bo'lsa)
+  clientId      String?  // yaratilgan/topilgan klient
+
+  // Metadata
+  ip            String?
+  userAgent     String?  @db.Text
+  duration      Int?     // ms
+
+  createdAt     DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, success])
+  @@index([apiKeyId])
+  @@map("webhook_logs")
+}

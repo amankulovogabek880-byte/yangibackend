@@ -1,0 +1,1559 @@
+import {
+  Module, Injectable, Controller, Get, Post, Body, Param, Query, UseGuards, NotFoundException, Res, Logger } from '@nestjs/common';
+import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
+import { PrismaService } from '../../prisma/prisma.service';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { RolesGuard } from '../../common/guards/roles.guard';
+import { CurrentUser, Roles } from '../../common/decorators';
+
+@Injectable()
+export class ReportsService {
+  private readonly logger = new Logger('Reports');
+  constructor(private prisma: PrismaService) {}
+
+  // ── SAFE VALUE HELPERS ──
+
+  // ═══════════════════════════════════════════════════════════════
+  // KALENDAR HISOBOTI — kunlik va oraliq
+  // ═══════════════════════════════════════════════════════════════
+  async calendarReport(tenantId: string, userId: string, role: string, date?: string, from?: string, to?: string) {
+    const agentFilter: any       = role === 'AGENT' ? { agentId: userId } : {};
+    const clientAgentFilter: any = role === 'AGENT' ? { assignedAgentId: userId } : {};
+
+    let start: Date, end: Date, isSingleDay: boolean;
+    if (date) {
+      const [y, m, d] = date.split('-').map(Number);
+      start = new Date(y, m - 1, d, 0, 0, 0);
+      end   = new Date(y, m - 1, d, 23, 59, 59);
+      isSingleDay = true;
+    } else if (from && to) {
+      const [fy, fm, fd] = from.split('-').map(Number);
+      const [ty, tm, td] = to.split('-').map(Number);
+      start = new Date(fy, fm - 1, fd, 0, 0, 0);
+      end   = new Date(ty, tm - 1, td, 23, 59, 59);
+      isSingleDay = false;
+    } else {
+      const n = new Date();
+      start = new Date(n.getFullYear(), n.getMonth(), n.getDate());
+      end   = new Date(n.getFullYear(), n.getMonth(), n.getDate(), 23, 59, 59);
+      isSingleDay = true;
+    }
+    const df = { gte: start, lte: end };
+
+    const [leads, bookings, payments] = await Promise.all([
+      (this.prisma as any).client.findMany({
+        where: { tenantId, ...clientAgentFilter, createdAt: df },
+        select: { id: true, fullName: true, phone: true, source: true, pipelineStage: true, createdAt: true, assignedAgent: { select: { name: true } } },
+        orderBy: { createdAt: 'asc' },
+      }),
+      (this.prisma as any).booking.findMany({
+        where: { tenantId, ...agentFilter, createdAt: df },
+        include: { client: { select: { fullName: true } }, agent: { select: { name: true } } },
+        orderBy: { createdAt: 'desc' },
+      }),
+      (this.prisma as any).payment.findMany({
+        where: { tenantId, paidAt: df },
+        select: { amount: true, currency: true, method: true, paidAt: true },
+      }),
+    ]);
+
+    const confirmed = bookings.filter((b: any) => ['CONFIRMED','COMPLETED'].includes(b.status));
+    const stats = {
+      revenue: confirmed.reduce((s: number, b: any) => s + (b.totalPrice || 0), 0),
+      profit:  confirmed.reduce((s: number, b: any) => s + (b.profit || 0), 0),
+      paid:    payments.reduce((s: number, p: any) => s + (p.amount || 0), 0),
+      newLeads: leads.length,
+      newClients: leads.length,
+      bookingsCount: bookings.length,
+      confirmedBookings: confirmed.length,
+    };
+
+    // Timeline
+    const [tlRows] = await Promise.all([
+      (this.prisma as any).clientTimeline.findMany({ where: { createdAt: df }, orderBy: { createdAt: 'asc' }, take: 200 }).catch(() => []),
+    ]);
+    const payEvents = payments.map((p: any) => ({ type: 'payment', title: `💰 To\'lov: ${p.currency} ${p.amount}`, createdAt: p.paidAt, metadata: { method: p.method } }));
+    const bkEvents  = bookings.map((b: any) => ({ type: 'booking', title: `✈️ Booking: ${b.client?.fullName || ''} — ${b.tourName}`, createdAt: b.createdAt, metadata: { status: b.status, amount: b.totalPrice } }));
+    const timeline  = [...tlRows, ...payEvents, ...bkEvents].sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+
+    // Agent faolligi
+    // BUG3 FIX: N+1 o'rniga 3 ta parallel groupBy (agent soni qancha bo'lsa ham 3 so'rov)
+    const agents = await (this.prisma as any).user.findMany({
+      where: { tenantId, role: { in: ['AGENT','MANAGER','TENANT_ADMIN'] }, status: 'ACTIVE' },
+      select: { id: true, name: true },
+    });
+    const agentIds = agents.map((a: any) => a.id);
+
+    const [agentLeads, agentBookings, agentCalls] = await Promise.all([
+      (this.prisma as any).client.groupBy({
+        by: ['assignedAgentId'],
+        where: { tenantId, assignedAgentId: { in: agentIds }, createdAt: df },
+        _count: { id: true },
+      }).catch(() => []),
+      (this.prisma as any).booking.groupBy({
+        by: ['agentId'],
+        where: { tenantId, agentId: { in: agentIds }, createdAt: df },
+        _count: { id: true },
+      }).catch(() => []),
+      (this.prisma as any).call.groupBy({
+        by: ['agentId'],
+        where: { tenantId, agentId: { in: agentIds }, createdAt: df },
+        _count: { id: true },
+      }).catch(() => []),
+    ]);
+
+    const agentActivity = agents.map((a: any) => ({
+      agent: a,
+      leads:    ((agentLeads as any[]).find((r: any) => r.assignedAgentId === a.id) as any)?._count?.id || 0,
+      bookings: ((agentBookings as any[]).find((r: any) => r.agentId === a.id) as any)?._count?.id || 0,
+      calls:    ((agentCalls as any[]).find((r: any) => r.agentId === a.id) as any)?._count?.id || 0,
+    }));
+
+    // Manba taqsimoti
+    const srcMap: Record<string, number> = {};
+    leads.forEach((c: any) => { srcMap[c.source || 'OTHER'] = (srcMap[c.source || 'OTHER'] || 0) + 1; });
+    const sourceBreakdown = Object.entries(srcMap).map(([source, count]) => ({ source, count })).sort((a, b) => b.count - a.count);
+
+    // Daily breakdown (faqat oraliqda)
+    let dailyBreakdown: any[] = [];
+    let bestDay: any = null;
+    if (!isSingleDay) {
+      // BUG4 FIX: 60 so'rov o'rniga 2 ta parallel so'rov, keyin JS da guruhla
+      const [allLeadsInRange, allBookingsInRange] = await Promise.all([
+        (this.prisma as any).client.findMany({
+          where: { tenantId, ...clientAgentFilter, createdAt: { gte: start, lte: end } },
+          select: { createdAt: true },
+        }).catch(() => []),
+        (this.prisma as any).booking.findMany({
+          where: { tenantId, ...agentFilter, createdAt: { gte: start, lte: end } },
+          select: { createdAt: true, totalPrice: true, profit: true, status: true },
+        }).catch(() => []),
+      ]);
+
+      // JS da kunlar bo'yicha guruhla
+      const totalDays = Math.min(Math.ceil((end.getTime() - start.getTime()) / 86400000) + 1, 366);
+      const dayMap: Record<string, { leads: number; bookings: number; revenue: number; profit: number }> = {};
+      for (let i = 0; i < totalDays; i++) {
+        const d = new Date(start); d.setDate(d.getDate() + i);
+        dayMap[d.toISOString().slice(0, 10)] = { leads: 0, bookings: 0, revenue: 0, profit: 0 };
+      }
+      for (const c of allLeadsInRange as any[]) {
+        const key = new Date(c.createdAt).toISOString().slice(0, 10);
+        if (dayMap[key]) dayMap[key].leads++;
+      }
+      for (const b of allBookingsInRange as any[]) {
+        const key = new Date(b.createdAt).toISOString().slice(0, 10);
+        if (dayMap[key]) {
+          dayMap[key].bookings++;
+          if (['CONFIRMED','COMPLETED'].includes(b.status)) {
+            dayMap[key].revenue += b.totalPrice || 0;
+            dayMap[key].profit  += b.profit || 0;
+          }
+        }
+      }
+      dailyBreakdown = Object.entries(dayMap).map(([date, v]) => ({ date, ...v }));
+      bestDay = dailyBreakdown.reduce(
+        (a, b) => ((b.revenue + b.leads * 10) > (a.revenue + a.leads * 10) ? b : a),
+        dailyBreakdown[0] || {}
+      );
+    }
+
+    return { isSingleDay, stats, leads, timeline, bookings, payments, agentActivity, sourceBreakdown, dailyBreakdown, bestDay };
+  }
+
+  private safeNumber(val: any): number {
+    const num = Number(val);
+    return isNaN(num) || val === null || val === undefined ? 0 : num;
+  }
+
+  private safePercent(val: any, max = 100): number {
+    const num = this.safeNumber(val);
+    return Math.min(Math.max(num, 0), max);
+  }
+
+  async dashboard(tenantId: string, userId: string, role: string, from?: string, to?: string) {
+    try {
+      const now = new Date();
+      // from/to berilsa — u davr, aks holda bu oy
+      const monthStart = from
+        ? (() => { const [y,m,d] = from.split('-').map(Number); return new Date(y, m-1, d, 0,0,0); })()
+        : new Date(now.getFullYear(), now.getMonth(), 1);
+      const monthEnd = to
+        ? (() => { const [y,m,d] = to.split('-').map(Number); return new Date(y, m-1, d, 23,59,59); })()
+        : now;
+      const prevMonthStart = new Date(monthStart.getFullYear(), monthStart.getMonth() - 1, 1);
+      const prevMonthEnd   = new Date(monthStart.getFullYear(), monthStart.getMonth(), 0, 23, 59, 59);
+      const todayStart     = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+      // Agent filterlari
+      const bookingAgentFilter = role === 'AGENT' ? { agentId: userId } : {};
+      const clientAgentFilter  = role === 'AGENT' ? { assignedAgentId: userId } : {};
+
+      // ── BOOKING WHERE UCHUN STATUS ──
+      const activeStatuses = { status: { in: ['CONFIRMED', 'COMPLETED', 'DRAFT'] as any[] } };
+      const confirmedStatuses = { status: { in: ['CONFIRMED', 'COMPLETED'] as any[] } };
+
+      // ── BARCHA SO'ROVLAR PARALLEL ──
+      const [
+        totalClients, newClientsMonth, totalLeads,
+        totalBookings, bookingsMonth, pendingBookings,
+        clientsWithBookings, // BUG4: conversion rate uchun
+        newLeadsMonth, // BUG5: pipeline boshidagi yangi leadlar
+        // Bu oygi booking stats (BOOKING dan - bir xil manba!)
+        thisMonthBookings, prevMonthBookings,
+        // Agent performance (BOOKING dan)
+        agentPerformance,
+        // Tenant sozlamalari
+        tenant,
+        // Conversations
+        activeConversations,
+      ] = await Promise.all([
+        // Klientlar
+        this.prisma.client.count({ where: { tenantId, ...clientAgentFilter } }).catch(() => 0),
+        this.prisma.client.count({ where: { tenantId, ...clientAgentFilter, createdAt: { gte: monthStart } } }).catch(() => 0),
+        // BUG1 FIX: totalLeads = faqat pipeline boshidagilar
+        this.prisma.client.count({ where: { tenantId, ...clientAgentFilter, pipelineStage: { in: ['NEW_LEAD','CONTACTED','INTERESTED'] as any[] } } }).catch(() => 0),
+
+        // Bookinglar
+        this.prisma.booking.count({ where: { tenantId, ...bookingAgentFilter, ...activeStatuses } }).catch(() => 0),
+        this.prisma.booking.count({ where: { tenantId, ...bookingAgentFilter, ...activeStatuses, createdAt: { gte: monthStart } } }).catch(() => 0),
+        this.prisma.booking.count({ where: { tenantId, ...bookingAgentFilter, status: { in: ['DRAFT', 'CONFIRMED'] as any[] } } }).catch(() => 0),
+
+        // BUG4 FIX: Conversion = booking qilgan klientlar / yangi klientlar
+        this.prisma.client.count({
+          where: { tenantId, ...clientAgentFilter, createdAt: { gte: monthStart, lte: monthEnd }, bookings: { some: { status: { not: 'CANCELLED' as any } } } },
+        }).catch(() => 0),
+        // BUG5 FIX: leads.newThisMonth = pipeline boshidagilar bu oy
+        this.prisma.client.count({
+          where: { tenantId, ...clientAgentFilter, pipelineStage: { in: ['NEW_LEAD','CONTACTED','INTERESTED'] as any[] }, createdAt: { gte: monthStart, lte: monthEnd } },
+        }).catch(() => 0),
+        // Bu oygi moliya (BOOKING.totalPrice, supplierCost, profit)
+        this.prisma.booking.aggregate({
+          where: { tenantId, ...bookingAgentFilter, ...confirmedStatuses, createdAt: { gte: monthStart, lte: monthEnd } },
+          _sum: { totalPrice: true, supplierCost: true, profit: true },
+          _count: { id: true },
+        }).catch(() => ({ _sum: { totalPrice: 0, supplierCost: 0, profit: 0 }, _count: { id: 0 } })),
+
+        // O'tgan oygi moliya
+        this.prisma.booking.aggregate({
+          where: { tenantId, ...bookingAgentFilter, ...confirmedStatuses, createdAt: { gte: prevMonthStart, lte: prevMonthEnd } },
+          _sum: { totalPrice: true, supplierCost: true, profit: true },
+          _count: { id: true },
+        }).catch(() => ({ _sum: { totalPrice: 0, supplierCost: 0, profit: 0 }, _count: { id: 0 } })),
+
+        // Agentlar performance (faqat admin/manager uchun)
+        role !== 'AGENT'
+          ? this.prisma.booking.groupBy({
+              by: ['agentId'],
+              where: { tenantId, ...confirmedStatuses, createdAt: { gte: monthStart }, agentId: { not: null } },
+              _sum: { totalPrice: true, profit: true, commissionAmount: true },
+              _count: { id: true },
+            }).catch(() => [])
+          : Promise.resolve([]),
+
+        // Tenant KPI sozlamalari
+        this.prisma.tenant.findUnique({
+          where: { id: tenantId },
+          select: { agentCommissionPercent: true, currency: true } as any,
+        }).catch(() => null),
+
+        // Faol suhbatlar
+        this.prisma.conversation.count({
+          where: { tenantId, isResolved: false, ...(role === 'AGENT' ? { OR: [{ assignedAgentId: userId }, { assignedAgentId: null }] } : {}) },
+        }).catch(() => 0),
+      ]);
+
+      // ── HIOBLAR ──
+      const kpiPercent = (tenant as any)?.agentCommissionPercent ?? 10;
+
+      // Bu oy
+      const revMonth    = this.safeNumber((thisMonthBookings._sum as any)?.totalPrice);
+      const costMonth   = this.safeNumber((thisMonthBookings._sum as any)?.supplierCost);
+      const profitMonth = this.safeNumber((thisMonthBookings._sum as any)?.profit);
+      const booksMonth  = (thisMonthBookings._count as any)?.id ?? 0;
+
+      // O'tgan oy
+      const revPrev = this.safeNumber((prevMonthBookings._sum as any)?.totalPrice);
+
+      // O'sish foizi
+      const growth = revPrev > 0 ? Math.round(((revMonth - revPrev) / revPrev) * 100) : 0;
+
+      // Agent maoshi (faqat agent uchun)
+      const mySalaryThisMonth = role === 'AGENT'
+        ? Math.round(profitMonth * kpiPercent / 100)
+        : 0;
+
+      // Jami agent maoshi (admin uchun)
+      const totalAgentSalaries = role !== 'AGENT'
+        ? (agentPerformance as any[]).reduce((sum: number, a: any) => {
+            const stored = this.safeNumber((a._sum as any)?.commissionAmount);
+            const calculated = this.safeNumber((a._sum as any)?.profit) * kpiPercent / 100;
+            return sum + (stored > 0 ? stored : calculated);
+          }, 0)
+        : 0;
+
+      // BUG4 FIX: Conversion = booking qilgan klientlar / yangi klientlar (max 100%)
+      const conversionRate = newClientsMonth > 0
+        ? Math.min(100, Math.round((this.safeNumber(clientsWithBookings) / newClientsMonth) * 100))
+        : 0;
+
+      // Net foyda = profit - agent maoshlari
+      const netProfit = Math.max(0, profitMonth - totalAgentSalaries);
+
+      return {
+        clients:  { total: totalClients, newThisMonth: newClientsMonth, newToday: 0 },
+        leads:    { total: totalLeads, newThisMonth: this.safeNumber(newLeadsMonth), newToday: 0 }, // BUG5 FIX
+        bookings: { total: totalBookings, thisMonth: booksMonth, today: 0, pending: pendingBookings },
+        revenue: {
+          thisMonth: revMonth,
+          prevMonth: revPrev,
+          today: 0,
+          growth,
+        },
+        cost: {
+          thisMonth: costMonth,
+          totalSales: revMonth,
+        },
+        profit: {
+          thisMonth: profitMonth,
+          today: 0,
+        },
+        netProfit: {
+          thisMonth: netProfit,
+        },
+        salary: {
+          kpiPercent,
+          mySalaryThisMonth,
+          totalAgentSalariesThisMonth: totalAgentSalaries,
+          formula: `Foyda × ${kpiPercent}% / 100`,
+        },
+        commission: { thisMonth: totalAgentSalaries },
+        conversion: { rate: conversionRate },
+        conversations: { active: this.safeNumber(activeConversations) },
+        role,
+        // Frontend uchun qulaylik
+        thisMonth: {
+          revenue: revMonth,
+          bookings: booksMonth,
+          newClients: newClientsMonth,
+          profit: profitMonth,
+          cost: costMonth,
+          netProfit,
+          bookingsChange: 0,
+        },
+        lastMonth: { revenue: revPrev },
+      };
+    } catch (e: any) {
+      this.logger.warn('Dashboard error: ' + e?.message);
+      return {
+        leads: { total: 0, newThisMonth: 0, newToday: 0 },
+        clients: { total: 0, newThisMonth: 0, newToday: 0 },
+        bookings: { total: 0, thisMonth: 0, today: 0, pending: 0 },
+        revenue: { thisMonth: 0, prevMonth: 0, today: 0, growth: 0 },
+        cost: { thisMonth: 0, totalSales: 0 },
+        profit: { thisMonth: 0, today: 0 },
+        netProfit: { thisMonth: 0 },
+        salary: { kpiPercent: 10, mySalaryThisMonth: 0, totalAgentSalariesThisMonth: 0, formula: '' },
+        commission: { thisMonth: 0 },
+        conversion: { rate: 0 },
+        conversations: { active: 0 },
+        role,
+        thisMonth: { revenue: 0, bookings: 0, newClients: 0, profit: 0, cost: 0, netProfit: 0, bookingsChange: 0 },
+        lastMonth: { revenue: 0 },
+      };
+    }
+  }
+
+  async revenue(tenantId: string, role: string, userId: string, from?: string, to?: string) {
+    // Booking dan hisoblash - bir xil manba
+    const fromDate = from ? new Date(from) : new Date(new Date().getFullYear(), new Date().getMonth() - 5, 1);
+    const toDate   = to   ? new Date(to)   : new Date();
+
+    const where: any = {
+      tenantId,
+      status: { in: ['CONFIRMED', 'COMPLETED'] },
+      createdAt: { gte: fromDate, lte: toDate },
+    };
+    if (role === 'AGENT') where.agentId = userId;
+
+    const bookings = await this.prisma.booking.findMany({
+      where,
+      select: { totalPrice: true, supplierCost: true, profit: true, createdAt: true, currency: true },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    // Group by month
+    const byMonth: Record<string, { revenue: number; cost: number; profit: number; count: number }> = {};
+    bookings.forEach((b) => {
+      const k = `${b.createdAt.getFullYear()}-${String(b.createdAt.getMonth() + 1).padStart(2, '0')}`;
+      if (!byMonth[k]) byMonth[k] = { revenue: 0, cost: 0, profit: 0, count: 0 };
+      byMonth[k].revenue += b.totalPrice || 0;
+      byMonth[k].cost    += b.supplierCost || 0;
+      byMonth[k].profit  += b.profit || 0;
+      byMonth[k].count   += 1;
+    });
+
+    const totalRevenue = bookings.reduce((s, b) => s + (b.totalPrice || 0), 0);
+    const totalCost    = bookings.reduce((s, b) => s + (b.supplierCost || 0), 0);
+    const totalProfit  = bookings.reduce((s, b) => s + (b.profit || 0), 0);
+
+    return {
+      total: totalRevenue,
+      totalCost,
+      totalProfit,
+      byMonth: Object.entries(byMonth)
+        .map(([month, v]) => ({ month, ...v }))
+        .sort((a, b) => a.month.localeCompare(b.month)),
+      byMethod: [], // payment method uchun alohida endpoint bor
+    };
+  }
+
+  async agents(tenantId: string, from?: string, to?: string) {
+    const fromDate = from ? new Date(from) : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    const toDate = to ? new Date(to) : new Date();
+
+    const agents = await this.prisma.user.findMany({
+      where: { tenantId, role: { in: ['AGENT', 'MANAGER'] }, status: 'ACTIVE' },
+      select: {
+        id: true, name: true, role: true, avatarUrl: true,
+        _count: { select: { bookings: true, assignedClients: true } },
+      },
+    });
+
+    if (agents.length === 0) return [];
+    const agentIds = agents.map((a) => a.id);
+
+    // N+1 o'rniga bitta groupBy query — optimallashtirish
+    const [bookingStats, leadsStats] = await Promise.all([
+      this.prisma.booking.groupBy({
+        by: ['agentId'],
+        where: { tenantId, agentId: { in: agentIds }, createdAt: { gte: fromDate, lte: toDate }, status: { not: 'CANCELLED' } },
+        _count: { id: true },
+        _sum: { totalPrice: true, profit: true },
+      }),
+      // BUG5 FIX: Leads ham davr bilan filtrlanadi
+      this.prisma.client.groupBy({
+        by: ['assignedAgentId'],
+        where: { tenantId, assignedAgentId: { in: agentIds }, createdAt: { gte: fromDate, lte: toDate } },
+        _count: { id: true },
+      }),
+    ]);
+
+    const bookingCountMap = new Map(bookingStats.map((b: any) => [b.agentId, b._count.id as number]));
+    const leadCountMap = new Map(leadsStats.map((l: any) => [l.assignedAgentId, l._count.id as number]));
+
+    return agents.map((a) => {
+      const bookingsInPeriod: number = (bookingCountMap.get(a.id) as number) || 0;
+      const leadsInPeriod: number = (leadCountMap.get(a.id) as number) || 0;
+      const conversion = leadsInPeriod > 0 ? Math.round((bookingsInPeriod / leadsInPeriod) * 100) : 0;
+      // Agent booking stats
+      const agentBookingStat = bookingStats.find((b: any) => b.agentId === a.id) as any;
+      const agentRevenue = agentBookingStat?._sum?.totalPrice || 0;
+      const agentProfit  = agentBookingStat?._sum?.profit || 0;
+
+      return {
+        agent: a,
+        bookings: a._count.bookings,
+        clients: a._count.assignedClients,
+        leadsInPeriod, bookingsInPeriod, conversion,
+        revenue: agentRevenue,
+        profit: agentProfit,
+        closedDeals: bookingsInPeriod,
+      };
+    });
+  }
+
+  async bookings(tenantId: string, role: string, userId: string) {
+    const where: any = { tenantId };
+    if (role === 'AGENT') where.agentId = userId;
+
+    const [byStatus, byMonth] = await Promise.all([
+      this.prisma.booking.groupBy({ by: ['status'], where, _count: { id: true }, _sum: { totalPrice: true } }),
+      this.prisma.booking.findMany({
+        where, select: { createdAt: true, totalPrice: true, status: true },
+        orderBy: { createdAt: 'desc' }, take: 500,
+      }),
+    ]);
+
+    const monthly: Record<string, { count: number; revenue: number }> = {};
+    byMonth.forEach((b) => {
+      const k = `${b.createdAt.getFullYear()}-${String(b.createdAt.getMonth() + 1).padStart(2, '0')}`;
+      if (!monthly[k]) monthly[k] = { count: 0, revenue: 0 };
+      monthly[k].count++;
+      if (b.status !== 'CANCELLED') monthly[k].revenue += b.totalPrice;
+    });
+    return {
+      byStatus,
+      // BUG6 FIX: localeCompare ile to'g'ri sana tartibida
+      byMonth: Object.entries(monthly).map(([month, v]) => ({ month, ...v })).sort((a, b) => a.month.localeCompare(b.month)),
+    };
+  }
+
+  /** v6: Klient manbaalari bo'yicha (Telegram/Instagram/WhatsApp/Referral) */
+  async bySource(tenantId: string, role: string, userId: string) {
+    try {
+      const where: any = { tenantId };
+      if (role === 'AGENT') where.assignedAgentId = userId;
+
+      const grouped = await this.prisma.client.groupBy({
+        by: ['source'],
+        where,
+        _count: { id: true },
+        _sum: { totalRevenue: true },
+      }).catch(() => []);
+
+      return (grouped || []).map((g: any) => ({
+        source: g.source || 'UNKNOWN',
+        clients: this.safeNumber(g._count?.id),
+        revenue: this.safeNumber(g._sum?.totalRevenue),
+      })).sort((a: any, b: any) => b.clients - a.clients);
+    } catch (e) {
+      this.logger.warn('bySource error: ' + e?.message);
+      return [];
+    }
+  }
+
+  /** v6: Destinatsiya bo'yicha (qaysi davlatga ko'p sotyapmiz) */
+  async byDestination(tenantId: string, role: string, userId: string, from?: string, to?: string) {
+    const where: any = { tenantId, status: { not: 'CANCELLED' } };
+    if (role === 'AGENT') where.agentId = userId;
+    if (from || to) {
+      where.createdAt = {};
+      if (from) where.createdAt.gte = new Date(from);
+      if (to) where.createdAt.lte = new Date(to);
+    }
+
+    const grouped = await this.prisma.booking.groupBy({
+      by: ['destination'],
+      where,
+      _count: { id: true },
+      _sum: { totalPrice: true, profit: true },
+    });
+
+    return grouped.map((g) => ({
+      destination: g.destination || 'Noma\'lum',
+      bookings: g._count.id,
+      revenue: g._sum.totalPrice || 0,
+      profit: g._sum.profit || 0,
+    })).sort((a, b) => b.revenue - a.revenue).slice(0, 20);
+  }
+
+  /** v6: Konversiya voronkasi — bosqichlar bo'yicha klientlar */
+  async conversionFunnel(tenantId: string, role: string, userId: string) {
+    const where: any = { tenantId };
+    if (role === 'AGENT') where.assignedAgentId = userId;
+
+    const stages: any[] = ['NEW_LEAD', 'CONTACTED', 'INTERESTED', 'OFFER_SENT', 'NEGOTIATION', 'DEPOSIT_PAID', 'CONFIRMED', 'TRAVELING', 'COMPLETED', 'LOST'];
+    const grouped = await this.prisma.client.groupBy({
+      by: ['pipelineStage'],
+      where,
+      _count: { id: true },
+    });
+
+    const counts: Record<string, number> = {};
+    stages.forEach((s) => (counts[s] = 0));
+    grouped.forEach((g) => {
+      counts[g.pipelineStage] = g._count.id;
+    });
+
+    const total = Object.values(counts).reduce((a, b) => a + b, 0);
+    return stages.map((stage) => ({
+      stage,
+      count: counts[stage],
+      percent: total > 0 ? Math.round((counts[stage] / total) * 100) : 0,
+    }));
+  }
+
+  /** v6: Daromad grafigi — kunlik/oylik */
+  async revenueChart(tenantId: string, role: string, userId: string, period: 'day' | 'month' = 'month') {
+    const where: any = { tenantId, status: { not: 'CANCELLED' } };
+    if (role === 'AGENT') where.agentId = userId;
+
+    // Oxirgi 12 oy yoki 30 kun
+    const since = new Date();
+    if (period === 'day') since.setDate(since.getDate() - 30);
+    else since.setMonth(since.getMonth() - 12);
+    where.createdAt = { gte: since };
+
+    const bookings = await this.prisma.booking.findMany({
+      where,
+      select: { createdAt: true, totalPrice: true, supplierCost: true, profit: true },
+    }).catch(() => []);
+
+    const buckets: Record<string, { revenue: number; cost: number; profit: number; count: number }> = {};
+    (bookings || []).forEach((b: any) => {
+      const d = b.createdAt;
+      const key = period === 'day'
+        ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+        : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      if (!buckets[key]) buckets[key] = { revenue: 0, cost: 0, profit: 0, count: 0 };
+      buckets[key].revenue += this.safeNumber(b.totalPrice);
+      buckets[key].cost += this.safeNumber(b.supplierCost);
+      buckets[key].profit += this.safeNumber(b.profit);
+      buckets[key].count++;
+    });
+
+    return Object.entries(buckets)
+      .map(([period_key, v]) => ({ period: period_key, ...v }))
+      .sort((a, b) => a.period.localeCompare(b.period));
+  }
+
+  /** v6: To'lov usullari bo'yicha */
+  async byPaymentMethod(tenantId: string, role: string, userId: string) {
+    const where: any = { tenantId };
+    if (role === 'AGENT') where.agentId = userId;
+
+    const grouped = await this.prisma.payment.groupBy({
+      by: ['method'],
+      where,
+      _count: { id: true },
+      _sum: { amount: true },
+    });
+
+    return grouped.map((g) => ({
+      method: g.method,
+      count: g._count.id,
+      total: g._sum.amount || 0,
+    })).sort((a, b) => b.total - a.total);
+  }
+
+  /**
+   * v7: AGENT'NING SHAXSIY STATISTIKASI
+   * Agent o'z ishini ko'rishi uchun (admin ko'rmaydi global metrika)
+   * Bu ma'lumotlar AGENT'ga ko'rinadi: o'z leadlari, o'z bookinglari, o'z foydasi
+   */
+  async myStats(tenantId: string, userId: string, _offset = 0, from?: string, to?: string) {
+    const now = new Date();
+    const monthStart    = from ? new Date(from) : new Date(now.getFullYear(), now.getMonth(), 1);
+    const monthEnd      = to   ? new Date(to + 'T23:59:59') : now;
+    const prevMonthStart = new Date(monthStart.getFullYear(), monthStart.getMonth() - 1, 1);
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const weekStart = new Date(now);
+    weekStart.setDate(weekStart.getDate() - 7);
+    const _ = monthEnd; // used in date filters
+
+    const [
+      // Leadlar (mijozlar)
+      totalLeads, leadsThisMonth, leadsThisWeek, leadsToday,
+      // Bookinglar
+      totalBookings, bookingsThisMonth, bookingsToday,
+      wonBookings, // qabul qilingan (CONFIRMED/COMPLETED)
+      // Foyda
+      profitThisMonth, profitPrevMonth, profitToday,
+      // Qo'ng'iroqlar
+      callsThisMonth, callsAnswered,
+      // Active suhbatlar
+      activeChats,
+      kpiTenantFromPA, // BUG9: parallel so'rov
+    ] = await Promise.all([
+      // Leadlar
+      this.prisma.client.count({ where: { tenantId, assignedAgentId: userId } }),
+      this.prisma.client.count({ where: { tenantId, assignedAgentId: userId, createdAt: { gte: monthStart } } }),
+      this.prisma.client.count({ where: { tenantId, assignedAgentId: userId, createdAt: { gte: weekStart } } }),
+      this.prisma.client.count({ where: { tenantId, assignedAgentId: userId, createdAt: { gte: todayStart } } }),
+      // Bookinglar
+      this.prisma.booking.count({ where: { tenantId, agentId: userId, status: { not: 'CANCELLED' } } }),
+      this.prisma.booking.count({ where: { tenantId, agentId: userId, status: { not: 'CANCELLED' }, createdAt: { gte: monthStart } } }),
+      this.prisma.booking.count({ where: { tenantId, agentId: userId, status: { not: 'CANCELLED' }, createdAt: { gte: todayStart } } }),
+      this.prisma.booking.count({ where: { tenantId, agentId: userId, status: { in: ['CONFIRMED', 'COMPLETED'] } } }),
+      // Foyda (o'zining bookinglaridan)
+      this.prisma.booking.aggregate({
+        where: { tenantId, agentId: userId, status: { not: 'CANCELLED' }, createdAt: { gte: monthStart } },
+        _sum: { profit: true, totalPrice: true },
+      }),
+      this.prisma.booking.aggregate({
+        where: { tenantId, agentId: userId, status: { not: 'CANCELLED' }, createdAt: { gte: prevMonthStart, lt: monthStart } },
+        _sum: { profit: true },
+      }),
+      this.prisma.booking.aggregate({
+        where: { tenantId, agentId: userId, status: { not: 'CANCELLED' }, createdAt: { gte: todayStart } },
+        _sum: { profit: true },
+      }),
+      // Qo'ng'iroqlar
+      this.prisma.call.count({ where: { tenantId, agentId: userId, createdAt: { gte: monthStart } } }),
+      this.prisma.call.count({ where: { tenantId, agentId: userId, status: 'COMPLETED', createdAt: { gte: monthStart } } }),
+      // Suhbatlar
+      this.prisma.conversation.count({ where: { tenantId, assignedAgentId: userId, isResolved: false } }),
+      // BUG9 FIX: tenant so'rovini Promise.all ga qo'shamiz (alohida await emas)
+      this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { agentCommissionPercent: true, kpiTiers: true } as any }).catch(() => null),
+    ]);
+
+    // Konversiya foizi: barcha aktiv bookinglar / jami leadlar
+    const myConversion = totalLeads > 0 ? Math.round((totalBookings / totalLeads) * 100) : 0;
+
+    const profitMonth = profitThisMonth._sum.profit || 0;
+    const profitPrev = profitPrevMonth._sum.profit || 0;
+    const profitGrowth = profitPrev > 0 ? Math.round(((profitMonth - profitPrev) / profitPrev) * 100) : null;
+
+    // O'rtacha booking summasi
+    const avgBookingValue = bookingsThisMonth > 0
+      ? Math.round((profitThisMonth._sum.totalPrice || 0) / bookingsThisMonth)
+      : 0;
+
+    const revenueMonth = profitThisMonth._sum?.totalPrice || 0;
+    const costMonth    = revenueMonth - profitMonth;
+    // BUG9 FIX: alohida await o'rniga Promise.all natijasidan
+    const kpiTenant = kpiTenantFromPA as any;
+    const kpi = kpiTenant?.agentCommissionPercent ?? 10;
+    const salaryMonth = Math.round(profitMonth * kpi / 100);
+
+    return {
+      // Leadlar
+      leads: { total: totalLeads, thisMonth: leadsThisMonth, thisWeek: leadsThisWeek, today: leadsToday },
+      // Bookinglar
+      bookings: { total: totalBookings, thisMonth: bookingsThisMonth, today: bookingsToday, won: wonBookings },
+      // Konversiya
+      conversion: { rate: myConversion, won: wonBookings, total: totalLeads },
+      // Foyda
+      profit: {
+        thisMonth: profitMonth,
+        prevMonth: profitPrev,
+        today: profitToday._sum.profit || 0,
+        growth: profitGrowth,
+        avgPerBooking: avgBookingValue,
+      },
+      // Maosh
+      salary: { kpiPercent: kpi, mySalaryThisMonth: salaryMonth, formula: `Foyda × ${kpi}% / 100` },
+      // Revenue (dashboard uchun bir xil interfeys)
+      revenue: { thisMonth: revenueMonth, prevMonth: 0, today: 0, growth: 0 },
+      cost:    { thisMonth: costMonth },
+      netProfit: { thisMonth: Math.max(0, profitMonth - salaryMonth) },
+      // Dashboard uchun
+      thisMonth: {
+        revenue: revenueMonth,
+        cost: costMonth,
+        profit: profitMonth,
+        netProfit: Math.max(0, profitMonth - salaryMonth),
+        bookings: bookingsThisMonth,
+        newClients: leadsThisMonth,
+      },
+      // Qo'ng'iroqlar
+      calls: {
+        thisMonth: callsThisMonth,
+        answered: callsAnswered,
+        answerRate: callsThisMonth > 0 ? Math.round((callsAnswered / callsThisMonth) * 100) : 0,
+      },
+      activeChats,
+    };
+  }
+
+  /**
+   * v8: AGENT MAOSH KALKULYATORI
+   *
+   * Tenant'da belgilangan komissiya foiziga ko'ra agent oylik maoshini hisoblaydi.
+   *
+   * Hisoblash:
+   *   - Bu oy uchun agent yopgan bookinglarning foydasi
+   *   - Tenant.agentCommissionPercent ga ko'ra agent ulushi
+   *   - Bonus: agar agent ma'lum miqdordan ko'p sotsa (kelajakda)
+   */
+  // ── Shared salary calculator (used by dashboard + mySalary) ──────────────
+  private async calcSalary(tenantId: string, userId: string, monthStart: Date, monthEnd: Date) {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { agentCommissionPercent: true, kpiTiers: true } as any,
+    }) as any;
+
+    const commissionPercent = tenant?.agentCommissionPercent ?? 10;
+    const kpiTiers = Array.isArray(tenant?.kpiTiers)
+      ? tenant.kpiTiers
+      : JSON.parse((tenant?.kpiTiers as string) || '[]');
+
+    const bookings = await this.prisma.booking.findMany({
+      where: { tenantId, agentId: userId, status: { not: 'CANCELLED' }, createdAt: { gte: monthStart, lt: monthEnd } },
+      select: { totalPrice: true, profit: true, commissionAmount: true },
+    });
+
+    const revenue = bookings.reduce((s: number, b: any) => s + this.safeNumber(b.totalPrice), 0);
+    const profit  = bookings.reduce((s: number, b: any) => s + this.safeNumber(b.profit), 0);
+
+    // KPI tiers override base percent
+    let appliedPercent = commissionPercent;
+    let appliedTier = null;
+    if (kpiTiers.length > 0) {
+      // BUG3 FIX: ASC sort (mySalary bilan bir xil)
+    const sorted = [...kpiTiers].sort((a: any, b: any) => a.minRevenue - b.minRevenue);
+      for (const tier of sorted) {
+        // BUG1 FIX: maxRevenue ham tekshiriladi
+        if (
+          revenue >= (tier.minRevenue || 0) &&
+          (tier.maxRevenue === null || revenue < tier.maxRevenue)
+        ) {
+          appliedPercent = tier.commissionPercent || commissionPercent;
+          appliedTier = tier.name || null;
+          break;
+        }
+      }
+      // BUG1 FIX: Hech bir tier mos kelmasa — eng yuqori tier
+      if (!appliedTier && sorted.length > 0) {
+        appliedPercent = sorted[sorted.length - 1].commissionPercent || commissionPercent;
+        appliedTier = sorted[sorted.length - 1].name || null;
+      }
+    }
+
+    const grossSalary = Math.round(profit * appliedPercent / 100);
+    const pending = Math.max(0, grossSalary - bookings.reduce((s: number, b: any) => s + this.safeNumber(b.commissionAmount), 0));
+
+    return { grossSalary, pending, myCommissionPercent: appliedPercent, appliedTier, revenue, profit, bookingCount: bookings.length };
+  }
+
+  async mySalary(tenantId: string, userId: string, monthOffset = 0) {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth() + monthOffset, 1);
+    const monthEnd = new Date(now.getFullYear(), now.getMonth() + monthOffset + 1, 1);
+
+    // BUG2 FIX: bitta so'rovda hamma kerakli fieldlar
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: {
+        agentCommissionPercent: true,
+        managerCommissionPercent: true,
+        currency: true,
+        kpiTiers: true,
+        settings: true, // salaryNotes shu yerda
+      } as any,
+    });
+    if (!tenant) return null;
+
+    // Bu oy uchun agentning yopgan bookinglari
+    const bookings = await this.prisma.booking.findMany({
+      where: {
+        tenantId, agentId: userId,
+        status: { in: ['CONFIRMED', 'COMPLETED'] },
+        createdAt: { gte: monthStart, lt: monthEnd },
+      },
+      select: {
+        id: true, bookingRef: true, totalPrice: true, profit: true,
+        status: true, currency: true, createdAt: true,
+        client: { select: { fullName: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    // Komissiyalar bo'yicha
+    const totalProfit = bookings.reduce((s, b) => s + (b.profit || 0), 0);
+    const totalRevenue = bookings.reduce((s, b) => s + (b.totalPrice || 0), 0);
+    
+    // v9: KPI TIERS - Calculate commission percent based on revenue
+    let commissionPercent = Number(tenant?.agentCommissionPercent ?? 10);  
+    let appliedTier = null;
+    
+    try {
+      const kpiTiers = Array.isArray(tenant.kpiTiers) 
+        ? tenant.kpiTiers 
+        : JSON.parse((tenant.kpiTiers as string) || '[]');
+      
+      if (Array.isArray(kpiTiers) && kpiTiers.length > 0) {
+        const sorted = [...kpiTiers].sort((a: any, b: any) => a.minRevenue - b.minRevenue);
+        for (const tier of sorted) {
+          if (totalRevenue >= tier.minRevenue && (tier.maxRevenue === null || totalRevenue < tier.maxRevenue)) {
+            commissionPercent = tier.commissionPercent;
+            appliedTier = tier;
+            break;
+          }
+        }
+        // If revenue exceeds all tiers, use last tier
+        if (!appliedTier && sorted.length > 0) {
+          commissionPercent = sorted[sorted.length - 1].commissionPercent;
+          appliedTier = sorted[sorted.length - 1];
+        }
+      }
+    } catch (e) {
+      // Fall back to default percent
+    }
+
+    const grossSalary = +(totalProfit * commissionPercent / 100).toFixed(2);
+
+    // Allaqachon paid commissionlar
+    const paidCommissions = await this.prisma.commission.aggregate({
+      where: {
+        tenantId, agentId: userId, isPaid: true,
+        paidAt: { gte: monthStart, lt: monthEnd },
+      },
+      _sum: { agentAmount: true },
+    });
+    const alreadyPaid = paidCommissions._sum.agentAmount || 0;
+    const pending = Math.max(0, grossSalary - alreadyPaid);
+
+    // BUG2 FIX: alohida findUnique o'rniga birinchi so'rov natijasidan
+    const salaryNotes: any = ((tenant as any).settings as any)?.salaryNotes || {};
+    const agentSalaryNote = salaryNotes[userId] || {};
+
+    return {
+      monthStart, monthEnd,
+      currency: tenant.currency,
+      myCommissionPercent: commissionPercent,
+      isPaid: agentSalaryNote.isPaid || false,
+      adminNote: agentSalaryNote.note || '',
+      paidAt: agentSalaryNote.paidAt || null,
+      appliedTier, // v9: Show which tier was applied
+      bookingsCount: bookings.length,
+      totalRevenue,
+      totalProfit,
+      grossSalary,
+      alreadyPaid,
+      pending,
+      bookings: bookings.slice(0, 20),
+      breakdown: bookings.map((b: any) => ({
+        id: b.id,
+        bookingRef: b.bookingRef,
+        clientName: b.client?.fullName,
+        totalPrice: b.totalPrice,
+        profit: b.profit,
+        myShare: +((b.profit || 0) * commissionPercent / 100).toFixed(2),
+        date: b.createdAt,
+      })),
+    };
+  }
+
+  /**
+   * v8: ADMIN UCHUN — barcha agentlar maoshlari
+   */
+  async agentSalaries(tenantId: string, monthOffset = 0) {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth() + monthOffset, 1);
+    const monthEnd   = new Date(now.getFullYear(), now.getMonth() + monthOffset + 1, 1);
+
+    // BUG2+BUG8 FIX: kpiTiers ham olamiz + N+1 ni groupBy bilan hal qilamiz
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { agentCommissionPercent: true, currency: true, kpiTiers: true } as any,
+    });
+    if (!tenant) return [];
+
+    const agents = await this.prisma.user.findMany({
+      where: { tenantId, status: 'ACTIVE', role: 'AGENT' },
+      select: { id: true, name: true, email: true, avatarUrl: true },
+    });
+    if (!agents.length) return [];
+
+    const agentIds = agents.map((a: any) => a.id);
+
+    // BUG8 FIX: N+1 o'rniga 2 ta parallel groupBy so'rov
+    const [bookingStats, commissionStats] = await Promise.all([
+      this.prisma.booking.groupBy({
+        by: ['agentId'],
+        where: { tenantId, agentId: { in: agentIds }, status: { in: ['CONFIRMED','COMPLETED'] as any[] }, createdAt: { gte: monthStart, lt: monthEnd } },
+        _count: { id: true },
+        _sum: { totalPrice: true, profit: true },
+      }),
+      this.prisma.commission.groupBy({
+        by: ['agentId'],
+        where: { tenantId, agentId: { in: agentIds }, isPaid: true, paidAt: { gte: monthStart, lt: monthEnd } },
+        _sum: { agentAmount: true },
+      }).catch(() => []),
+    ]);
+
+    // BUG2 FIX: KPI tiers bilan hisoblash
+    const kpiTiersRaw = (tenant as any).kpiTiers;
+    let kpiTiers: any[] = [];
+    try { kpiTiers = Array.isArray(kpiTiersRaw) ? kpiTiersRaw : JSON.parse(kpiTiersRaw || '[]'); } catch {}
+
+    const results = agents.map((a: any) => {
+      const bStat = (bookingStats as any[]).find((b: any) => b.agentId === a.id) as any;
+      const cStat = (commissionStats as any[]).find((c: any) => c.agentId === a.id) as any;
+      const totalRevenue = bStat?._sum?.totalPrice || 0;
+      const totalProfit  = bStat?._sum?.profit || 0;
+
+      // BUG2 FIX: KPI tier foizini aniqlash (ASC sort — BUG3 bilan mos)
+      let commissionPercent = (tenant as any).agentCommissionPercent || 10;
+      if (kpiTiers.length > 0) {
+        const sorted = [...kpiTiers].sort((a: any, b: any) => a.minRevenue - b.minRevenue);
+        for (const tier of sorted) {
+          if (totalRevenue >= tier.minRevenue && (tier.maxRevenue === null || totalRevenue < tier.maxRevenue)) {
+            commissionPercent = tier.commissionPercent;
+            break;
+          }
+        }
+      }
+
+      const salary = +(totalProfit * commissionPercent / 100).toFixed(2);
+      const paid   = cStat?._sum?.agentAmount || 0;
+      return {
+        ...a,
+        bookingsCount: bStat?._count?.id || 0,
+        totalRevenue, totalProfit,
+        commissionPercent,
+        salary,
+        paid,
+        pending: Math.max(0, salary - paid),
+      };
+    });
+
+    return results.sort((a: any, b: any) => b.salary - a.salary);
+  }
+
+  /**
+   * v9-FINAL: KLIENTNING TO'LIQ MOLIYAVIY PROFILI
+   *
+   * Klient kartasida ko'rsatiladi:
+   *   - Jami bookinglar (booking ro'yxati)
+   *   - Total Revenue (mijoz to'lagan summa)
+   *   - Total Cost (provayderga ketgan)
+   *   - Total Profit (foyda)
+   *   - To'langan / Qoldiq
+   *   - Birinchi va oxirgi sana
+   *
+   * Permissions:
+   *   - Admin/Manager: hamma ko'radi
+   *   - Agent: faqat o'z klientini ko'radi
+   */
+  async getClientFinancial(
+    tenantId: string,
+    clientId: string,
+    userId: string,
+    role: string,
+  ) {
+    // Klient ruxsatini tekshirish
+    const whereClient: any = { id: clientId, tenantId };
+    if (role === 'AGENT') whereClient.assignedAgentId = userId;
+    const client = await this.prisma.client.findFirst({
+      where: whereClient,
+      include: {
+        assignedAgent: { select: { id: true, name: true } },
+      },
+    });
+    if (!client) {
+      throw new NotFoundException("Klient topilmadi yoki sizning ruxsatingiz yo'q");
+    }
+
+    // Klientning barcha bookinglari
+    const bookings = await this.prisma.booking.findMany({
+      where: { clientId, tenantId },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        agent: { select: { id: true, name: true } },
+        payments: { select: { amount: true, paidAt: true, method: true, status: true } },
+      },
+    });
+
+    // Statistik hisob-kitob
+    let totalRevenue = 0;
+    let totalCost = 0;
+    let totalProfit = 0;
+    let totalPaid = 0;
+    let totalDue = 0;
+
+    const bookingSummaries = bookings.map((b: any) => {
+      // BUG7 FIX: NaN xavfini oldini olish
+      const cost     = this.safeNumber(b.supplierCost || b.providerCost);
+      const discount = this.safeNumber((b as any).discount);
+      const profit   = b.profit != null
+        ? this.safeNumber(b.profit)
+        : this.safeNumber(b.totalPrice) - cost - discount;
+      const paid = (b.payments || [])
+        .filter((p: any) => p.status === 'COMPLETED' || p.status === 'PAID')
+        .reduce((s: number, p: any) => s + (p.amount || 0), 0);
+
+      totalRevenue += b.totalPrice || 0;
+      totalCost += cost;
+      totalProfit += profit;
+      totalPaid += paid;
+
+      const due = (b.totalPrice || 0) - paid;
+      totalDue += Math.max(0, due);
+
+      return {
+        id: b.id,
+        bookingRef: b.bookingRef,
+        tourName: b.tourName,
+        destination: b.destination,
+        status: b.status,
+        currency: b.currency,
+        // Klient ko'radigan
+        totalPrice: b.totalPrice,
+        // Admin/Agent ko'radigan (klientga ko'rinmaydi)
+        supplierCost: cost,
+        profit,
+        // To'lov
+        paidAmount: paid,
+        dueAmount: Math.max(0, due),
+        // Sayohat sanalari
+        departureDate: b.departureDate,
+        returnDate: b.returnDate,
+        // Agent
+        agent: b.agent,
+        createdAt: b.createdAt,
+      };
+    });
+
+    // Birinchi va oxirgi sana
+    const dates = bookings.map((b: any) => new Date(b.createdAt).getTime()).filter(Boolean);
+    const firstBookingAt = dates.length ? new Date(Math.min(...dates)) : null;
+    const lastBookingAt = dates.length ? new Date(Math.max(...dates)) : null;
+
+    return {
+      // Klient asosiy
+      client: {
+        id: client.id,
+        fullName: client.fullName,
+        phone: client.phone,
+        email: client.email,
+        telegramUsername: client.telegramUsername,
+        tier: client.tier,
+        pipelineStage: client.pipelineStage,
+        source: client.source,
+        country: client.country,
+        city: client.city,
+        assignedAgent: client.assignedAgent,
+        createdAt: client.createdAt,
+      },
+      // Moliyaviy
+      financial: {
+        totalRevenue,         // mijoz to'lagan summa
+        totalCost,            // provayderga ketgan
+        totalProfit,          // foyda
+        totalPaid,            // to'langan
+        totalDue,             // qoldiq
+        bookingsCount: bookings.length,
+        avgBookingValue: bookings.length ? totalRevenue / bookings.length : 0,
+        firstBookingAt,
+        lastBookingAt,
+        // LTV (Lifetime Value)
+        ltv: totalRevenue,
+      },
+      // Booking ro'yxati
+      bookings: bookingSummaries,
+    };
+  }
+
+  /**
+   * v9-FINAL: LEAD SOURCE ANALYTICS
+   *
+   * Manba bo'yicha tahlil:
+   *   - Lead'lar soni (klient yaratilgan)
+   *   - Conversion rate (lead → kamida 1 booking)
+   *   - Daromad (har bir manbadan keladigan jami summa)
+   *   - O'rtacha booking qiymati
+   *   - Tarixiy timeline (kunlik)
+   */
+  async getCallAnalytics(tenantId: string, days: number, agentId?: string) {
+    const from = new Date(Date.now() - days * 86400000);
+    const where: any = { tenantId, createdAt: { gte: from } };
+    if (agentId) where.agentId = agentId;
+    const total = await this.prisma.call.count({ where });
+    const byStatus = await this.prisma.call.groupBy({ by: ['status'], where, _count: { id: true } });
+    const answered = (byStatus.find((r: any) => r.status === 'COMPLETED') as any)?._count?.id || 0;
+    const daily = await this.prisma.call.findMany({ where, select: { createdAt: true, status: true }, orderBy: { createdAt: 'asc' } });
+    const byDayMap: Record<string, {date: string; total: number; answered: number}> = {};
+    for (const c of daily) {
+      const date = c.createdAt.toISOString().slice(0, 10);
+      if (!byDayMap[date]) byDayMap[date] = { date, total: 0, answered: 0 };
+      byDayMap[date].total++;
+      if ((c as any).status === 'COMPLETED') byDayMap[date].answered++;
+    }
+    return {
+      summary: { total, answered, noAnswer: total - answered, conversionRate: total > 0 ? Math.round(answered / total * 100) : 0 },
+      byDay: Object.values(byDayMap),
+    };
+  }
+
+  async getLeadAnalytics(tenantId: string, days: number) {
+    try {
+      const since = new Date();
+      since.setDate(since.getDate() - days);
+
+      // Barcha klientlarni manba bo'yicha guruhlash
+      const clients: any[] = await this.prisma.client.findMany({
+        where: {
+          tenantId,
+          createdAt: { gte: since },
+        },
+        select: {
+          id: true,
+          source: true,
+          createdAt: true,
+          bookings: {
+            where: { status: { not: 'CANCELLED' } },
+            select: {
+              id: true,
+              totalPrice: true,
+              profit: true,
+              status: true,
+            },
+          },
+        },
+      }).catch(() => []);
+
+      // Manba bo'yicha statistik
+      const sourceMap: Record<string, any> = {};
+      for (const c of (clients || [])) {
+        const src = c.source || 'OTHER';
+        if (!sourceMap[src]) {
+          sourceMap[src] = {
+            source: src,
+            leads: 0,
+            conversions: 0,
+            bookings: 0,
+            revenue: 0,
+            profit: 0,
+          };
+        }
+        sourceMap[src].leads += 1;
+        if (c.bookings && c.bookings.length > 0) {
+          sourceMap[src].conversions += 1;
+          sourceMap[src].bookings += c.bookings.length;
+          sourceMap[src].revenue += c.bookings.reduce((s: number, b: any) => s + this.safeNumber(b.totalPrice), 0);
+          sourceMap[src].profit += c.bookings.reduce((s: number, b: any) => s + this.safeNumber(b.profit), 0);
+        }
+      }
+
+      // Conversion rate hisoblash + sortlash
+      const bySource = Object.values(sourceMap)
+        .map((s: any) => ({
+          ...s,
+          conversionRate: s.leads > 0 ? (s.conversions / s.leads) * 100 : 0,
+          avgBookingValue: s.bookings > 0 ? s.revenue / s.bookings : 0,
+          avgProfitPerLead: s.leads > 0 ? s.profit / s.leads : 0,
+        }))
+        .sort((a: any, b: any) => b.revenue - a.revenue);
+
+      // Eng yaxshi manba (revenue bo'yicha)
+      const topSource = bySource[0]?.source || null;
+      const topByConversion = [...bySource].sort((a: any, b: any) => b.conversionRate - a.conversionRate)[0]?.source || null;
+
+      // Jami statistik
+      const totalLeads = (clients || []).length;
+      const totalBookings = (clients || []).reduce((s, c) => s + (c.bookings?.length || 0), 0);
+      const totalRevenue = (clients || []).reduce(
+        (s, c) => s + ((c.bookings || []).reduce((bs: number, b: any) => bs + this.safeNumber(b.totalPrice), 0)),
+        0,
+      );
+      const totalProfit = (clients || []).reduce(
+        (s, c) => s + ((c.bookings || []).reduce((bs: number, b: any) => bs + this.safeNumber(b.profit), 0)),
+        0,
+      );
+
+      // Kunlik timeline (oxirgi N kun)
+      const timeline: Record<string, number> = {};
+      for (let i = days - 1; i >= 0; i--) {
+        const d = new Date();
+        d.setDate(d.getDate() - i);
+        const key = d.toISOString().split('T')[0];
+        timeline[key] = 0;
+      }
+      for (const c of (clients || [])) {
+        const key = new Date(c.createdAt).toISOString().split('T')[0];
+        if (timeline[key] !== undefined) timeline[key] += 1;
+      }
+      const timelineArray = Object.entries(timeline).map(([date, count]) => ({ date, count }));
+
+      return {
+        period: { days, since },
+        summary: {
+          totalLeads: this.safeNumber(totalLeads),
+          totalBookings: this.safeNumber(totalBookings),
+          totalRevenue: this.safeNumber(totalRevenue),
+          totalProfit: this.safeNumber(totalProfit),
+          avgConversionRate: totalLeads > 0 ? ((clients || []).filter((c) => (c.bookings?.length || 0) > 0).length / totalLeads) * 100 : 0,
+          topSource,
+          topByConversion,
+        },
+        bySource,
+        timeline: timelineArray,
+      };
+    } catch (e) {
+      this.logger.warn('getLeadAnalytics error: ' + e?.message);
+      return {
+        period: { days, since: new Date() },
+        summary: { totalLeads: 0, totalBookings: 0, totalRevenue: 0, totalProfit: 0, avgConversionRate: 0, topSource: null, topByConversion: null },
+        bySource: [],
+        timeline: [],
+      };
+    }
+  }
+
+  // ─── EXPORT: Excel ────────────────────────────────────────────────────────
+  async exportExcel(tenantId: string, role: string, userId: string, type: string, from?: string, to?: string) {
+    const fromDate = from ? new Date(from) : new Date(new Date().setMonth(new Date().getMonth() - 1));
+    const toDate = to ? new Date(to) : new Date();
+    const where: any = { tenantId, createdAt: { gte: fromDate, lte: toDate } };
+    if (role === 'AGENT') where.agentId = userId;
+
+    let rows: any[] = [];
+    let headers: string[] = [];
+
+    if (type === 'bookings') {
+      const items = await this.prisma.booking.findMany({
+        where: { tenantId, createdAt: { gte: fromDate, lte: toDate }, ...(role === 'AGENT' ? { agentId: userId } : {}) },
+        include: { client: { select: { fullName: true, phone: true } }, agent: { select: { name: true } } },
+        orderBy: { createdAt: 'desc' }, take: 1000,
+      });
+      headers = ['#', 'Ref', 'Klient', 'Telefon', 'Tur', 'Yonalish', 'Sana', 'Narxi', 'Foyda', 'Status', 'Agent'];
+      rows = items.map((b, i) => [
+        i+1, b.bookingRef, b.client?.fullName, b.client?.phone, b.tourName, b.destination,
+        b.createdAt.toLocaleDateString('uz-UZ'), b.totalPrice, b.profit || 0, b.status, b.agent?.name,
+      ]);
+    } else if (type === 'clients') {
+      const items = await this.prisma.client.findMany({
+        where: { tenantId, createdAt: { gte: fromDate, lte: toDate } },
+        include: { assignedAgent: { select: { name: true } } },
+        orderBy: { createdAt: 'desc' }, take: 1000,
+      });
+      headers = ['#', 'Ism', 'Telefon', 'Email', 'Manba', 'Stage', 'Tier', 'Agent', 'Sana'];
+      rows = items.map((c, i) => [
+        i+1, (c as any).fullName, c.phone, c.email, c.source, c.pipelineStage, c.tier,
+        (c as any).assignedAgent?.name, c.createdAt.toLocaleDateString('uz-UZ'),
+      ]);
+    } else if (type === 'payments') {
+      const items = await this.prisma.payment.findMany({
+        where: { tenantId, paidAt: { gte: fromDate, lte: toDate } },
+        include: { booking: { include: { client: { select: { fullName: true } } } } },
+        orderBy: { paidAt: 'desc' }, take: 1000,
+      });
+      headers = ['#', 'Sana', 'Klient', 'Miqdor', 'Valyuta', 'Usul', 'Status', 'Booking Ref'];
+      rows = items.map((p, i) => [
+        i+1, p.paidAt?.toLocaleDateString('uz-UZ'), p.booking?.client?.fullName,
+        p.amount, p.currency, p.method, p.status, p.booking?.bookingRef,
+      ]);
+    } else if (type === 'calls') {
+      const items = await this.prisma.call.findMany({
+        where: { tenantId, createdAt: { gte: fromDate, lte: toDate }, ...(role === 'AGENT' ? { agentId: userId } : {}) },
+        include: { agent: { select: { name: true } }, client: { select: { fullName: true } } },
+        orderBy: { createdAt: 'desc' }, take: 1000,
+      });
+      headers = ['#', 'Sana', 'Agent', 'Klient', 'Yonalish', 'Status', 'Davomiylik (sek)', 'Raqam'];
+      rows = items.map((c, i) => [
+        i+1, c.createdAt.toLocaleDateString('uz-UZ'), c.agent?.name, c.client?.fullName,
+        c.direction, c.status, c.duration, c.toMasked || c.fromMasked,
+      ]);
+    }
+
+    // Build CSV (simpler than Excel, works universally)
+    const csvLines = [
+      headers.join(','),
+      ...rows.map(row => row.map((v: any) => {
+        const s = String(v ?? '').replace(/"/g, '""');
+        const needsQuote = s.includes(',') || s.includes('"') || s.indexOf('\n') >= 0;
+        return needsQuote ? `"${s}"` : s;
+      }).join(','))
+    ];
+    const newline = '\n';
+    const csv = '\uFEFF' + csvLines.join(newline); // BOM for Excel UTF-8
+
+    return { csv, filename: `${type}-${new Date().toISOString().slice(0,10)}.csv`, rows: rows.length };
+  }
+
+  // ─── EXPORT: Summary stats ────────────────────────────────────────────────
+  async exportSummary(tenantId: string, role: string, userId: string, from?: string, to?: string) {
+    const [dash, agents, bookings] = await Promise.all([
+      this.dashboard(tenantId, userId, role),
+      this.agents(tenantId, from, to),
+      this.bookings(tenantId, role, userId),
+    ]);
+    return { dashboard: dash, agents, bookings, exportedAt: new Date() };
+  }
+
+}
+
+@ApiTags('Reports & Statistika')
+@ApiBearerAuth('JWT')
+@Controller('reports')
+@UseGuards(JwtAuthGuard)
+export class ReportsController {
+  constructor(private svc: ReportsService) {}
+
+  @Get('dashboard')
+  dashboard(@CurrentUser() u: any, @Query('from') from?: string, @Query('to') to?: string) {
+    return this.svc.dashboard(u.tenantId, u.sub, u.role, from, to);
+  }
+
+  @Get('revenue')
+  revenue(@CurrentUser() u: any, @Query('from') from?: string, @Query('to') to?: string) {
+    return this.svc.revenue(u.tenantId, u.role, u.sub, from, to);
+  }
+
+  @Get('agents')
+  agents(@CurrentUser() u: any, @Query('from') from?: string, @Query('to') to?: string) {
+    return this.svc.agents(u.tenantId, from, to);
+  }
+
+  @Get('bookings')
+  bookings(@CurrentUser() u: any) {
+    return this.svc.bookings(u.tenantId, u.role, u.sub);
+  }
+
+  /** v6: Manba (Telegram/Instagram/WhatsApp) bo'yicha */
+  @Get('by-source')
+  bySource(@CurrentUser() u: any) {
+    return this.svc.bySource(u.tenantId, u.role, u.sub);
+  }
+
+  /** v6: Destinatsiya bo'yicha */
+  @Get('by-destination')
+  byDestination(@CurrentUser() u: any, @Query('from') from?: string, @Query('to') to?: string) {
+    return this.svc.byDestination(u.tenantId, u.role, u.sub, from, to);
+  }
+
+  /** v6: Konversiya voronkasi */
+  @Get('conversion-funnel')
+  conversionFunnel(@CurrentUser() u: any) {
+    return this.svc.conversionFunnel(u.tenantId, u.role, u.sub);
+  }
+
+  /** v6: Daromad grafigi (kunlik/oylik) */
+  @Get('revenue-chart')
+  revenueChart(@CurrentUser() u: any, @Query('period') period?: 'day' | 'month') {
+    return this.svc.revenueChart(u.tenantId, u.role, u.sub, period || 'month');
+  }
+
+  /** v6: To'lov usullari bo'yicha */
+  @Get('by-payment-method')
+  byPaymentMethod(@CurrentUser() u: any) {
+    return this.svc.byPaymentMethod(u.tenantId, u.role, u.sub);
+  }
+
+  /**
+   * v7: AGENT'NING SHAXSIY STATISTIKASI
+   * Faqat o'zining ma'lumotlari — global metrika emas
+   * Agent uchun mo'ljallangan: o'z leadlari, bookinglari, foydasi, konversiyasi
+   */
+  @Get('my-stats')
+  myStats(@CurrentUser() u: any, @Query('from') from?: string, @Query('to') to?: string) {
+    return this.svc.myStats(u.tenantId, u.sub, 0, from, to);
+  }
+
+  /**
+   * v8: AGENT MAOSH KALKULYATORI
+   * Agent o'z oyligini ko'radi (komissiya foiziga ko'ra)
+   *
+   * Query param: ?month=0 (bu oy), -1 (o'tgan oy), -2 (oldingi oy)
+   */
+  @Get('my-salary')
+  async mySalary(
+    @CurrentUser() u: any,
+    @Query('month') month?: string,
+    @Query('agentId') agentId?: string,
+  ) {
+    const offset = month ? parseInt(month) : 0;
+    // Admin can view any agent's salary
+    let targetId = u.sub || u.id;
+    if ((u.role === 'TENANT_ADMIN' || u.role === 'MANAGER') && agentId) {
+      // Verify agentId belongs to same tenant (prevent cross-tenant IDOR)
+      const agent = await this.svc['prisma'].user.findFirst({
+        where: { id: agentId, tenantId: u.tenantId },
+        select: { id: true },
+      });
+      if (!agent) throw new Error('Agent topilmadi');
+      targetId = agentId;
+    }
+    return this.svc.mySalary(u.tenantId, targetId, offset);
+  }
+
+  /**
+   * v8: ADMIN UCHUN — barcha agentlar oyliklari
+   * Faqat TENANT_ADMIN va MANAGER ko'radi
+   */
+  @Get('agent-salaries')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN', 'MANAGER')
+  agentSalaries(@CurrentUser() u: any, @Query('month') month?: string) {
+    const offset = month ? parseInt(month) : 0;
+    return this.svc.agentSalaries(u.tenantId, offset);
+  }
+
+  /**
+   * v9-FINAL: KLIENTNING TO'LIQ FINANS PROFILI
+   *
+   * Klient kartasida ko'rsatiladi:
+   *   - Jami bookinglar soni
+   *   - Jami sotuv summasi (totalPrice)
+   *   - Jami xarajat (supplierCost)
+   *   - Jami foyda (profit)
+   *   - To'langan / Qoldiq summa
+   *   - LTV (Lifetime Value)
+   *   - Birinchi va oxirgi booking sanasi
+   *   - Booking ro'yxati (qachon, qayerga, qancha foyda)
+   */
+  @Get('client/:id/financial')
+  clientFinancial(@Param('id') id: string, @CurrentUser() u: any) {
+    return this.svc.getClientFinancial(u.tenantId, id, u.sub, u.role);
+  }
+
+  /**
+   * v9-FINAL: LEAD SOURCE ANALYTICS
+   * Manba bo'yicha lead'lar tahlili:
+   *   - Har bir manbada nechta lead
+   *   - Conversion rate (lead → booking)
+   *   - Har bir manbadan kelgan daromad
+   *   - Eng yaxshi manba
+   */
+  @Get('lead-analytics')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN', 'MANAGER')
+  leadAnalytics(
+    @CurrentUser() u: any,
+    @Query('days') days?: string,
+  ) {
+    const period = Math.min(Number(days) || 30, 365);
+    return this.svc.getLeadAnalytics(u.tenantId, period);
+  }
+
+  @Get('calendar')
+  calendar(
+    @CurrentUser() u: any,
+    @Query('date') date?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.svc.calendarReport(u.tenantId, u.sub, u.role, date, from, to);
+  }
+
+  @Get('call-analytics')
+  callAnalytics(@CurrentUser() u: any, @Query('days') days?: string, @Query('agentId') aid?: string) {
+    const d = Math.min(Number(days) || 30, 365);
+    const agentId = u.role === 'AGENT' ? (u.id || u.sub) : (aid || undefined);
+    return this.svc.getCallAnalytics(u.tenantId, d, agentId);
+  }
+
+  @Get('export')
+  async exportData(
+    @CurrentUser() u: any,
+    @Query('type') type = 'bookings',
+    @Res() res: any,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    const result = await this.svc.exportExcel(u.tenantId, u.role, u.sub, type, from, to);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
+    res.send(result.csv);
+  }
+
+  @Get('export-json')
+  exportJSON(
+    @CurrentUser() u: any,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.svc.exportSummary(u.tenantId, u.role, u.sub, from, to);
+  }
+
+  @Post('mark-salary-paid')
+  @UseGuards(JwtAuthGuard)
+  async markSalaryPaid(@CurrentUser() u: any, @Body() body: any) {
+    if (u.role === 'AGENT') return { error: 'Ruxsat yoq' };
+    const prisma = (this.svc as any).prisma;
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: u.tenantId }, select: { settings: true },
+    });
+    const settings: any = (tenant?.settings as any) || {};
+    const salaryNotes: any = settings.salaryNotes || {};
+    salaryNotes[body.agentId] = {
+      isPaid: !!body.isPaid,
+      note: body.note || '',
+      paidAt: body.isPaid ? new Date().toISOString() : null,
+    };
+    await prisma.tenant.update({
+      where: { id: u.tenantId },
+      data: { settings: { ...settings, salaryNotes } as any },
+    });
+    return { success: true };
+  }
+}
+
+@Module({
+  controllers: [ReportsController],
+  providers: [ReportsService],
+})
+export class ReportsModule {}

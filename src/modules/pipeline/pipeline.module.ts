@@ -1,0 +1,628 @@
+import {
+  Module, Injectable, Controller,
+  Get, Post, Patch, Delete,
+  Param, Body, Query, UseGuards,
+  NotFoundException, BadRequestException, Logger } from '@nestjs/common';
+import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import { PrismaService } from '../../prisma/prisma.service';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { RolesGuard } from '../../common/guards/roles.guard';
+import { CurrentUser, Roles } from '../../common/decorators';
+import { PipelineStage } from '../../prisma-types';;
+import { Prisma } from '@prisma/client';
+
+// ─── Stage config (no DB changes needed) ─────────────────────────────────────
+const STAGE_LABELS_UZ: Record<string, string> = {
+  NEW_LEAD: 'Yangi lid', CONTACTED: 'Aloqa o\'rnatildi',
+  INTERESTED: 'Qiziqdi', OFFER_SENT: 'Taklif yuborildi',
+  NEGOTIATION: 'Muzokara', DEPOSIT_PAID: 'Avans olindi',
+  CONFIRMED: 'Tasdiqlandi', TRAVELING: 'Sayohatda',
+  COMPLETED: 'Yakunlandi', LOST: 'Yo\'qotildi',
+};
+
+const STAGE_COLORS: Record<string, string> = {
+  NEW_LEAD: '#6366f1', CONTACTED: '#3b82f6', INTERESTED: '#06b6d4',
+  OFFER_SENT: '#8b5cf6', NEGOTIATION: '#a855f7', DEPOSIT_PAID: '#22c55e',
+  CONFIRMED: '#10b981', TRAVELING: '#84cc16', COMPLETED: '#64748b', LOST: '#dc2626',
+};
+
+const TERMINAL_STAGES = ['COMPLETED', 'LOST'];
+
+// Auto-transitions
+const AUTO_TRANSITIONS: Record<string, PipelineStage> = {
+  DID_NOT_COME: 'NEGOTIATION', // kelmadi → qayta aloqa (NEGOTIATION maps to follow-up)
+};
+
+// v10 stage display names (stored in CustomStage.name via seed)
+const V10_STAGE_KEYS: Record<string, string> = {
+  'Yangi lid': 'NEW_LEAD',
+  'Aloqa o\'rnatildi': 'CONTACTED',
+  'Aloqa o\'rnatilmadi': 'INTERESTED', // mapped to INTERESTED
+  'Taklif yuborildi': 'OFFER_SENT',
+  'Qayta aloqa': 'NEGOTIATION',
+  'Offisga chaqirildi': 'DEPOSIT_PAID',
+  'Keldi': 'CONFIRMED',
+  'Kelmadi': 'TRAVELING',
+  'Avans to\'landi': 'DEPOSIT_PAID',
+  'To\'landi': 'COMPLETED',
+  'Yo\'qotildi': 'LOST',
+  'Sayohatga ketuvchilar': 'CONFIRMED',
+  'Sayohatdagilar': 'TRAVELING',
+  'Sayohatdan qaytganlar': 'COMPLETED',
+};
+
+@Injectable()
+export class PipelineService {
+  private readonly logger = new Logger('Pipeline');
+  constructor(private prisma: PrismaService) {}
+
+  // ─── Pipeline list (works with existing DB) ────────────────────────────────
+  async listPipelines(tenantId: string) {
+    const pipelines = await this.prisma.pipeline.findMany({
+      where: { tenantId },
+      include: { stages: { orderBy: { order: 'asc' } } },
+      orderBy: { createdAt: 'asc' },
+    });
+    // Add pipelineType based on name pattern (no DB column needed)
+    return pipelines.map(pl => ({
+      ...pl,
+      pipelineType: pl.name.includes('Sayohat') || pl.name.includes('Post') || pl.name.includes('POST')
+        ? 'POST_SALE' : 'NEW_SALE',
+      color: pl.isDefault ? '#3d7eff' : '#10b981',
+    }));
+  }
+
+  // ─── Create pipeline (NO pipelineType column) ─────────────────────────────
+  async createPipeline(tenantId: string, data: { name: string; pipelineType?: string; color?: string }) {
+    const isPost = data.pipelineType === 'POST_SALE';
+    
+    const pl = await this.prisma.pipeline.create({
+      data: {
+        tenantId,
+        name: data.name,
+        isDefault: false,
+      },
+    });
+
+    // Create stages
+    const stages = isPost ? [
+      { name: 'Sayohatga ketuvchilar', color: '#6366f1', order: 1 },
+      { name: 'Sayohatdagilar',        color: '#10b981', order: 2 },
+      { name: 'Sayohatdan qaytganlar', color: '#8b5cf6', order: 3, isClosing: true },
+    ] : [
+      { name: 'Yangi lid',           color: '#6366f1', order: 1 },
+      { name: 'Aloqa o\'rnatildi',   color: '#3b82f6', order: 2 },
+      { name: 'Aloqa o\'rnatilmadi', color: '#f97316', order: 3 },
+      { name: 'Taklif yuborildi',    color: '#8b5cf6', order: 4 },
+      { name: 'Qayta aloqa',         color: '#06b6d4', order: 5 },
+      { name: 'Offisga chaqirildi',  color: '#f59e0b', order: 6 },
+      { name: 'Keldi',               color: '#10b981', order: 7 },
+      { name: 'Kelmadi',             color: '#ef4444', order: 8 },
+      { name: 'Avans to\'landi',     color: '#22c55e', order: 9 },
+      { name: 'To\'landi',           color: '#16a34a', order: 10, isClosing: true },
+      { name: 'Yo\'qotildi',         color: '#dc2626', order: 11, isLost: true },
+    ];
+
+    for (const s of stages) {
+      await this.prisma.customStage.create({
+        data: {
+          tenantId,
+          pipelineId: pl.id,
+          name: s.name,
+          color: s.color,
+          order: s.order,
+          isClosing: (s as any).isClosing || false,
+          isLost: (s as any).isLost || false,
+        },
+      });
+    }
+
+    return this.prisma.pipeline.findUnique({
+      where: { id: pl.id },
+      include: { stages: { orderBy: { order: 'asc' } } },
+    });
+  }
+
+  async updatePipeline(tenantId: string, id: string, data: any) {
+    const pl = await this.prisma.pipeline.findFirst({ where: { id, tenantId } });
+    if (!pl) throw new NotFoundException('Pipeline topilmadi');
+    return this.prisma.pipeline.update({ where: { id }, data: { name: data.name || pl.name } });
+  }
+
+  async deletePipeline(tenantId: string, id: string) {
+    const pl = await this.prisma.pipeline.findFirst({ where: { id, tenantId } });
+    if (!pl) throw new NotFoundException('Pipeline topilmadi');
+    if (pl.isDefault) throw new BadRequestException('Default pipeline o\'chirilmaydi');
+    await this.prisma.pipeline.delete({ where: { id } });
+    return { success: true };
+  }
+
+  // ─── Board (original logic + custom stages by pipeline) ───────────────────
+  async getBoard(tenantId: string, userId: string, role: string, agentId?: string, pipelineId?: string) {
+    const where: any = { tenantId, status: 'ACTIVE' };
+    if (role === 'AGENT') where.assignedAgentId = userId;
+    else if (agentId) where.assignedAgentId = agentId;
+
+    const clients = await this.prisma.client.findMany({
+      where,
+      include: {
+        assignedAgent: { select: { id: true, name: true, avatarUrl: true } },
+        _count: { select: { bookings: true, conversations: true, calls: true } },
+      },
+      orderBy: { pipelineStageAt: 'desc' },
+      take: 500,
+    });
+
+    // If specific pipeline requested - show its custom stages
+    if (pipelineId) {
+      const pipeline = await this.prisma.pipeline.findFirst({
+        where: { id: pipelineId, tenantId },
+        include: { stages: { orderBy: { order: 'asc' } } },
+      });
+      if (!pipeline) throw new NotFoundException('Pipeline topilmadi');
+
+      const columns = (pipeline.stages || []).map((stage: any) => {
+        // Map stage name to PipelineStage enum value
+        const stageEnumKey = V10_STAGE_KEYS[stage.name] || null;
+        const isFirstStage = (pipeline.stages || []).sort((a: any, b: any) => a.order - b.order)[0]?.id === stage.id;
+        const stageClients = clients.filter((c: any) => {
+          if (stageEnumKey) return c.pipelineStage === stageEnumKey;
+          if (c.pipelineStage === 'CUSTOM_' + stage.id) return true;
+          // First column catches: NEW_LEAD and any unrecognized stages
+          if (isFirstStage && (c.pipelineStage === 'NEW_LEAD' || !clients.some((cl: any) =>
+            (pipeline.stages || []).some((s: any) => {
+              const k = V10_STAGE_KEYS[s.name];
+              return cl.id === c.id && (cl.pipelineStage === ('CUSTOM_' + s.id) || (k && cl.pipelineStage === k));
+            })
+          ))) return true;
+          return false;
+        });
+        return {
+          stage: {
+            ...stage,
+            stageKey: stageEnumKey || `CUSTOM_${stage.id}`,
+            label: stage.name,
+          },
+          clients: stageClients.map((c: any) => this.mapClient(c)),
+          count: stageClients.length,
+        };
+      });
+
+      // Add pipelineType based on name
+      const pipelineType = pipeline.name.includes('Sayohat') ? 'POST_SALE' : 'NEW_SALE';
+      return { pipeline: { ...pipeline, pipelineType, color: pipeline.isDefault ? '#3d7eff' : '#10b981' }, columns };
+    }
+
+    // Default board: original ALL_STAGES logic
+    const ALL_STAGES: PipelineStage[] = [
+      'NEW_LEAD', 'CONTACTED', 'INTERESTED', 'OFFER_SENT',
+      'NEGOTIATION', 'DEPOSIT_PAID', 'CONFIRMED', 'TRAVELING',
+      'COMPLETED', 'LOST',
+    ];
+
+    const stages = ALL_STAGES.map((stage) => ({
+      stage,
+      label: STAGE_LABELS_UZ[stage] || stage,
+      color: STAGE_COLORS[stage] || '#64748b',
+      isClosing: TERMINAL_STAGES.includes(stage),
+      stageKey: stage,
+      clients: clients.filter((c) => c.pipelineStage === stage).map((c) => this.mapClient(c)),
+      count: 0,
+      totalValue: 0,
+    }));
+
+    for (const s of stages) {
+      s.count = s.clients.length;
+      (s as any).totalValue = s.clients.reduce((sum: number, c: any) => sum + (c.totalRevenue || 0), 0);
+    }
+
+    // Add custom stages
+    try {
+      const customStages = await this.prisma.customStage.findMany({
+        where: { tenantId },
+        orderBy: { order: 'asc' },
+      });
+      for (const cs of customStages) {
+        const stageEnumKey = V10_STAGE_KEYS[cs.name];
+        const csClients = clients.filter((c: any) =>
+          c.pipelineStage === `CUSTOM_${cs.id}` ||
+          (stageEnumKey && c.pipelineStage === stageEnumKey)
+        ).map((c: any) => this.mapClient(c));
+        (stages as any[]).push({
+          stage: `CUSTOM_${cs.id}`,
+          customStageId: cs.id,
+          stageKey: stageEnumKey || `CUSTOM_${cs.id}`,
+          label: cs.name,
+          color: cs.color,
+          isClosing: cs.isClosing,
+          clients: csClients,
+          count: csClients.length,
+          totalValue: csClients.reduce((s: number, c: any) => s + (c.totalRevenue || 0), 0),
+          isCustom: true,
+        });
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    return { stages };
+  }
+
+  private mapClient(c: any) {
+    // Travel info stored in preferences JSON
+    const prefs = c.preferences || {};
+    return {
+      id: c.id,
+      fullName: c.fullName,
+      phone: c.phone,
+      tier: c.tier,
+      leadScore: c.leadScore,
+      source: c.source,
+      assignedAgent: c.assignedAgent,
+      stageEnteredAt: c.pipelineStageAt,
+      daysInStage: Math.floor((Date.now() - new Date(c.pipelineStageAt).getTime()) / 86400000),
+      tags: c.tags,
+      totalRevenue: c.totalRevenue,
+      noContactAttempts: prefs.noContactAttempts || 0,
+      nextCallAt: prefs.nextCallAt || null,
+      travelDepartDate: prefs.travelDepartDate || null,
+      travelDestination: prefs.travelDestination || null,
+      bookingsCount: c._count.bookings,
+      messagesCount: c._count.conversations,
+      callsCount: c._count.calls,
+      lastContactAt: c.lastContactAt,
+    };
+  }
+
+  // ─── Move stage ────────────────────────────────────────────────────────────
+  async moveStage(tenantId: string, userId: string, role: string, clientId: string, data: {
+    stage: string; note?: string; lostReason?: string; lostReasonDetail?: string;
+  }) {
+    const client = await this.prisma.client.findFirst({ where: { id: clientId, tenantId } });
+    if (!client) throw new NotFoundException('Klient topilmadi');
+
+    // Handle CUSTOM_ stages - store as string bypassing enum check
+    const toStage = data.stage;
+    const isCustomStage = toStage.startsWith('CUSTOM_');
+    const updateData: any = {
+      pipelineStage: (isCustomStage ? toStage : toStage) as any,
+      pipelineStageAt: new Date(),
+    };
+    // lostReason exists in original schema
+    if ((toStage === 'LOST' || toStage.includes('LOST')) && data.lostReason) {
+      updateData.lostReason = data.lostReason as any;
+    }
+
+    // noContactAttempts stored in preferences JSON (no schema change)
+    if (toStage === 'INTERESTED') { // INTERESTED = "Aloqa o'rnatilmadi"
+      const prefs = (client as any).preferences || {};
+      prefs.noContactAttempts = 0;
+      prefs.nextCallAt = new Date(Date.now() + 24 * 3600000).toISOString();
+      updateData.preferences = prefs;
+    }
+
+    await this.prisma.client.update({ where: { id: clientId }, data: updateData });
+
+    // Timeline entry
+    await this.prisma.clientTimeline.create({
+      data: {
+        clientId, userId, type: 'stage_change',
+        title: `Bosqich: ${client.pipelineStage} → ${toStage}`,
+        description: data.note || null,
+        metadata: { from: client.pipelineStage, to: toStage, lostReasonDetail: data.lostReasonDetail },
+      } as any,
+    }).catch(() => {});
+
+    // Auto-transition: 'TRAVELING' (Kelmadi) → NEGOTIATION (Qayta aloqa)
+    if (toStage === ('TRAVELING' as any)) {
+      setTimeout(async () => {
+        try {
+          await this.prisma.client.update({
+            where: { id: clientId },
+            data: { pipelineStage: 'NEGOTIATION', pipelineStageAt: new Date() },
+          });
+        } catch {}
+      }, 3000);
+    }
+
+    return this.prisma.client.findUnique({ where: { id: clientId } });
+  }
+
+  // ─── Call attempts (stored in preferences JSON) ────────────────────────────
+  async recordCallAttempt(tenantId: string, agentId: string, clientId: string, data: {
+    outcome: string; note?: string; nextCallAt?: string;
+  }) {
+    const client = await this.prisma.client.findFirst({ where: { id: clientId, tenantId } });
+    if (!client) throw new NotFoundException('Klient topilmadi');
+
+    const prefs: any = (client as any).preferences || {};
+    const attempts = (prefs.noContactAttempts || 0) + 1;
+    const nextCallAt = data.nextCallAt || new Date(Date.now() + 24 * 3600000).toISOString();
+
+    prefs.noContactAttempts = attempts;
+    prefs.nextCallAt = nextCallAt;
+    prefs.lastCallOutcome = data.outcome;
+    if (!prefs.callHistory) prefs.callHistory = [];
+    prefs.callHistory.push({ attemptNo: attempts, outcome: data.outcome, note: data.note, at: new Date().toISOString() });
+
+    const updateData: any = { preferences: prefs };
+    if (attempts >= 6 && data.outcome === 'NO_ANSWER') {
+      updateData.pipelineStage = 'LOST';
+      updateData.lostReason = 'NO_RESPONSE';
+      updateData.pipelineStageAt = new Date();
+    }
+
+    await this.prisma.client.update({ where: { id: clientId }, data: updateData });
+
+    // Create task for next call
+    if (attempts < 6) {
+      await this.prisma.task.create({
+        data: {
+          tenantId, creatorId: agentId, assigneeId: agentId, clientId,
+          title: `${(client as any).fullName}ga qo'ng'iroq (${attempts}/6)`,
+          priority: 'HIGH', status: 'TODO', dueAt: new Date(nextCallAt),
+        } as any,
+      }).catch(() => {});
+      // Notification
+      await this.prisma.notification.create({
+        data: {
+          tenantId, userId: agentId, type: 'CALL_REMINDER' as any,
+          title: `${(client as any).fullName}ga qo'ng'iroq (${attempts}/6)`,
+          body: `Keyingi: ${new Date(nextCallAt).toLocaleDateString('uz-UZ')}`,
+          link: `/clients/${clientId}`, metadata: {},
+        } as any,
+      }).catch(() => {});
+    }
+
+    return { attempts, nextCallAt, outcome: data.outcome };
+  }
+
+  // ─── Custom stages CRUD (original schema - no stageKey) ───────────────────
+  async getCustomStages(tenantId: string, pipelineId?: string) {
+    const where: any = { tenantId };
+    if (pipelineId) where.pipelineId = pipelineId;
+    return this.prisma.customStage.findMany({ where, orderBy: { order: 'asc' } });
+  }
+
+  async createCustomStage(tenantId: string, data: {
+    name: string; color?: string; order?: number; isClosing?: boolean; pipelineId?: string;
+  }) {
+    let pipelineId = data.pipelineId;
+    if (!pipelineId) {
+      let pl = await this.prisma.pipeline.findFirst({ where: { tenantId, isDefault: true } });
+      if (!pl) pl = await this.prisma.pipeline.findFirst({ where: { tenantId } });
+      if (!pl) throw new BadRequestException('Pipeline topilmadi');
+      pipelineId = pl.id;
+    }
+    const last = await this.prisma.customStage.findFirst({
+      where: { tenantId, pipelineId },
+      orderBy: { order: 'desc' },
+    });
+    return this.prisma.customStage.create({
+      data: {
+        tenantId, pipelineId, name: data.name,
+        color: data.color || '#3d7eff',
+        order: data.order ?? ((last?.order ?? 0) + 1),
+        isClosing: data.isClosing || false,
+      },
+    });
+  }
+
+  async updateCustomStage(tenantId: string, id: string, data: any) {
+    const s = await this.prisma.customStage.findFirst({ where: { id, tenantId } });
+    if (!s) throw new NotFoundException();
+    return this.prisma.customStage.update({ where: { id }, data: { name: data.name || s.name, color: data.color || s.color, order: data.order ?? s.order } });
+  }
+
+  async deleteCustomStage(tenantId: string, id: string) {
+    const s = await this.prisma.customStage.findFirst({ where: { id, tenantId } });
+    if (!s) throw new NotFoundException();
+    if (s.isClosing) throw new BadRequestException('Bu bosqich o\'chirilmaydi');
+    await this.prisma.customStage.delete({ where: { id } });
+    return { success: true };
+  }
+
+  async reorderCustomStages(tenantId: string, orderedIds: string[]) {
+    await Promise.all(orderedIds.map((id, i) =>
+      this.prisma.customStage.updateMany({ where: { id, tenantId }, data: { order: i + 1 } })
+    ));
+    return this.getCustomStages(tenantId);
+  }
+
+  async getHistory(tenantId: string, clientId: string) {
+    return this.prisma.stageHistory.findMany({
+      where: { clientId },
+      include: { user: { select: { id: true, name: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+  }
+
+  async analytics(tenantId: string) {
+    const groups = await this.prisma.client.groupBy({
+      by: ['pipelineStage'],
+      where: { tenantId, status: 'ACTIVE' },
+      _count: { id: true },
+    });
+    return { stageDistribution: groups };
+  }
+
+  async bulkMove(tenantId: string, userId: string, clientIds: string[], stage: string) {
+    await this.prisma.client.updateMany({
+      where: { id: { in: clientIds }, tenantId },
+      data: { pipelineStage: stage as PipelineStage, pipelineStageAt: new Date() },
+    });
+    return { updated: clientIds.length };
+  }
+
+  // ─── CRON: Travel notifications (reads from preferences JSON) ─────────────
+  @Cron(CronExpression.EVERY_HOUR)
+  async travelNotifications() {
+    const now = new Date();
+
+    // Find clients with travel info in preferences
+    const travelingClients = await this.prisma.client.findMany({
+      where: {
+        pipelineStage: { in: ['CONFIRMED', 'TRAVELING'] as PipelineStage[] },
+        status: 'ACTIVE',
+      },
+      take: 100,
+    });
+
+    for (const c of travelingClients) {
+      const prefs: any = (c as any).preferences || {};
+      if (!prefs.travelDepartDate || !(c as any).assignedAgentId) continue;
+
+      const depart = new Date(prefs.travelDepartDate);
+      const diff = depart.getTime() - now.getTime();
+
+      // 1 day before departure
+      if (diff > 0 && diff < 25 * 3600000 && !prefs.departureNotified) {
+        await this.prisma.notification.create({
+          data: {
+            tenantId: c.tenantId, userId: (c as any).assignedAgentId,
+            type: 'STAGE_CHANGED' as any,
+            title: `${(c as any).fullName} ertaga sayohatga ketadi!`,
+            body: 'Omadli yo\'l tiling.', link: `/clients/${c.id}`, metadata: {},
+          } as any,
+        }).catch(() => {});
+        await this.prisma.task.create({
+          data: {
+            tenantId: c.tenantId, creatorId: (c as any).assignedAgentId,
+            assigneeId: (c as any).assignedAgentId, clientId: c.id,
+            title: `${(c as any).fullName}ga omadli yo'l tiling`,
+            priority: 'HIGH', status: 'TODO', dueAt: depart,
+          } as any,
+        }).catch(() => {});
+        // Mark notified
+        await this.prisma.client.update({
+          where: { id: c.id },
+          data: { preferences: { ...prefs, departureNotified: true } } as any,
+        }).catch(() => {});
+      }
+    }
+
+    // Callback reminders (nextCallAt in preferences)
+    const noContactClients = await this.prisma.client.findMany({
+      where: { pipelineStage: 'INTERESTED', status: 'ACTIVE' },
+      take: 100,
+    });
+
+    for (const c of noContactClients) {
+      const prefs: any = (c as any).preferences || {};
+      if (!prefs.nextCallAt || !(c as any).assignedAgentId) continue;
+      if (new Date(prefs.nextCallAt) <= now) {
+        await this.prisma.notification.create({
+          data: {
+            tenantId: c.tenantId, userId: (c as any).assignedAgentId,
+            type: 'FOLLOWUP_DUE' as any,
+            title: `${(c as any).fullName}ga qo'ng'iroq vaqti!`,
+            body: `${(prefs.noContactAttempts || 0) + 1}/6 urinish`,
+            link: `/clients/${c.id}`, metadata: {},
+          } as any,
+        }).catch(() => {});
+      }
+    }
+  }
+
+  // Task deadline reminders (every 5 min)
+  @Cron('*/5 * * * *')
+  async taskReminders() {
+    const now = new Date();
+    const in15 = new Date(now.getTime() + 15 * 60000);
+    const tasks = await this.prisma.task.findMany({
+      where: { status: { in: ['TODO', 'IN_PROGRESS'] }, dueAt: { gte: now, lte: in15 } } as any,
+      include: { client: { select: { fullName: true } } } as any,
+    });
+    for (const t of tasks as any[]) {
+      if (!t.assigneeId) continue;
+      await this.prisma.notification.create({
+        data: {
+          tenantId: t.tenantId, userId: t.assigneeId, type: 'TASK_DUE' as any,
+          title: `Vazifa: ${t.title}`,
+          body: t.client ? `Klient: ${t.client.fullName}` : '15 daqiqa qoldi',
+          link: t.clientId ? `/clients/${t.clientId}` : '/tasks', metadata: {},
+        } as any,
+      }).catch(() => {});
+    }
+  }
+}
+
+// ─── Controller ───────────────────────────────────────────────────────────────
+@ApiTags('Pipeline')
+@ApiBearerAuth('JWT')
+@Controller('pipeline')
+@UseGuards(JwtAuthGuard)
+export class PipelineController {
+  constructor(private svc: PipelineService) {}
+
+  @Get('pipelines')
+  listPipelines(@CurrentUser() u: any) { return this.svc.listPipelines(u.tenantId); }
+
+  @Post('pipelines')
+  createPipeline(@CurrentUser() u: any, @Body() body: any) { return this.svc.createPipeline(u.tenantId, body); }
+
+  @Patch('pipelines/:id')
+  updatePipeline(@CurrentUser() u: any, @Param('id') id: string, @Body() body: any) { return this.svc.updatePipeline(u.tenantId, id, body); }
+
+  @Delete('pipelines/:id')
+  @UseGuards(RolesGuard) @Roles('TENANT_ADMIN')
+  deletePipeline(@CurrentUser() u: any, @Param('id') id: string) { return this.svc.deletePipeline(u.tenantId, id); }
+
+  @Get('board')
+  board(@CurrentUser() u: any, @Query('agentId') aid?: string, @Query('pipelineId') pid?: string) {
+    return this.svc.getBoard(u.tenantId, u.id || u.sub, u.role, aid, pid);
+  }
+
+  @Get('analytics')
+  analytics(@CurrentUser() u: any) { return this.svc.analytics(u.tenantId); }
+
+  @Get('client/:id/history')
+  history(@CurrentUser() u: any, @Param('id') id: string) { return this.svc.getHistory(u.tenantId, id); }
+
+  @Patch('client/:id/stage')
+  moveStage(@CurrentUser() u: any, @Param('id') id: string, @Body() body: any) {
+    return this.svc.moveStage(u.tenantId, u.id || u.sub, u.role, id, body);
+  }
+
+  @Patch('move/:clientId')
+  moveClient(@CurrentUser() u: any, @Param('clientId') id: string, @Body() body: any) {
+    return this.svc.moveStage(u.tenantId, u.id || u.sub, u.role, id, body);
+  }
+
+  @Post('bulk-move')
+  bulkMove(@CurrentUser() u: any, @Body() body: { clientIds: string[]; stage: string }) {
+    return this.svc.bulkMove(u.tenantId, u.id || u.sub, body.clientIds, body.stage);
+  }
+
+  @Post('call-attempt/:clientId')
+  callAttempt(@CurrentUser() u: any, @Param('clientId') id: string, @Body() body: any) {
+    return this.svc.recordCallAttempt(u.tenantId, u.id || u.sub, id, body);
+  }
+
+  @Get('stages')
+  getStages(@CurrentUser() u: any, @Query('pipelineId') pid?: string) { return this.svc.getCustomStages(u.tenantId, pid); }
+
+  @Post('stages')
+  createStage(@CurrentUser() u: any, @Body() body: any) { return this.svc.createCustomStage(u.tenantId, body); }
+
+  @Patch('stages/:id')
+  updateStage(@CurrentUser() u: any, @Param('id') id: string, @Body() body: any) { return this.svc.updateCustomStage(u.tenantId, id, body); }
+
+  @Delete('stages/:id')
+  @UseGuards(RolesGuard) @Roles('TENANT_ADMIN', 'MANAGER')
+  deleteStage(@CurrentUser() u: any, @Param('id') id: string) { return this.svc.deleteCustomStage(u.tenantId, id); }
+
+  @Post('stages/reorder')
+  reorderStages(@CurrentUser() u: any, @Body() body: { orderedIds: string[] }) {
+    return this.svc.reorderCustomStages(u.tenantId, body.orderedIds);
+  }
+}
+
+@Module({
+  controllers: [PipelineController],
+  providers: [PipelineService],
+  exports: [PipelineService],
+})
+export class PipelineModule {}
