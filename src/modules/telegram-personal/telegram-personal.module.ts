@@ -14,13 +14,10 @@ import { CurrentUser } from '../../common/decorators';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { EncryptionService } from '../../common/encryption/encryption.service';
 
-// ─── SESSION STORE (memory — per user) ─────────────────────────
+// ─── SESSION STORE (memory — faqat aktiv ulanganlar uchun) ──
+// Bu Map restart bo'lsa yo'qoladi, lekin bu OK —
+// chunki session DB da saqlangan, getClient() qayta ulanadi
 const activeSessions = new Map<string, TelegramClient>();
-const pendingAuth = new Map<string, {
-  client: TelegramClient;
-  phone: string;
-  phoneCodeHash: string;
-}>();
 
 // ─── SERVICE ───────────────────────────────────────────────────
 @Injectable()
@@ -61,7 +58,6 @@ export class TelegramPersonalService {
     await client.connect();
     activeSessions.set(userId, client);
 
-    // Incoming messages listener
     client.addEventHandler(async (event: any) => {
       await this.handleIncoming(event, userId, tenantId);
     }, new NewMessage({}));
@@ -69,7 +65,7 @@ export class TelegramPersonalService {
     return client;
   }
 
-  // ── STEP 1: Send code ──────────────────────────────────────
+  // ── STEP 1: Send code — endi DB ga saqlanadi ──────────────
   async sendCode(userId: string, tenantId: string, phone: string, apiId: number, apiHash: string) {
     const client = new TelegramClient(
       new StringSession(''),
@@ -79,17 +75,61 @@ export class TelegramPersonalService {
     await client.connect();
 
     const result = await client.sendCode({ apiId, apiHash }, phone);
-    pendingAuth.set(userId, { client, phone, phoneCodeHash: result.phoneCodeHash });
+
+    // Eski pending ni o'chirib, yangisini DB ga yoz
+    await (this.prisma as any).telegramPendingAuth.deleteMany({ where: { userId } });
+
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 daqiqa
+    await (this.prisma as any).telegramPendingAuth.create({
+      data: {
+        userId,
+        phone,
+        phoneCodeHash: result.phoneCodeHash,
+        apiId,
+        apiHash: this.encryption.encrypt(apiHash),
+        expiresAt,
+      },
+    });
+
+    // Client ni RAM da saqlaylik (bir xil process ichida ishlaydi)
+    // Agar restart bo'lsa verifyCode yangi client yaratadi
+    activeSessions.set(`pending_${userId}`, client);
 
     return { sent: true, phoneCodeHash: result.phoneCodeHash };
   }
 
-  // ── STEP 2: Verify code ────────────────────────────────────
+  // ── STEP 2: Verify code — DB dan o'qiydi ──────────────────
   async verifyCode(userId: string, tenantId: string, code: string, password?: string) {
-    const pending = pendingAuth.get(userId);
-    if (!pending) throw new BadRequestException('Avval telefon raqam kiriting');
+    // DB dan pending ma'lumotni olish
+    const pending = await (this.prisma as any).telegramPendingAuth.findUnique({
+      where: { userId },
+    });
 
-    const { client, phone, phoneCodeHash } = pending;
+    if (!pending) {
+      throw new BadRequestException('Avval telefon raqam kiriting (kod muddati tugagan bo\'lishi mumkin)');
+    }
+
+    // Muddati o'tganmi tekshir
+    if (new Date() > new Date(pending.expiresAt)) {
+      await (this.prisma as any).telegramPendingAuth.deleteMany({ where: { userId } });
+      throw new BadRequestException('Kod muddati tugadi. Qaytadan telefon raqam kiriting.');
+    }
+
+    const apiId   = pending.apiId;
+    const apiHash = this.encryption.decrypt(pending.apiHash);
+    const phone   = pending.phone;
+    const phoneCodeHash = pending.phoneCodeHash;
+
+    // RAM da client bor bo'lsa ishlatamiz, yo'q bo'lsa yangi yaratamiz
+    let client = activeSessions.get(`pending_${userId}`);
+    if (!client || !client.connected) {
+      client = new TelegramClient(
+        new StringSession(''),
+        apiId, apiHash,
+        { connectionRetries: 3, useWSS: false },
+      );
+      await client.connect();
+    }
 
     try {
       await client.invoke(new Api.auth.SignIn({
@@ -107,13 +147,15 @@ export class TelegramPersonalService {
       } else throw e;
     }
 
-    const session = (client.session as StringSession).save();
-    pendingAuth.delete(userId);
-
-    // Save to DB
+    const session    = (client.session as StringSession).save();
     const encSession = this.encryption.encrypt(session);
-    const encHash    = this.encryption.encrypt(pending.client['apiHash'] || '');
+    const encHash    = this.encryption.encrypt(apiHash);
 
+    // Pending ni DB dan o'chir
+    await (this.prisma as any).telegramPendingAuth.deleteMany({ where: { userId } });
+    activeSessions.delete(`pending_${userId}`);
+
+    // Session ni DB ga saqlash
     const existing = await (this.prisma as any).telegramAccount.findFirst({
       where: { userId, tenantId, isPersonal: true },
     });
@@ -139,7 +181,6 @@ export class TelegramPersonalService {
     }
 
     activeSessions.set(userId, client);
-    // Incoming listener
     client.addEventHandler(async (event: any) => {
       await this.handleIncoming(event, userId, tenantId);
     }, new NewMessage({}));
@@ -158,7 +199,6 @@ export class TelegramPersonalService {
       const entity = d.entity as any;
       const chatId = String(entity?.id || d.id);
 
-      // Upsert conversation
       let conv = await (this.prisma as any).conversation.findFirst({
         where: { tenantId, channel: 'TELEGRAM', externalChatId: chatId },
       });
@@ -221,7 +261,7 @@ export class TelegramPersonalService {
           fileName = `tg_${Date.now()}_${m.id}.${ext}`;
           const filePath = path.join(uploadDir, fileName);
           
-          const buf = await client.downloadMedia(m as any) as Buffer;
+          const buf = await client.downloadMedia(m as any, { workers: 1 }) as Buffer;
           if (buf && buf.length > 0) {
             fs.writeFileSync(filePath, buf);
             const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
@@ -234,10 +274,10 @@ export class TelegramPersonalService {
       const myId     = String((await client.getMe())?.id || '');
       const direction = senderId === myId ? 'OUTBOUND' : 'INBOUND';
 
-      // Determine message type
       const msgType = m.media
         ? ((m.media as any).photo ? 'PHOTO' : 'DOCUMENT')
         : 'TEXT';
+
       await (this.prisma as any).message.create({
         data: {
           conversationId,

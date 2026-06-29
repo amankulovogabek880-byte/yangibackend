@@ -1691,3 +1691,21 @@ model WebhookLog {
   @@index([apiKeyId])
   @@map("webhook_logs")
 }
+
+// ═══════════════════════════════════════════════════════════
+// TELEGRAM PENDING AUTH (RAM o'rniga DB — Render restart safe)
+// sendCode → verifyCode orasidagi vaqtinchalik ma'lumot
+// ═══════════════════════════════════════════════════════════
+model TelegramPendingAuth {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  phone         String
+  phoneCodeHash String
+  apiId         Int
+  apiHash       String   // encrypted
+  createdAt     DateTime @default(now())
+  expiresAt     DateTime // 10 daqiqa
+
+  @@index([userId])
+  @@map("telegram_pending_auth")
+}
