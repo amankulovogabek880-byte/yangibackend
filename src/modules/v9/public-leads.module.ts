@@ -464,7 +464,7 @@ export class PublicLeadsService {
       await writeLog();
 
       this.logger.log(
-        `[PUBLIC LEADS] ✅ Lead yaratildi: ${newClient.id} | Agent: ${assignedAgentId || 'YOQ'} | Tenant: ${tenantId}`,
+        `[PUBLIC LEADS] ✅ Lead yaratildi: ${newClient.id} | Agent: ${assignedAgentId || 'YO'Q'} | Tenant: ${tenantId}`,
       );
 
       return {
@@ -643,7 +643,7 @@ export class WebhookLogsController {
   constructor(private svc: PublicLeadsService) {}
 
   @Get()
-  @UseGuards(RolesGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('TENANT_ADMIN', 'MANAGER')
   async list(
     @CurrentUser() u: any,
@@ -683,7 +683,7 @@ export class WebhookLogsController {
   }
 
   @Get(':id')
-  @UseGuards(RolesGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('TENANT_ADMIN', 'MANAGER')
   async one(@Param('id') id: string, @CurrentUser() u: any) {
     const log = await this.prisma.webhookLog.findFirst({
@@ -694,7 +694,7 @@ export class WebhookLogsController {
   }
 
   @Delete(':id')
-  @UseGuards(RolesGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('TENANT_ADMIN')
   async delete(@Param('id') id: string, @CurrentUser() u: any) {
     const log = await this.prisma.webhookLog.findFirst({
@@ -703,6 +703,57 @@ export class WebhookLogsController {
     if (!log) throw new BadRequestException('Log topilmadi');
     await this.prisma.webhookLog.delete({ where: { id } });
     return { ok: true };
+  }
+
+  /**
+   * v10: Webhook'ni qayta jo'natish — saqlangan requestBody asosida
+   * lead import jarayonini qayta ishga tushiradi.
+   */
+  @Post(':id/retry')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('TENANT_ADMIN', 'MANAGER')
+  async retry(@Param('id') id: string, @CurrentUser() u: any) {
+    const log = await this.prisma.webhookLog.findFirst({
+      where: { id, tenantId: u.tenantId },
+    });
+    if (!log) throw new BadRequestException('Log topilmadi');
+    if (!log.requestBody) throw new BadRequestException("Qayta jo'natish uchun ma'lumot yo'q");
+
+    try {
+      const result = await this.svc.createLead(u.tenantId, log.apiKeyPrefix || '', log.requestBody as any);
+      await this.prisma.webhookLog.create({
+        data: {
+          tenantId: u.tenantId,
+          apiKeyId: log.apiKeyId,
+          apiKeyPrefix: log.apiKeyPrefix,
+          apiKeyName: log.apiKeyName,
+          endpoint: log.endpoint,
+          method: log.method,
+          requestBody: log.requestBody,
+          responseBody: result as any,
+          statusCode: 200,
+          success: true,
+          clientId: (result as any)?.id,
+        },
+      });
+      return { ok: true, result };
+    } catch (e: any) {
+      await this.prisma.webhookLog.create({
+        data: {
+          tenantId: u.tenantId,
+          apiKeyId: log.apiKeyId,
+          apiKeyPrefix: log.apiKeyPrefix,
+          apiKeyName: log.apiKeyName,
+          endpoint: log.endpoint,
+          method: log.method,
+          requestBody: log.requestBody,
+          statusCode: 400,
+          success: false,
+          errorMessage: e?.message || "Noma'lum xato",
+        },
+      });
+      throw new BadRequestException(e?.message || "Qayta jo'natishda xato");
+    }
   }
 }
 
