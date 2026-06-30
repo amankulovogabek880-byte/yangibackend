@@ -1,22 +1,26 @@
 import {
   Module, Injectable, Controller, Post, Get, Delete, UseGuards,
   UploadedFile, UseInterceptors, BadRequestException,
-  UploadedFiles, Query, Param, NotFoundException,
+  UploadedFiles, Query, Param, NotFoundException, Logger,
 } from '@nestjs/common';
 import { FileInterceptor, FilesInterceptor } from '@nestjs/platform-express';
-import { diskStorage } from 'multer';
-import { extname } from 'path';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators';
 import { PrismaService } from '../../prisma/prisma.service';
 import { DocumentCategory } from '@prisma/client';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-const UPLOAD_DIR = process.env.UPLOAD_DIR || './uploads';
-const BASE_URL = process.env.PUBLIC_URL || 'http://localhost:3000';
+// ─── Supabase Storage konfiguratsiyasi ──────────────────────────────
+// .env da SUPABASE_URL va SUPABASE_SERVICE_KEY bo'lishi shart.
+// Bucket nomi: "documents" (public bo'lishi kerak — Supabase dashboard'da
+// Storage > New bucket > Public bucket ✅ yoqilgan bo'lishi kerak)
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || 'documents';
 
-// Telegramga ham yaroqli URL formati
-function publicUrl(filename: string): string {
-  return `${BASE_URL}/uploads/${filename}`;
+let supabase: SupabaseClient | null = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 }
 
 const ALLOWED_MIME = new Set([
@@ -29,11 +33,17 @@ const ALLOWED_MIME = new Set([
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 ]);
 
+function safeFileName(original: string): string {
+  const safe = original.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safe}`;
+}
+
 @Injectable()
 export class UploadsService {
+  private readonly logger = new Logger('Uploads');
+
   constructor(private prisma: PrismaService) {}
 
-  // Entity turi → DocumentCategory + qaysi FK ustunga yozish
   private mapEntity(entityType?: string, entityId?: string) {
     const t = (entityType || '').toLowerCase();
     if (t === 'booking') return { bookingId: entityId };
@@ -41,9 +51,41 @@ export class UploadsService {
     return {};
   }
 
+  /**
+   * Faylni Supabase Storage'ga yuklaydi va public URL qaytaradi.
+   * Render'dagi diskdan farqli o'laroq, bu URL doimiy — deploy/restart
+   * bo'lganda ham fayl o'chmaydi.
+   */
+  async uploadToSupabase(file: Express.Multer.File): Promise<{ url: string; path: string }> {
+    if (!supabase) {
+      throw new BadRequestException(
+        'Fayl saqlash xizmati sozlanmagan (SUPABASE_URL / SUPABASE_SERVICE_KEY yoq)',
+      );
+    }
+    const path = safeFileName(file.originalname);
+    const { error } = await supabase.storage
+      .from(SUPABASE_BUCKET)
+      .upload(path, file.buffer, {
+        contentType: file.mimetype,
+        upsert: false,
+      });
+    if (error) {
+      this.logger.error(`Supabase upload xatosi: ${error.message}`);
+      throw new BadRequestException(`Fayl yuklanmadi: ${error.message}`);
+    }
+    const { data: pub } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(path);
+    return { url: pub.publicUrl, path };
+  }
+
+  async deleteFromSupabase(path: string) {
+    if (!supabase) return;
+    await supabase.storage.from(SUPABASE_BUCKET).remove([path]).catch(() => {});
+  }
+
   async saveRecord(
     tenantId: string, uploadedById: string,
     file: Express.Multer.File,
+    url: string, storagePath: string,
     entityType?: string, entityId?: string,
   ) {
     const link = this.mapEntity(entityType, entityId);
@@ -52,8 +94,8 @@ export class UploadsService {
         tenantId,
         uploadedById,
         name: file.originalname,
-        fileName: file.filename,
-        fileUrl: publicUrl(file.filename),
+        fileName: storagePath,
+        fileUrl: url,
         fileMimeType: file.mimetype,
         fileSize: file.size,
         category: 'OTHER' as DocumentCategory,
@@ -67,7 +109,6 @@ export class UploadsService {
     if (entityType === 'booking' && entityId) where.bookingId = entityId;
     else if (entityType === 'client' && entityId) where.clientId = entityId;
     else if (entityId) {
-      // entityType berilmagan — ikkalasidan ham qidiramiz
       where.OR = [{ bookingId: entityId }, { clientId: entityId }];
     }
     const docs = await this.prisma.document.findMany({
@@ -87,6 +128,7 @@ export class UploadsService {
   async remove(tenantId: string, id: string) {
     const doc = await this.prisma.document.findFirst({ where: { id, tenantId } });
     if (!doc) throw new NotFoundException('Hujjat topilmadi');
+    await this.deleteFromSupabase(doc.fileName);
     await this.prisma.document.delete({ where: { id } });
     return { ok: true };
   }
@@ -97,24 +139,16 @@ export class UploadsController {
   constructor(private svc: UploadsService) {}
 
   /**
-   * v6: Bitta fayl yuklash (inbox, template, klient hujjati uchun)
-   * v10: DB ga ham yoziladi (Document jadvali) — Render restart bo'lganda
-   * fayl o'chib ketsa ham metadata saqlanib qoladi va xato bermaydi.
+   * Bitta fayl yuklash — Supabase Storage'ga saqlanadi (doimiy, Render
+   * restart bo'lsa ham o'chmaydi). DB'ga ham yoziladi (Document jadvali).
    */
   @Post()
   @UseGuards(JwtAuthGuard)
   @UseInterceptors(FileInterceptor('file', {
-    storage: diskStorage({
-      destination: UPLOAD_DIR,
-      filename: (_req, file, cb) => {
-        const safe = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-        cb(null, `${Date.now()}-${safe}`);
-      },
-    }),
     limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB
     fileFilter: (_req, file, cb) => {
       if (!ALLOWED_MIME.has(file.mimetype)) {
-        cb(new BadRequestException(`Fayl turi qo'llab-quvvatlanmaydi: ${file.mimetype}`), false);
+        cb(new BadRequestException(`Fayl turi qollab-quvvatlanmaydi: ${file.mimetype}`), false);
         return;
       }
       cb(null, true);
@@ -130,17 +164,18 @@ export class UploadsController {
     const isImage = file.mimetype.startsWith('image/');
     const isVideo = file.mimetype.startsWith('video/');
 
-    // DB ga yozamiz (agar entityType/entityId berilgan bo'lsa)
+    const { url, path } = await this.svc.uploadToSupabase(file);
+
     let docId: string | undefined;
     if (entityType && entityId) {
-      const doc = await this.svc.saveRecord(u.tenantId, u.sub, file, entityType, entityId);
+      const doc = await this.svc.saveRecord(u.tenantId, u.sub, file, url, path, entityType, entityId);
       docId = doc.id;
     }
 
     return {
       id: docId,
-      url: publicUrl(file.filename),
-      filename: file.filename,
+      url,
+      filename: path,
       originalName: file.originalname,
       mimeType: file.mimetype,
       size: file.size,
@@ -149,7 +184,56 @@ export class UploadsController {
   }
 
   /**
-   * v10: Hujjatlar ro'yxati — entityType + entityId bo'yicha
+   * Bir nechta fayl (mehmonxona galereya kabi)
+   */
+  @Post('batch')
+  @UseGuards(JwtAuthGuard)
+  @UseInterceptors(FilesInterceptor('files', 10, {
+    limits: { fileSize: 25 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+      if (!ALLOWED_MIME.has(file.mimetype)) {
+        cb(new BadRequestException(`Fayl turi: ${file.mimetype} qollab-quvvatlanmaydi`), false);
+        return;
+      }
+      cb(null, true);
+    },
+  }))
+  async uploadBatch(
+    @UploadedFiles() files: Express.Multer.File[],
+    @Query('entityType') entityType: string,
+    @Query('entityId') entityId: string,
+    @CurrentUser() u: any,
+  ) {
+    if (!files?.length) throw new BadRequestException('Fayllar yoq');
+
+    const results = [];
+    for (const f of files) {
+      const isImage = f.mimetype.startsWith('image/');
+      const isVideo = f.mimetype.startsWith('video/');
+      const { url, path } = await this.svc.uploadToSupabase(f);
+
+      let docId: string | undefined;
+      if (entityType && entityId) {
+        const doc = await this.svc.saveRecord(u.tenantId, u.sub, f, url, path, entityType, entityId);
+        docId = doc.id;
+      }
+
+      results.push({
+        id: docId,
+        url,
+        filename: path,
+        originalName: f.originalname,
+        mimeType: f.mimetype,
+        size: f.size,
+        type: isImage ? 'image' : isVideo ? 'video' : 'document',
+      });
+    }
+
+    return { count: results.length, files: results };
+  }
+
+  /**
+   * Hujjatlar royxati — entityType + entityId boyicha
    * Misol: GET /uploads?entityType=booking&entityId=xxx
    */
   @Get()
@@ -163,53 +247,12 @@ export class UploadsController {
   }
 
   /**
-   * v10: Hujjatni o'chirish
+   * Hujjatni ochirish (Supabase'dan ham, DB'dan ham)
    */
   @Delete(':id')
   @UseGuards(JwtAuthGuard)
   remove(@Param('id') id: string, @CurrentUser() u: any) {
     return this.svc.remove(u.tenantId, id);
-  }
-
-  /**
-   * v6: Bir nechta fayl (mehmonxona galereya — bir vaqtning o'zida 5-10 ta rasm)
-   */
-  @Post('batch')
-  @UseGuards(JwtAuthGuard)
-  @UseInterceptors(FilesInterceptor('files', 10, {
-    storage: diskStorage({
-      destination: UPLOAD_DIR,
-      filename: (_req, file, cb) => {
-        const safe = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safe}`);
-      },
-    }),
-    limits: { fileSize: 25 * 1024 * 1024 },
-    fileFilter: (_req, file, cb) => {
-      if (!ALLOWED_MIME.has(file.mimetype)) {
-        cb(new BadRequestException(`Fayl turi: ${file.mimetype} qo'llab-quvvatlanmaydi`), false);
-        return;
-      }
-      cb(null, true);
-    },
-  }))
-  uploadBatch(@UploadedFiles() files: Express.Multer.File[], @CurrentUser() u: any) {
-    if (!files?.length) throw new BadRequestException('Fayllar yo\'q');
-    return {
-      count: files.length,
-      files: files.map((f) => {
-        const isImage = f.mimetype.startsWith('image/');
-        const isVideo = f.mimetype.startsWith('video/');
-        return {
-          url: publicUrl(f.filename),
-          filename: f.filename,
-          originalName: f.originalname,
-          mimeType: f.mimetype,
-          size: f.size,
-          type: isImage ? 'image' : isVideo ? 'video' : 'document',
-        };
-      }),
-    };
   }
 }
 
