@@ -66,7 +66,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     } catch {}
     const bot = new TelegramBot(token, { polling: true });
     bot.on('message', (msg) =>
-      this.handleIncoming(msg, accountId, tenantId).catch((e) =>
+      this.handleIncoming(msg, accountId, tenantId, bot).catch((e) =>
         this.logger.error(`handle: ${e.message}`),
       ),
     );
@@ -125,6 +125,31 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     return counts[0].id;
   }
 
+  // ─── Telegram bot orqali profil rasmini yuklab olish ──────────────────────
+  private async saveAvatarFromBot(bot: TelegramBot, tgUserId: string, key: string): Promise<string | undefined> {
+    try {
+      const photos = await bot.getUserProfilePhotos(Number(tgUserId), { limit: 1 });
+      const fileId = photos?.photos?.[0]?.[0]?.file_id;
+      if (!fileId) return undefined;
+
+      const fileLink = await bot.getFileLink(fileId);
+      const axios = require('axios');
+      const resp = await axios.get(fileLink, { responseType: 'arraybuffer' });
+
+      const fs = require('fs');
+      const path = require('path');
+      const uploadDir = process.env.UPLOAD_DIR || './uploads';
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+      const fileName = `tg_avatar_bot_${key}.jpg`;
+      fs.writeFileSync(path.join(uploadDir, fileName), Buffer.from(resp.data));
+      const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
+      return `${baseUrl}/uploads/${fileName}?v=${Date.now()}`;
+    } catch {
+      return undefined;
+    }
+  }
+
   private inferType(msg: TelegramBot.Message): MessageType {
     if (msg.photo) return 'PHOTO';
     if (msg.document) return 'DOCUMENT';
@@ -141,6 +166,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     msg: TelegramBot.Message,
     accountId: string,
     tenantId: string,
+    bot: TelegramBot,
   ) {
     const chatId = String(msg.chat.id);
     const tgUserId = msg.from?.id ? String(msg.from.id) : undefined;
@@ -157,6 +183,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     });
     let isNew = false;
 
+    // Telegramdan profil rasmini olib qo'yamiz (faqat hali yo'q bo'lsa) —
+    // shu orqali "rasm ko'rinmayapti" muammosi hal bo'ladi
+    let avatarUrl: string | undefined;
+    if (tgUserId && (!conv || !conv.avatarUrl)) {
+      avatarUrl = await this.saveAvatarFromBot(bot, tgUserId, chatId);
+    }
+
     if (!conv) {
       isNew = true;
       const client = tgUserId
@@ -165,27 +198,6 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           })
         : null;
       const assignedAgentId = await this.pickAgent(tenantId);
-
-      // Telegram profil rasmini olish
-      let avatarUrl: string | null = null;
-      try {
-        if (tgUserId) {
-          const bot = this.bots.get(accountId);
-          if (bot) {
-            const photos = await bot.getUserProfilePhotos(Number(tgUserId), { limit: 1 });
-            if (photos.total_count > 0 && photos.photos[0]?.[0]?.file_id) {
-              const fileId = photos.photos[0][photos.photos[0].length - 1].file_id;
-              const file = await bot.getFile(fileId);
-              if (file.file_path) {
-                // Find bot token from bots map context - passed in startBot
-                const acc2 = await this.prisma.telegramAccount.findFirst({ where: { id: accountId } });
-                const botToken = acc2?.botToken || '';
-                avatarUrl = `https://api.telegram.org/file/bot${botToken}/${file.file_path}`;
-              }
-            }
-          }
-        }
-      } catch { /* rasm olishda xato - davom etamiz */ }
 
       conv = await this.prisma.conversation.create({
         data: {
@@ -214,6 +226,16 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           metadata: { conversationId: conv.id },
         }).catch(() => {});
       }
+    } else if (avatarUrl || !conv.firstName) {
+      conv = await this.prisma.conversation.update({
+        where: { id: conv.id },
+        data: {
+          ...(avatarUrl ? { avatarUrl } : {}),
+          firstName: conv.firstName || msg.from?.first_name,
+          lastName: conv.lastName || msg.from?.last_name,
+          username: conv.username || msg.from?.username,
+        },
+      });
     }
 
     const messageType = this.inferType(msg);
@@ -238,8 +260,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       },
     });
 
-    // Real-time emit (WebSocket)
+    // Real-time emit (WebSocket) — tenant xonasiga, chunki frontend shu xonaga avtomatik qo'shiladi
     try {
+      this.realtime.emitToTenant(tenantId, 'message:new', newMsg);
       this.realtime.emitToConversation(conv.id, 'message:new', newMsg);
       this.realtime.emitToTenant(tenantId, 'conversation:updated', {
         conversationId: conv.id,
@@ -312,7 +335,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         messageType: 'TEXT',
         text, isInternal, isRead: true,
       },
-      include: { agent: { select: { id: true, name: true } } },
+      include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
     });
 
     if (!isInternal && conv.channel === 'TELEGRAM' && conv.accountId) {
@@ -339,6 +362,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
     // Realtime emit
     try {
+      this.realtime.emitToTenant(tenantId, 'message:new', msg);
       this.realtime.emitToConversation(conversationId, 'message:new', msg);
       this.realtime.emitToTenant(tenantId, 'conversation:updated', {
         conversationId,
@@ -396,7 +420,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         caption: data.caption,
         isRead: true,
       },
-      include: { agent: { select: { id: true, name: true } } },
+      include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
     });
 
     // Telegramga yuborish
@@ -459,6 +483,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
+      this.realtime.emitToTenant(tenantId, 'message:new', msg);
       this.realtime.emitToConversation(conversationId, 'message:new', msg);
     } catch {}
 
@@ -928,11 +953,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       }),
       this.prisma.conversation.count({ where }),
     ]);
-    // Add isPersonal flag and photoUrl from account to each conversation
+    // Add isPersonal flag from account to each conversation
     const enriched = data.map((conv: any) => ({
       ...conv,
       isPersonal: conv.account?.isPersonal ?? false,
-      photoUrl: conv.avatarUrl || null,  // Frontend uchun photoUrl alias
     }));
     return { data: enriched, meta: meta(total, page, limit) };
   }
@@ -959,7 +983,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
     const messages = await this.prisma.message.findMany({
       where: { conversationId },
-      include: { agent: { select: { id: true, name: true } } },
+      include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
       orderBy: { createdAt: 'asc' },
       take: 200,
     });

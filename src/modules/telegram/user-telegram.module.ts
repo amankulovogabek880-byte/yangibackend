@@ -86,6 +86,26 @@ export class UserTelegramService implements OnModuleInit {
     return null;
   }
 
+  // ─── Telegramdan profil rasmini yuklab olish va saqlash ───────────────────
+  private async saveAvatar(client: TelegramClient, entity: any, key: string): Promise<string | undefined> {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const uploadDir = process.env.UPLOAD_DIR || './uploads';
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+      const buf = await client.downloadProfilePhoto(entity, {} as any) as Buffer;
+      if (!buf || !buf.length) return undefined;
+
+      const fileName = `tg_avatar_${key}.jpg`;
+      fs.writeFileSync(path.join(uploadDir, fileName), buf);
+      const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
+      return `${baseUrl}/uploads/${fileName}?v=${Date.now()}`;
+    } catch {
+      return undefined;
+    }
+  }
+
   // ─── Step 1: Send auth code ──────────────────────────────────────────────
   async sendCode(tenantId: string, userId: string, data: {
     phone: string;
@@ -312,6 +332,16 @@ export class UserTelegramService implements OnModuleInit {
             where: { tenantId, channel: 'TELEGRAM', externalChatId },
           });
 
+          // Telegramdan rasm ham olamiz (faqat hali yo'q bo'lsa) —
+          // shu orqali "rasm/username ko'rinmayapti" muammosi hal bo'ladi
+          let avatarUrl: string | undefined;
+          if (!conv || !conv.avatarUrl) {
+            try {
+              const sender = await msg.getSender();
+              avatarUrl = await this.saveAvatar(client, sender, externalChatId);
+            } catch {}
+          }
+
           if (!conv) {
             // Check if client exists by username/phone
             let clientId: string | null = null;
@@ -333,22 +363,28 @@ export class UserTelegramService implements OnModuleInit {
                 firstName,
                 lastName,
                 username,
+                avatarUrl,
                 lastMessageAt: date,
                 lastMessageText: text.slice(0, 200),
               },
             });
           } else {
-            await this.prisma.conversation.update({
+            conv = await this.prisma.conversation.update({
               where: { id: conv.id },
               data: {
                 lastMessageAt: date,
                 lastMessageText: text.slice(0, 200),
+                // Ism/username bo'sh bo'lsa — yangilab qo'yamiz
+                firstName: conv.firstName || firstName,
+                lastName: conv.lastName || lastName,
+                username: conv.username || username,
+                ...(avatarUrl ? { avatarUrl } : {}),
               },
             });
           }
 
           // Save message
-          await this.prisma.message.create({
+          const savedMsg = await this.prisma.message.create({
             data: {
               conversationId: conv.id,
               direction: 'INBOUND',
@@ -359,15 +395,15 @@ export class UserTelegramService implements OnModuleInit {
             },
           });
 
-          // Real-time notify to agent
+          // Real-time notify to agent — to'liq xabar ob'ekti, refreshsiz ko'rinishi uchun
           if (agentId) {
-            this.realtime.emitToUser(agentId, 'message:new', {
-              conversationId: conv.id,
-              text,
-              from: { firstName, lastName, username },
-              source: 'personal_telegram',
-            });
+            this.realtime.emitToUser(agentId, 'message:new', savedMsg);
           }
+          this.realtime.emitToTenant(tenantId, 'conversation:updated', {
+            conversationId: conv.id,
+            lastMessageText: text.slice(0, 200),
+            lastMessageAt: date,
+          });
         } catch (e: any) {
           this.logger.warn('Personal incoming handler error: ' + e.message);
         }
@@ -382,12 +418,13 @@ export class UserTelegramService implements OnModuleInit {
     phone?: string;
     username?: string;
     userId?: string; // Telegram user ID
+    conversationId?: string; // Mavjud suhbatga yozayotgan bo'lsak — shu orqali yangi dublikat suhbat yaratilmaydi
     text: string;
     clientId?: string;
   }) {
     if (!data.text?.trim()) throw new BadRequestException('Xabar matni kerak');
-    if (!data.phone && !data.username && !data.userId) {
-      throw new BadRequestException('Telefon raqami, username yoki Telegram ID kerak');
+    if (!data.phone && !data.username && !data.userId && !data.conversationId) {
+      throw new BadRequestException('Telefon raqami, username, Telegram ID yoki suhbat kerak');
     }
 
     // Get agent's personal account
@@ -412,9 +449,19 @@ export class UserTelegramService implements OnModuleInit {
     }
 
     try {
-      // Resolve recipient
       let peer: any;
-      if (data.username) {
+      let existingConv: any = null;
+
+      // Agar mavjud suhbatga yozayotgan bo'lsak — peer'ni o'sha suhbatning
+      // saqlangan externalChatId'sidan olamiz. Bu yangi/dublikat suhbat
+      // yaratilib, agentning yozgan xabari "yo'qolib qolish" muammosining oldini oladi.
+      if (data.conversationId) {
+        existingConv = await this.prisma.conversation.findFirst({
+          where: { id: data.conversationId, tenantId },
+        });
+        if (!existingConv) throw new NotFoundException('Suhbat topilmadi');
+        peer = await client.getInputEntity(existingConv.externalChatId);
+      } else if (data.username) {
         peer = await client.getInputEntity(data.username.startsWith('@') ? data.username : `@${data.username}`);
       } else if (data.phone) {
         // Import contact first to be able to send
@@ -439,53 +486,74 @@ export class UserTelegramService implements OnModuleInit {
 
       // Send message
       const sent = await client.sendMessage(peer, { message: data.text });
-      let chat: any = null;
-      let externalChatId: string;
-      try {
-        chat = await client.getEntity(peer) as any;
-        // For user chats: use the user's Telegram ID
-        externalChatId = String(chat.id);
-      } catch {
-        // Fallback: extract from sent message
-        const peerId = (sent as any).peerId;
-        externalChatId = String(peerId?.userId || peerId?.chatId || peerId?.channelId || Date.now());
-      }
 
-      // Save to DB as conversation
-      let conv = await this.prisma.conversation.findFirst({
-        where: { tenantId, channel: 'TELEGRAM', externalChatId },
-      });
-
+      let conv = existingConv;
       if (!conv) {
-        conv = await this.prisma.conversation.create({
-          data: {
-            tenantId,
-            accountId: account.id,
-            clientId: data.clientId || null,
-            assignedAgentId: agentId,
-            channel: 'TELEGRAM',
-            externalChatId,
-            firstName: chat?.firstName || chat?.username || data.username || data.phone || '',
-            lastName: chat?.lastName || '',
-            username: chat?.username || (data.username ? data.username.replace('@','') : ''),
-            lastMessageAt: new Date(),
-            lastMessageText: data.text.slice(0, 200),
-          },
+        let chat: any = null;
+        let externalChatId: string;
+        try {
+          chat = await client.getEntity(peer) as any;
+          // For user chats: use the user's Telegram ID
+          externalChatId = String(chat.id);
+        } catch {
+          // Fallback: extract from sent message
+          const peerId = (sent as any).peerId;
+          externalChatId = String(peerId?.userId || peerId?.chatId || peerId?.channelId || Date.now());
+        }
+
+        // Save to DB as conversation — lekin avval shu externalChatId bilan
+        // mavjud suhbat bormi tekshiramiz (qayta dublikat yaratmaslik uchun)
+        conv = await this.prisma.conversation.findFirst({
+          where: { tenantId, channel: 'TELEGRAM', externalChatId },
         });
+
+        let avatarUrl: string | undefined;
+        if (!conv || !conv.avatarUrl) {
+          avatarUrl = await this.saveAvatar(client, chat || peer, externalChatId);
+        }
+
+        if (!conv) {
+          conv = await this.prisma.conversation.create({
+            data: {
+              tenantId,
+              accountId: account.id,
+              clientId: data.clientId || null,
+              assignedAgentId: agentId,
+              channel: 'TELEGRAM',
+              externalChatId,
+              firstName: chat?.firstName || chat?.username || data.username || data.phone || '',
+              lastName: chat?.lastName || '',
+              username: chat?.username || (data.username ? data.username.replace('@','') : ''),
+              avatarUrl,
+              lastMessageAt: new Date(),
+              lastMessageText: data.text.slice(0, 200),
+            },
+          });
+        } else {
+          conv = await this.prisma.conversation.update({
+            where: { id: conv.id },
+            data: {
+              lastMessageAt: new Date(),
+              lastMessageText: data.text.slice(0, 200),
+              clientId: conv.clientId || data.clientId || null,
+              assignedAgentId: conv.assignedAgentId || agentId,
+              ...(avatarUrl ? { avatarUrl } : {}),
+            },
+          });
+        }
       } else {
-        await this.prisma.conversation.update({
+        conv = await this.prisma.conversation.update({
           where: { id: conv.id },
           data: {
             lastMessageAt: new Date(),
             lastMessageText: data.text.slice(0, 200),
             clientId: conv.clientId || data.clientId || null,
-            assignedAgentId: conv.assignedAgentId || agentId,
           },
         });
       }
 
       // Save message
-      await this.prisma.message.create({
+      const savedMsg = await this.prisma.message.create({
         data: {
           conversationId: conv.id,
           agentId,
@@ -495,9 +563,19 @@ export class UserTelegramService implements OnModuleInit {
           externalMsgId: String((sent as any).id || Date.now()),
           isDelivered: true,
         },
+        include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
       });
 
-      return { ok: true, conversationId: conv.id, message: '✅ Xabar yuborildi' };
+      // Refresh qilmasdan darhol ko'rinishi uchun — barcha ulangan
+      // sessiyalarga (boshqa tab/qurilma) ham real xabarni yuboramiz
+      this.realtime.emitToUser(agentId, 'message:new', savedMsg);
+      this.realtime.emitToTenant(tenantId, 'conversation:updated', {
+        conversationId: conv.id,
+        lastMessageText: data.text.slice(0, 200),
+        lastMessageAt: new Date(),
+      });
+
+      return { ok: true, conversationId: conv.id, message: savedMsg };
     } catch (e: any) {
       if (e.message?.includes('USERNAME_NOT_OCCUPIED')) throw new BadRequestException('Bu username topilmadi');
       if (e.message?.includes('PEER_ID_INVALID')) throw new BadRequestException('Foydalanuvchi topilmadi');
