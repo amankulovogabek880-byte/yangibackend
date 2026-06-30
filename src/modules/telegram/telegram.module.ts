@@ -499,10 +499,56 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     agentId: string, agentRole: string,
     templateId: string,
   ) {
-    const template = await this.prisma.messageTemplate.findFirst({
-      where: { id: templateId, tenantId, isActive: true },
-    });
+    const [template, conv] = await Promise.all([
+      this.prisma.messageTemplate.findFirst({
+        where: { id: templateId, tenantId, isActive: true },
+      }),
+      this.prisma.conversation.findFirst({
+        where: { id: conversationId, tenantId },
+        include: {
+          account: true,
+          client: {
+            include: {
+              bookings: {
+                orderBy: { createdAt: 'desc' },
+                take: 1,
+              },
+            } as any,
+          },
+        } as any,
+      }),
+    ]);
     if (!template) throw new NotFoundException('Shablon topilmadi');
+    if (!conv) throw new NotFoundException('Suhbat topilmadi');
+
+    // ── Shablon o'zgaruvchilarini avtomatik to'ldirish ──────────────────────
+    const client: any = (conv as any).client;
+    const booking: any = (client?.bookings?.[0]) || null;
+
+    const fmt = (d: any) => d ? new Date(d).toLocaleDateString('uz-UZ', { day: '2-digit', month: '2-digit', year: 'numeric' }) : '—';
+    const vars: Record<string, string> = {
+      client_name:    client?.fullName || 'Mijoz',
+      tour_name:      booking?.tourName || '—',
+      booking_ref:    booking?.bookingRef || '—',
+      destination:    booking?.destination || '—',
+      departure_date: fmt(booking?.departureDate),
+      return_date:    fmt(booking?.returnDate),
+      total_price:    booking?.totalPrice ? `$${Number(booking.totalPrice).toFixed(0)}` : '—',
+      paid_amount:    booking?.paidAmount ? `$${Number(booking.paidAmount).toFixed(0)}` : '$0',
+      agent_name:     '',  // quyida to'ldirilamiz
+    };
+
+    // Agent ismini ham qo'shamiz
+    try {
+      const agent = await this.prisma.user.findFirst({ where: { id: agentId }, select: { name: true } });
+      vars.agent_name = agent?.name || '';
+    } catch {}
+
+    const varRe = new RegExp('\\{([^}]+)\\}', 'g');
+    const fill = (str: string) =>
+      str.replace(varRe, (_, k: string) => vars[k.trim()] ?? ('{' + k + '}'));
+
+    const filledText = fill(template.text || '');
 
     // useCount oshirish
     await this.prisma.messageTemplate.update({
@@ -512,38 +558,97 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
     const sentMessages: any[] = [];
 
-    // 1. Matn xabar
-    if (template.text?.trim()) {
-      const msg = await this.sendMessage(
-        tenantId, conversationId, template.text, agentId, agentRole, false,
-      );
-      sentMessages.push(msg);
-    }
+    // ── Shaxsiy (isPersonal) suhbat — MTProto client orqali yuborish ────────
+    // Bot mavjud bo'lmasa ham ishlaydi
+    const isPersonalConv = (conv as any).account?.isPersonal || !conv.accountId;
 
-    // 2. Asosiy media
-    if (template.mediaUrl) {
-      const mediaMsg = await this.sendMedia(tenantId, conversationId, agentId, agentRole, {
-        fileUrl: template.mediaUrl,
-        mediaType: (template.mediaType as any) || 'photo',
-        caption: template.mediaCaption || undefined,
+    if (isPersonalConv) {
+      // user-telegram module orqali emas, to'g'ridan telegram-js orqali yuboramiz
+      // (sendMessage bu yerda ichki bot route qiladi, isPersonal bo'lsa MTProto ishlatadi)
+      const personalService = (this as any).prisma; // DI orqali olish uchun indirect trick emas
+      // To'g'ri yechim: MTProto session'dan foydalanib yuboriamiz
+      const acct = await (this.prisma as any).telegramAccount.findFirst({
+        where: { tenantId, userId: agentId, isPersonal: true, isActive: true },
       });
-      sentMessages.push(mediaMsg);
-    }
 
-    // 3. Qo'shimcha attachmentlar (bir nechta rasm — mehmonxona galereya uchun)
-    if (Array.isArray(template.attachments)) {
-      for (const att of template.attachments as any[]) {
-        if (!att?.url) continue;
+      if (!acct) throw new BadRequestException(
+        'Shaxsiy Telegram account ulanmagan — shablonni yuborib bo\'lmaydi'
+      );
+
+      // Import TelegramClient on-demand
+      const { TelegramClient } = require('telegram');
+      const { StringSession } = require('telegram/sessions');
+
+      let client2: any;
+      // activeSessions allaqachon telegram-personal module'da boshqariladi,
+      // lekin bu modul alohida — shu sababli acct'dan session olib qayta ulanamiz
+      try {
+        const apiId = parseInt(acct.apiId || process.env.TELEGRAM_API_ID || '2040');
+        const apiHash = acct.apiHash || process.env.TELEGRAM_API_HASH || '';
+        const session = acct.sessionData || '';
+        client2 = new TelegramClient(new StringSession(session), apiId, apiHash, {
+          connectionRetries: 3, useWSS: false,
+        });
+        await client2.connect();
+      } catch (e: any) {
+        throw new BadRequestException('Telegram session'ga ulanib bo\'lmadi: ' + e.message);
+      }
+
+      try {
+        const sent = await client2.sendMessage(conv.externalChatId, { message: filledText });
+        const msg = await this.prisma.message.create({
+          data: {
+            conversationId, agentId,
+            direction: 'OUTBOUND',
+            messageType: 'TEXT',
+            text: filledText,
+            externalMsgId: String((sent as any).id),
+            isDelivered: true, isRead: true,
+          },
+          include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
+        });
+        sentMessages.push(msg);
+
+        await this.prisma.conversation.update({
+          where: { id: conversationId },
+          data: { lastMessageAt: new Date(), lastMessageText: filledText.slice(0, 200) },
+        });
+
+        this.realtime.emitToTenant(tenantId, 'message:new', msg);
+        this.realtime.emitToUser(agentId, 'message:new', msg);
+      } finally {
+        try { await client2.disconnect(); } catch {}
+      }
+    } else {
+      // Bot suhbati — standart sendMessage orqali yuboramiz
+      if (filledText.trim()) {
+        const msg = await this.sendMessage(tenantId, conversationId, filledText, agentId, agentRole, false);
+        sentMessages.push(msg);
+      }
+
+      // Media
+      if (template.mediaUrl) {
         try {
-          const m = await this.sendMedia(tenantId, conversationId, agentId, agentRole, {
-            fileUrl: att.url,
-            mimeType: att.mimeType,
-            mediaType: att.type || 'photo',
-            caption: att.caption,
+          const mediaMsg = await this.sendMedia(tenantId, conversationId, agentId, agentRole, {
+            fileUrl: template.mediaUrl,
+            mediaType: (template.mediaType as any) || 'photo',
+            caption: fill(template.mediaCaption || ''),
           });
-          sentMessages.push(m);
-        } catch (e) {
-          // bitta fayl xato bo'lsa, qolganlarini davom etamiz
+          sentMessages.push(mediaMsg);
+        } catch {}
+      }
+
+      // Attachments
+      if (Array.isArray(template.attachments)) {
+        for (const att of template.attachments as any[]) {
+          if (!att?.url) continue;
+          try {
+            const m = await this.sendMedia(tenantId, conversationId, agentId, agentRole, {
+              fileUrl: att.url, mimeType: att.mimeType,
+              mediaType: att.type || 'photo', caption: fill(att.caption || ''),
+            });
+            sentMessages.push(m);
+          } catch {}
         }
       }
     }
