@@ -383,6 +383,21 @@ export class BookingsService {
       changes: { before: { status: existing.status }, after: { status: safe.status || existing.status } },
     });
 
+    // ── BUG FIX: dashboard real-time yangilanmas edi narx/profit o'zgarganda ──
+    // Booking narxi (totalPrice/supplierCost/discount/profit) yoki status
+    // o'zgarsa, dashboard'ga 'dashboard:update' yuborilmagan edi — shu sabab
+    // dashboarddagi raqamlar booking yoki klient sahifasidan narx
+    // tahrirlanganda darhol yangilanmasdi.
+    try {
+      this.realtime.emitToTenant(tenantId, 'dashboard:update', {
+        type: 'booking_updated',
+        bookingId: id,
+        agentId: updated.agentId,
+        totalPrice: updated.totalPrice,
+        profit: updated.profit,
+      });
+    } catch {}
+
     return updated;
   }
 
