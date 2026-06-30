@@ -257,7 +257,7 @@ export class TelegramPersonalService {
           fileName = `tg_${Date.now()}_${m.id}.${ext}`;
           const filePath = path.join(uploadDir, fileName);
           
-          const buf = await client.downloadMedia(m as any, { workers: 1 }) as Buffer;
+          const buf = await client.downloadMedia(m as any, {} as any) as Buffer;
           if (buf && buf.length > 0) {
             fs.writeFileSync(filePath, buf);
             const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
