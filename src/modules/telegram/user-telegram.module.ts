@@ -295,22 +295,68 @@ export class UserTelegramService implements OnModuleInit {
     }
   }
 
-  // ─── Listen incoming messages ────────────────────────────────────────────
+  // ─── Listen incoming AND outgoing messages ──────────────────────────────
   private startListening(client: TelegramClient, acc: any) {
     try {
       client.addEventHandler(async (event: NewMessageEvent) => {
         try {
           const msg = event.message;
-          // Only incoming (not our own outgoing)
-          if (!msg || msg.out) return;
+          if (!msg) return;
 
-          const senderId = msg.senderId?.toString();
-          if (!senderId) return;
-
-          const text = msg.message || '';
+          const isOut = !!msg.out; // agent o'zi yozganmi?
+          const tenantId = acc.tenantId;
+          const agentId = acc.userId;
           const date = new Date((msg.date || 0) * 1000);
+          const text = msg.message || '';
 
-          this.logger.log(`Personal incoming: ${senderId} → "${text.slice(0, 50)}"`);
+          // Suhbat kim bilan: kiruvchi bo'lsa senderId, chiquvchi bo'lsa peerId
+          const peerId = isOut
+            ? String((msg as any).peerId?.userId || (msg as any).chatId || '')
+            : (msg.senderId?.toString() || '');
+          if (!peerId) return;
+
+          if (isOut) {
+            // ── Agent o'z Telegram'idan yozgan (OUTBOUND) ────────────────────
+            const conv = await this.prisma.conversation.findFirst({
+              where: { tenantId, channel: 'TELEGRAM', externalChatId: peerId },
+            });
+            if (!conv) return; // Yangi suhbat yaratmaymiz — faqat mavjudga qo'shamiz
+
+            // Dublikat tekshirish (CRM orqali yuborilgan bo'lsa, allaqachon saqlangan)
+            const dup = await this.prisma.message.findFirst({
+              where: { conversationId: conv.id, externalMsgId: String(msg.id) },
+            });
+            if (dup) return;
+
+            const savedOut = await this.prisma.message.create({
+              data: {
+                conversationId: conv.id,
+                agentId,
+                direction: 'OUTBOUND',
+                messageType: 'TEXT',
+                text,
+                externalMsgId: String(msg.id),
+                isDelivered: true,
+                createdAt: date,
+              },
+              include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
+            });
+
+            await this.prisma.conversation.update({
+              where: { id: conv.id },
+              data: { lastMessageAt: date, lastMessageText: text.slice(0, 200) },
+            });
+
+            // Real-time: boshqa tab/qurilmada ham darhol ko'rinsin
+            this.realtime.emitToUser(agentId, 'message:new', savedOut);
+            this.realtime.emitToTenant(tenantId, 'conversation:updated', {
+              conversationId: conv.id, lastMessageText: text.slice(0, 200), lastMessageAt: date,
+            });
+            return;
+          }
+
+          // ── Kiruvchi xabar (INBOUND) ──────────────────────────────────────
+          this.logger.log(`Personal incoming: ${peerId} → "${text.slice(0, 50)}"`);
 
           // Get sender info
           let firstName = '';
@@ -323,27 +369,21 @@ export class UserTelegramService implements OnModuleInit {
             username = sender?.username || '';
           } catch {}
 
-          const tenantId = acc.tenantId;
-          const agentId = acc.userId;
-          const externalChatId = senderId;
-
           // Find or create conversation
           let conv = await this.prisma.conversation.findFirst({
-            where: { tenantId, channel: 'TELEGRAM', externalChatId },
+            where: { tenantId, channel: 'TELEGRAM', externalChatId: peerId },
           });
 
-          // Telegramdan rasm ham olamiz (faqat hali yo'q bo'lsa) —
-          // shu orqali "rasm/username ko'rinmayapti" muammosi hal bo'ladi
+          // Telegramdan profil rasmini yuklab olamiz
           let avatarUrl: string | undefined;
           if (!conv || !conv.avatarUrl) {
             try {
               const sender = await msg.getSender();
-              avatarUrl = await this.saveAvatar(client, sender, externalChatId);
+              avatarUrl = await this.saveAvatar(client, sender, peerId);
             } catch {}
           }
 
           if (!conv) {
-            // Check if client exists by username/phone
             let clientId: string | null = null;
             if (username) {
               const cl = await this.prisma.client.findFirst({
@@ -354,27 +394,17 @@ export class UserTelegramService implements OnModuleInit {
 
             conv = await this.prisma.conversation.create({
               data: {
-                tenantId,
-                accountId: acc.id,
-                clientId,
-                assignedAgentId: agentId,
-                channel: 'TELEGRAM',
-                externalChatId,
-                firstName,
-                lastName,
-                username,
-                avatarUrl,
-                lastMessageAt: date,
-                lastMessageText: text.slice(0, 200),
+                tenantId, accountId: acc.id, clientId,
+                assignedAgentId: agentId, channel: 'TELEGRAM',
+                externalChatId: peerId, firstName, lastName, username, avatarUrl,
+                lastMessageAt: date, lastMessageText: text.slice(0, 200),
               },
             });
           } else {
             conv = await this.prisma.conversation.update({
               where: { id: conv.id },
               data: {
-                lastMessageAt: date,
-                lastMessageText: text.slice(0, 200),
-                // Ism/username bo'sh bo'lsa — yangilab qo'yamiz
+                lastMessageAt: date, lastMessageText: text.slice(0, 200),
                 firstName: conv.firstName || firstName,
                 lastName: conv.lastName || lastName,
                 username: conv.username || username,
@@ -383,19 +413,16 @@ export class UserTelegramService implements OnModuleInit {
             });
           }
 
-          // Save message
           const savedMsg = await this.prisma.message.create({
             data: {
               conversationId: conv.id,
-              direction: 'INBOUND',
-              messageType: 'TEXT',
-              text,
+              direction: 'INBOUND', messageType: 'TEXT', text,
               externalMsgId: String(msg.id || Date.now()),
-              isDelivered: true,
+              isDelivered: true, createdAt: date,
             },
           });
 
-          // Real-time notify to agent — to'liq xabar ob'ekti, refreshsiz ko'rinishi uchun
+          // Real-time notify
           if (agentId) {
             this.realtime.emitToUser(agentId, 'message:new', savedMsg);
           }
