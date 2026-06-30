@@ -402,8 +402,16 @@ export class BookingsService {
   }
 
   async delete(tenantId: string, id: string, userId: string, role: string) {
-    if (role === 'AGENT') throw new BadRequestException("Agentlar booking o'chira olmaydi");
+    // BUG FIX: avval agentlar hech qanday bookingni o'chira olmasdi —
+    // hatto o'zlari yaratgan/o'ziga biriktirilgan bookingni ham.
+    // findOne() AGENT uchun allaqachon agentId = userId bilan filtrlaydi
+    // (this.where() ichida), shuning uchun agent boshqa agentning
+    // bookingini topa olmaydi (404 qaytadi) — demak quyida agentga
+    // ruxsat berish faqat O'ZINING bookinglarini o'chirishga imkon beradi.
     const b = await this.findOne(tenantId, id, userId, role);
+    if (role === 'AGENT' && b.agentId !== userId) {
+      throw new BadRequestException("Faqat o'zingizga biriktirilgan bookingni o'chira olasiz");
+    }
 
     await this.prisma.booking.delete({ where: { id } });
     await this.clients.recalcStats(b.clientId).catch(() => {});
@@ -433,6 +441,15 @@ export class BookingsService {
       action: 'DELETE', entity: 'booking', entityId: id,
       metadata: { bookingRef: b.bookingRef, tourName: b.tourName },
     });
+
+    // Dashboard real-time yangilanishi uchun
+    try {
+      this.realtime.emitToTenant(tenantId, 'dashboard:update', {
+        type: 'booking_deleted',
+        bookingId: id,
+        agentId: b.agentId,
+      });
+    } catch {}
 
     return { ok: true };
   }
