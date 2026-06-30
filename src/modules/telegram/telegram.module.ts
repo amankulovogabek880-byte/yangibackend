@@ -166,6 +166,27 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         : null;
       const assignedAgentId = await this.pickAgent(tenantId);
 
+      // Telegram profil rasmini olish
+      let avatarUrl: string | null = null;
+      try {
+        if (tgUserId) {
+          const bot = this.bots.get(accountId);
+          if (bot) {
+            const photos = await bot.getUserProfilePhotos(Number(tgUserId), { limit: 1 });
+            if (photos.total_count > 0 && photos.photos[0]?.[0]?.file_id) {
+              const fileId = photos.photos[0][photos.photos[0].length - 1].file_id;
+              const file = await bot.getFile(fileId);
+              if (file.file_path) {
+                // Find bot token from bots map context - passed in startBot
+                const acc2 = await this.prisma.telegramAccount.findFirst({ where: { id: accountId } });
+                const botToken = acc2?.botToken || '';
+                avatarUrl = `https://api.telegram.org/file/bot${botToken}/${file.file_path}`;
+              }
+            }
+          }
+        }
+      } catch { /* rasm olishda xato - davom etamiz */ }
+
       conv = await this.prisma.conversation.create({
         data: {
           tenantId,
@@ -176,6 +197,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           firstName: msg.from?.first_name,
           lastName: msg.from?.last_name,
           username: msg.from?.username,
+          avatarUrl,
           startPayload,
           clientId: client?.id,
           assignedAgentId,
@@ -906,10 +928,11 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       }),
       this.prisma.conversation.count({ where }),
     ]);
-    // Add isPersonal flag from account to each conversation
+    // Add isPersonal flag and photoUrl from account to each conversation
     const enriched = data.map((conv: any) => ({
       ...conv,
       isPersonal: conv.account?.isPersonal ?? false,
+      photoUrl: conv.avatarUrl || null,  // Frontend uchun photoUrl alias
     }));
     return { data: enriched, meta: meta(total, page, limit) };
   }
