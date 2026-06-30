@@ -464,7 +464,7 @@ export class PublicLeadsService {
       await writeLog();
 
       this.logger.log(
-        `[PUBLIC LEADS] ✅ Lead yaratildi: ${newClient.id} | Agent: ${assignedAgentId || 'YO'Q'} | Tenant: ${tenantId}`,
+        `[PUBLIC LEADS] ✅ Lead yaratildi: ${newClient.id} | Agent: ${assignedAgentId || "YO'Q"} | Tenant: ${tenantId}`,
       );
 
       return {
