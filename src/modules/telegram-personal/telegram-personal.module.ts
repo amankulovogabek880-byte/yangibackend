@@ -14,10 +14,13 @@ import { CurrentUser } from '../../common/decorators';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { EncryptionService } from '../../common/encryption/encryption.service';
 
-// ─── SESSION STORE (memory — faqat aktiv ulanganlar uchun) ──
-// Bu Map restart bo'lsa yo'qoladi, lekin bu OK —
-// chunki session DB da saqlangan, getClient() qayta ulanadi
+// ─── SESSION STORE (memory — per user) ─────────────────────────
 const activeSessions = new Map<string, TelegramClient>();
+const pendingAuth = new Map<string, {
+  client: TelegramClient;
+  phone: string;
+  phoneCodeHash: string;
+}>();
 
 // ─── SERVICE ───────────────────────────────────────────────────
 @Injectable()
@@ -58,14 +61,36 @@ export class TelegramPersonalService {
     await client.connect();
     activeSessions.set(userId, client);
 
+    // Incoming messages listener
     client.addEventHandler(async (event: any) => {
-      await this.handleIncoming(event, userId, tenantId);
+      await this.handleIncoming(event, userId, tenantId, client);
     }, new NewMessage({}));
 
     return client;
   }
 
-  // ── STEP 1: Send code — endi DB ga saqlanadi ──────────────
+  // ── Avatar yuklab olish va saqlash (telegramdan asl rasm) ────
+  private async saveAvatar(client: TelegramClient, entity: any, key: string): Promise<string | undefined> {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const uploadDir = process.env.UPLOAD_DIR || './uploads';
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+      const buf = await client.downloadProfilePhoto(entity, {} as any) as Buffer;
+      if (!buf || !buf.length) return undefined;
+
+      const fileName = `tg_avatar_${key}.jpg`;
+      fs.writeFileSync(path.join(uploadDir, fileName), buf);
+      const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
+      // cache-bust har safar yangilanganda
+      return `${baseUrl}/uploads/${fileName}?v=${Date.now()}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // ── STEP 1: Send code ──────────────────────────────────────
   async sendCode(userId: string, tenantId: string, phone: string, apiId: number, apiHash: string) {
     const client = new TelegramClient(
       new StringSession(''),
@@ -75,61 +100,17 @@ export class TelegramPersonalService {
     await client.connect();
 
     const result = await client.sendCode({ apiId, apiHash }, phone);
-
-    // Eski pending ni o'chirib, yangisini DB ga yoz
-    await (this.prisma as any).telegramPendingAuth.deleteMany({ where: { userId } });
-
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 daqiqa
-    await (this.prisma as any).telegramPendingAuth.create({
-      data: {
-        userId,
-        phone,
-        phoneCodeHash: result.phoneCodeHash,
-        apiId,
-        apiHash: this.encryption.encrypt(apiHash),
-        expiresAt,
-      },
-    });
-
-    // Client ni RAM da saqlaylik (bir xil process ichida ishlaydi)
-    // Agar restart bo'lsa verifyCode yangi client yaratadi
-    activeSessions.set(`pending_${userId}`, client);
+    pendingAuth.set(userId, { client, phone, phoneCodeHash: result.phoneCodeHash });
 
     return { sent: true, phoneCodeHash: result.phoneCodeHash };
   }
 
-  // ── STEP 2: Verify code — DB dan o'qiydi ──────────────────
+  // ── STEP 2: Verify code ────────────────────────────────────
   async verifyCode(userId: string, tenantId: string, code: string, password?: string) {
-    // DB dan pending ma'lumotni olish
-    const pending = await (this.prisma as any).telegramPendingAuth.findUnique({
-      where: { userId },
-    });
+    const pending = pendingAuth.get(userId);
+    if (!pending) throw new BadRequestException('Avval telefon raqam kiriting');
 
-    if (!pending) {
-      throw new BadRequestException('Avval telefon raqam kiriting (kod muddati tugagan bo\'lishi mumkin)');
-    }
-
-    // Muddati o'tganmi tekshir
-    if (new Date() > new Date(pending.expiresAt)) {
-      await (this.prisma as any).telegramPendingAuth.deleteMany({ where: { userId } });
-      throw new BadRequestException('Kod muddati tugadi. Qaytadan telefon raqam kiriting.');
-    }
-
-    const apiId   = pending.apiId;
-    const apiHash = this.encryption.decrypt(pending.apiHash);
-    const phone   = pending.phone;
-    const phoneCodeHash = pending.phoneCodeHash;
-
-    // RAM da client bor bo'lsa ishlatamiz, yo'q bo'lsa yangi yaratamiz
-    let client = activeSessions.get(`pending_${userId}`);
-    if (!client || !client.connected) {
-      client = new TelegramClient(
-        new StringSession(''),
-        apiId, apiHash,
-        { connectionRetries: 3, useWSS: false },
-      );
-      await client.connect();
-    }
+    const { client, phone, phoneCodeHash } = pending;
 
     try {
       await client.invoke(new Api.auth.SignIn({
@@ -147,15 +128,13 @@ export class TelegramPersonalService {
       } else throw e;
     }
 
-    const session    = (client.session as StringSession).save();
+    const session = (client.session as StringSession).save();
+    pendingAuth.delete(userId);
+
+    // Save to DB
     const encSession = this.encryption.encrypt(session);
-    const encHash    = this.encryption.encrypt(apiHash);
+    const encHash    = this.encryption.encrypt(pending.client['apiHash'] || '');
 
-    // Pending ni DB dan o'chir
-    await (this.prisma as any).telegramPendingAuth.deleteMany({ where: { userId } });
-    activeSessions.delete(`pending_${userId}`);
-
-    // Session ni DB ga saqlash
     const existing = await (this.prisma as any).telegramAccount.findFirst({
       where: { userId, tenantId, isPersonal: true },
     });
@@ -181,8 +160,9 @@ export class TelegramPersonalService {
     }
 
     activeSessions.set(userId, client);
+    // Incoming listener
     client.addEventHandler(async (event: any) => {
-      await this.handleIncoming(event, userId, tenantId);
+      await this.handleIncoming(event, userId, tenantId, client);
     }, new NewMessage({}));
 
     return { connected: true };
@@ -199,6 +179,7 @@ export class TelegramPersonalService {
       const entity = d.entity as any;
       const chatId = String(entity?.id || d.id);
 
+      // Upsert conversation
       let conv = await (this.prisma as any).conversation.findFirst({
         where: { tenantId, channel: 'TELEGRAM', externalChatId: chatId },
       });
@@ -217,12 +198,27 @@ export class TelegramPersonalService {
         lastMessageAt: d.message?.date ? new Date((d.message.date as number) * 1000) : new Date(),
       };
 
+      // Telegramdagi profil rasmini olib qo'yamiz (faqat hali yo'q bo'lsa)
+      if (!conv || !conv.avatarUrl) {
+        const avatarUrl = await this.saveAvatar(client, entity, chatId);
+        if (avatarUrl) (convData as any).avatarUrl = avatarUrl;
+      }
+
       if (!conv) {
         conv = await (this.prisma as any).conversation.create({ data: convData });
       } else {
         conv = await (this.prisma as any).conversation.update({
           where: { id: conv.id },
-          data: { unreadCount: convData.unreadCount, lastMessageText: convData.lastMessageText, lastMessageAt: convData.lastMessageAt },
+          data: {
+            unreadCount: convData.unreadCount,
+            lastMessageText: convData.lastMessageText,
+            lastMessageAt: convData.lastMessageAt,
+            // Ism/username ham yangilanib boradi (telegramdan o'zgargan bo'lishi mumkin)
+            firstName: convData.firstName || conv.firstName,
+            lastName:  convData.lastName  || conv.lastName,
+            username:  convData.username  || conv.username,
+            ...((convData as any).avatarUrl ? { avatarUrl: (convData as any).avatarUrl } : {}),
+          },
         });
       }
       results.push(conv);
@@ -261,7 +257,7 @@ export class TelegramPersonalService {
           fileName = `tg_${Date.now()}_${m.id}.${ext}`;
           const filePath = path.join(uploadDir, fileName);
           
-          const buf = await client.downloadMedia(m as any, {}) as Buffer;
+          const buf = await client.downloadMedia(m as any, { workers: 1 }) as Buffer;
           if (buf && buf.length > 0) {
             fs.writeFileSync(filePath, buf);
             const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
@@ -274,10 +270,10 @@ export class TelegramPersonalService {
       const myId     = String((await client.getMe())?.id || '');
       const direction = senderId === myId ? 'OUTBOUND' : 'INBOUND';
 
+      // Determine message type
       const msgType = m.media
         ? ((m.media as any).photo ? 'PHOTO' : 'DOCUMENT')
         : 'TEXT';
-
       await (this.prisma as any).message.create({
         data: {
           conversationId,
@@ -295,6 +291,7 @@ export class TelegramPersonalService {
 
     return (this.prisma as any).message.findMany({
       where: { conversationId },
+      include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
       orderBy: { createdAt: 'asc' },
       take: 100,
     });
@@ -337,6 +334,7 @@ export class TelegramPersonalService {
         isRead: false,
         createdAt: new Date(),
       },
+      include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
     });
 
     await (this.prisma as any).conversation.update({
@@ -344,8 +342,53 @@ export class TelegramPersonalService {
       data: { lastMessageText: text, lastMessageAt: new Date() },
     });
 
-    this.realtime.emitToTenant(tenantId, 'message:new', { conversationId, message: saved });
+    // Live yangilanish — refresh qilmasdan ekranda darhol ko'rinishi uchun
+    this.realtime.emitToUser(userId, 'message:new', saved);
+    this.realtime.emitToTenant(tenantId, 'conversation:updated', {
+      conversationId, lastMessageText: text, lastMessageAt: new Date(),
+    });
+
     return saved;
+  }
+
+  // ── Shablon yuborish (matn + media, refresh'siz darhol ko'rinadi) ──
+  async sendTemplate(userId: string, tenantId: string, conversationId: string, templateId: string) {
+    const template = await (this.prisma as any).messageTemplate.findFirst({
+      where: { id: templateId, tenantId, isActive: true },
+    });
+    if (!template) throw new NotFoundException('Shablon topilmadi');
+
+    await (this.prisma as any).messageTemplate.update({
+      where: { id: templateId },
+      data: { useCount: { increment: 1 } },
+    });
+
+    const sent: any[] = [];
+
+    if (template.text?.trim()) {
+      sent.push(await this.sendMessage(userId, tenantId, conversationId, template.text));
+    }
+
+    const mediaItems = [
+      ...(template.mediaUrl ? [{ url: template.mediaUrl, caption: template.mediaCaption || '' }] : []),
+      ...((Array.isArray(template.attachments) ? template.attachments : []) as any[])
+        .filter((a: any) => a?.url)
+        .map((a: any) => ({ url: a.url, caption: a.caption || '' })),
+    ];
+
+    for (const item of mediaItems) {
+      try {
+        const axios = require('axios');
+        const resp = await axios.get(item.url, { responseType: 'arraybuffer' });
+        const b64 = Buffer.from(resp.data).toString('base64');
+        const fileName = item.url.split('/').pop()?.split('?')[0] || `file_${Date.now()}`;
+        sent.push(await this.sendMessage(userId, tenantId, conversationId, item.caption, b64, fileName));
+      } catch (e: any) {
+        this.logger.warn('Shablon media yuborilmadi: ' + e?.message);
+      }
+    }
+
+    return { sent: sent.length, messages: sent };
   }
 
   // ── Search username ────────────────────────────────────────
@@ -400,7 +443,7 @@ export class TelegramPersonalService {
   }
 
   // ── Handle incoming ────────────────────────────────────────
-  private async handleIncoming(event: any, userId: string, tenantId: string) {
+  private async handleIncoming(event: any, userId: string, tenantId: string, client: TelegramClient) {
     try {
       const m = event.message;
       if (!m) return;
@@ -410,6 +453,21 @@ export class TelegramPersonalService {
       let conv = await (this.prisma as any).conversation.findFirst({
         where: { tenantId, channel: 'TELEGRAM', externalChatId: chatId },
       });
+
+      // Yuboruvchi haqida telegramdan ism + rasm olib kelamiz —
+      // shu orqali "Noma'lum" bo'lib ko'rinish muammosi hal bo'ladi.
+      let profile: { firstName?: string; lastName?: string; username?: string; avatarUrl?: string } = {};
+      if (!conv || !conv.firstName || !conv.avatarUrl) {
+        try {
+          const entity = await client.getEntity(chatId);
+          profile.firstName = (entity as any)?.firstName || '';
+          profile.lastName  = (entity as any)?.lastName || '';
+          profile.username  = (entity as any)?.username || '';
+          const avatarUrl = await this.saveAvatar(client, entity, chatId);
+          if (avatarUrl) profile.avatarUrl = avatarUrl;
+        } catch {}
+      }
+
       if (!conv) {
         conv = await (this.prisma as any).conversation.create({
           data: {
@@ -418,17 +476,23 @@ export class TelegramPersonalService {
             externalUserId: chatId,
             assignedAgentId: userId,
             unreadCount: 1,
+            firstName: profile.firstName || '',
+            lastName:  profile.lastName || '',
+            username:  profile.username || '',
+            avatarUrl: profile.avatarUrl,
             lastMessageText: m.message || '',
             lastMessageAt: new Date(),
           },
         });
       } else {
-        await (this.prisma as any).conversation.update({
+        conv = await (this.prisma as any).conversation.update({
           where: { id: conv.id },
           data: {
             unreadCount: { increment: 1 },
             lastMessageText: m.message || '',
             lastMessageAt: new Date(),
+            ...(profile.firstName ? { firstName: profile.firstName, lastName: profile.lastName, username: profile.username } : {}),
+            ...(profile.avatarUrl ? { avatarUrl: profile.avatarUrl } : {}),
           },
         });
       }
@@ -445,7 +509,8 @@ export class TelegramPersonalService {
         },
       });
 
-      this.realtime.emitToUser(userId, 'message:new', { conversationId: conv.id, message: msg });
+      // Refresh qilmasdan darhol ekranda ko'rinishi uchun raw xabarni yuboramiz
+      this.realtime.emitToUser(userId, 'message:new', msg);
       this.realtime.emitToTenant(tenantId, 'conversation:update', conv);
     } catch (e: any) {
       this.logger.warn('handleIncoming error: ' + e?.message);
@@ -494,7 +559,7 @@ export class TelegramPersonalService {
           await client.connect();
           activeSessions.set(acct.userId, client);
           client.addEventHandler(async (event: any) => {
-            await this.handleIncoming(event, acct.userId, acct.tenantId);
+            await this.handleIncoming(event, acct.userId, acct.tenantId, client);
           }, new NewMessage({}));
           this.logger.log(`Session restored: ${acct.phoneNumber}`);
         } catch (e: any) {
@@ -544,6 +609,11 @@ export class TelegramPersonalController {
   @Post('send')
   send(@CurrentUser() u: any, @Body() body: { conversationId: string; text: string; fileBase64?: string; fileName?: string }) {
     return this.svc.sendMessage(u.sub, u.tenantId, body.conversationId, body.text, body.fileBase64, body.fileName);
+  }
+
+  @Post('send-template')
+  sendTemplate(@CurrentUser() u: any, @Body() body: { conversationId: string; templateId: string }) {
+    return this.svc.sendTemplate(u.sub, u.tenantId, body.conversationId, body.templateId);
   }
 
   @Post('search')
