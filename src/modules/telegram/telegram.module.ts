@@ -591,7 +591,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         });
         await client2.connect();
       } catch (e: any) {
-        throw new BadRequestException('Telegram session'ga ulanib bo\'lmadi: ' + e.message);
+        throw new BadRequestException("Telegram sessionga ulanib bo'lmadi: " + e.message);
       }
 
       try {
