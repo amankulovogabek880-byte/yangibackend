@@ -166,6 +166,14 @@ export class ReportsService {
     return isNaN(num) || val === null || val === undefined ? 0 : num;
   }
 
+  // Pul summalarini 2 xona (tiyin) gacha dumaloqlaydi — floating-point
+  // arifmetika (masalan profit * kpiPercent / 100) natijasida $57,374.852
+  // kabi 3+ xonali "chiroyli bo'lmagan" summalar chiqib qolmasligi uchun.
+  private round2(val: any): number {
+    const num = this.safeNumber(val);
+    return Math.round(num * 100) / 100;
+  }
+
   private safePercent(val: any, max = 100): number {
     const num = this.safeNumber(val);
     return Math.min(Math.max(num, 0), max);
@@ -273,9 +281,9 @@ export class ReportsService {
       const kpiPercent = (tenant as any)?.agentCommissionPercent ?? 10;
 
       // Bu oy
-      const revMonth    = this.safeNumber((thisMonthBookings._sum as any)?.totalPrice);
-      const costMonth   = this.safeNumber((thisMonthBookings._sum as any)?.supplierCost);
-      const profitMonth = this.safeNumber((thisMonthBookings._sum as any)?.profit);
+      const revMonth    = this.round2(this.safeNumber((thisMonthBookings._sum as any)?.totalPrice));
+      const costMonth   = this.round2(this.safeNumber((thisMonthBookings._sum as any)?.supplierCost));
+      const profitMonth = this.round2(this.safeNumber((thisMonthBookings._sum as any)?.profit));
       const booksMonth  = (thisMonthBookings._count as any)?.id ?? 0;
 
       // O'tgan oy
@@ -290,13 +298,13 @@ export class ReportsService {
         : 0;
 
       // Jami agent maoshi (admin uchun)
-      const totalAgentSalaries = role !== 'AGENT'
+      const totalAgentSalaries = this.round2(role !== 'AGENT'
         ? (agentPerformance as any[]).reduce((sum: number, a: any) => {
             const stored = this.safeNumber((a._sum as any)?.commissionAmount);
             const calculated = this.safeNumber((a._sum as any)?.profit) * kpiPercent / 100;
             return sum + (stored > 0 ? stored : calculated);
           }, 0)
-        : 0;
+        : 0);
 
       // BUG4 FIX: Conversion = booking qilgan klientlar / yangi klientlar (max 100%)
       const conversionRate = newClientsMonth > 0
@@ -304,7 +312,7 @@ export class ReportsService {
         : 0;
 
       // Net foyda = profit - agent maoshlari
-      const netProfit = Math.max(0, profitMonth - totalAgentSalaries);
+      const netProfit = this.round2(Math.max(0, profitMonth - totalAgentSalaries));
 
       return {
         clients:  { total: totalClients, newThisMonth: newClientsMonth, newToday: 0 },
@@ -766,7 +774,7 @@ export class ReportsService {
       : JSON.parse((tenant?.kpiTiers as string) || '[]');
 
     const bookings = await this.prisma.booking.findMany({
-      where: { tenantId, agentId: userId, status: { not: 'CANCELLED' }, createdAt: { gte: monthStart, lt: monthEnd } },
+      where: { tenantId, agentId: userId, status: { in: ['DRAFT', 'CONFIRMED', 'COMPLETED'] }, createdAt: { gte: monthStart, lt: monthEnd } },
       select: { totalPrice: true, profit: true, commissionAmount: true },
     });
 
@@ -821,11 +829,15 @@ export class ReportsService {
     });
     if (!tenant) return null;
 
-    // Bu oy uchun agentning yopgan bookinglari
+    // Bu oy uchun agentning bookinglari — dashboarddagi "activeStatuses"
+    // (DRAFT, CONFIRMED, COMPLETED) bilan bir xil ta'rif, aks holda DRAFT
+    // holatidagi bookinglar bu yerda hisobga olinmay, admin "Agentlar"
+    // jadvalida Daromad/Maosh $0 ko'rinib, umumiy dashboard bilan mos
+    // kelmay qolardi.
     const bookings = await this.prisma.booking.findMany({
       where: {
         tenantId, agentId: userId,
-        status: { in: ['CONFIRMED', 'COMPLETED'] },
+        status: { in: ['DRAFT', 'CONFIRMED', 'COMPLETED'] },
         createdAt: { gte: monthStart, lt: monthEnd },
       },
       select: {
