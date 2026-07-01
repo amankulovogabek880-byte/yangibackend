@@ -190,8 +190,14 @@ export class ReportsService {
       const clientAgentFilter  = role === 'AGENT' ? { assignedAgentId: userId } : {};
 
       // ── BOOKING WHERE UCHUN STATUS ──
+      // v10 FIX: avval "Bookinglar" soni activeStatuses (DRAFT+CONFIRMED+COMPLETED)
+      // bilan, lekin "Jami daromad/Operator narxi/Sof foyda" faqat
+      // confirmedStatuses (CONFIRMED+COMPLETED) bilan hisoblanardi — shu
+      // nomuvofiqlik tufayli booking DRAFT holatida turganda dashboard
+      // butunlay $0 ko'rsatardi, garchi klient sahifasida "Jami xarid"
+      // to'g'ri chiqsa ham (u ham DRAFT'ni hisobga oladi). Endi hammasi
+      // BITTA ta'rif — activeStatuses — bilan hisoblanadi.
       const activeStatuses = { status: { in: ['CONFIRMED', 'COMPLETED', 'DRAFT'] as any[] } };
-      const confirmedStatuses = { status: { in: ['CONFIRMED', 'COMPLETED'] as any[] } };
 
       // ── BARCHA SO'ROVLAR PARALLEL ──
       const [
@@ -229,14 +235,14 @@ export class ReportsService {
         }).catch(() => 0),
         // Bu oygi moliya (BOOKING.totalPrice, supplierCost, profit)
         this.prisma.booking.aggregate({
-          where: { tenantId, ...bookingAgentFilter, ...confirmedStatuses, createdAt: { gte: monthStart, lte: monthEnd } },
+          where: { tenantId, ...bookingAgentFilter, ...activeStatuses, createdAt: { gte: monthStart, lte: monthEnd } },
           _sum: { totalPrice: true, supplierCost: true, profit: true },
           _count: { id: true },
         }).catch(() => ({ _sum: { totalPrice: 0, supplierCost: 0, profit: 0 }, _count: { id: 0 } })),
 
         // O'tgan oygi moliya
         this.prisma.booking.aggregate({
-          where: { tenantId, ...bookingAgentFilter, ...confirmedStatuses, createdAt: { gte: prevMonthStart, lte: prevMonthEnd } },
+          where: { tenantId, ...bookingAgentFilter, ...activeStatuses, createdAt: { gte: prevMonthStart, lte: prevMonthEnd } },
           _sum: { totalPrice: true, supplierCost: true, profit: true },
           _count: { id: true },
         }).catch(() => ({ _sum: { totalPrice: 0, supplierCost: 0, profit: 0 }, _count: { id: 0 } })),
@@ -245,7 +251,7 @@ export class ReportsService {
         role !== 'AGENT'
           ? this.prisma.booking.groupBy({
               by: ['agentId'],
-              where: { tenantId, ...confirmedStatuses, createdAt: { gte: monthStart }, agentId: { not: null } },
+              where: { tenantId, ...activeStatuses, createdAt: { gte: monthStart }, agentId: { not: null } },
               _sum: { totalPrice: true, profit: true, commissionAmount: true },
               _count: { id: true },
             }).catch(() => [])
