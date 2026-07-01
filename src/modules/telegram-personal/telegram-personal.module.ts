@@ -21,6 +21,14 @@ const pendingAuth = new Map<string, {
   phone: string;
   phoneCodeHash: string;
 }>();
+// BUG FIX: bir nechta so'rov bir vaqtda getClient() ni chaqirsa (masalan
+// sendMessage va getMessages deyarli bir vaqtda kelsa), ikkalasi ham hali
+// activeSessions'da yo'qligini ko'rib, IKKITA alohida TelegramClient yaratib,
+// HAR BIRIGA o'z addEventHandler'ini ulardi — natijada bitta kiruvchi xabar
+// 2 marta (yoki undan ko'p) qayta ishlanib, chatda takrorlanib chiqardi.
+// Endi bir xil userId uchun ulanish "in-flight" bo'lsa, boshqa chaqiruvlar
+// o'sha BITTA va'dani kutadi — ikkinchi mustaqil ulanish umuman yaratilmaydi.
+const connectingPromises = new Map<string, Promise<TelegramClient>>();
 
 // ─── SERVICE ───────────────────────────────────────────────────
 @Injectable()
@@ -40,33 +48,47 @@ export class TelegramPersonalService {
       if (c.connected) return c;
     }
 
-    const acct = await (this.prisma as any).telegramAccount.findFirst({
-      where: { userId, tenantId, isPersonal: true, isActive: true },
-    });
-    if (!acct) throw new NotFoundException('Telegram akkaunt ulanmagan');
+    // Agar shu userId uchun ulanish allaqachon jarayonda bo'lsa — o'sha BITTA
+    // va'dani kutamiz, yangi mustaqil ulanish boshlamaymiz (yuqoridagi izohga qarang).
+    const inFlight = connectingPromises.get(userId);
+    if (inFlight) return inFlight;
 
-    const apiId   = parseInt(acct.apiId || process.env.TELEGRAM_API_ID || '0');
-    const apiHash = acct.apiHash
-      ? this.encryption.decrypt(acct.apiHash)
-      : (process.env.TELEGRAM_API_HASH || '');
-    const session = acct.sessionData
-      ? this.encryption.decrypt(acct.sessionData)
-      : '';
+    const connectPromise = (async () => {
+      const acct = await (this.prisma as any).telegramAccount.findFirst({
+        where: { userId, tenantId, isPersonal: true, isActive: true },
+      });
+      if (!acct) throw new NotFoundException('Telegram akkaunt ulanmagan');
 
-    const client = new TelegramClient(
-      new StringSession(session),
-      apiId, apiHash,
-      { connectionRetries: 5, useWSS: false },
-    );
-    await client.connect();
-    activeSessions.set(userId, client);
+      const apiId   = parseInt(acct.apiId || process.env.TELEGRAM_API_ID || '0');
+      const apiHash = acct.apiHash
+        ? this.encryption.decrypt(acct.apiHash)
+        : (process.env.TELEGRAM_API_HASH || '');
+      const session = acct.sessionData
+        ? this.encryption.decrypt(acct.sessionData)
+        : '';
 
-    // Incoming messages listener
-    client.addEventHandler(async (event: any) => {
-      await this.handleIncoming(event, userId, tenantId, client);
-    }, new NewMessage({}));
+      const client = new TelegramClient(
+        new StringSession(session),
+        apiId, apiHash,
+        { connectionRetries: 5, useWSS: false },
+      );
+      await client.connect();
+      activeSessions.set(userId, client);
 
-    return client;
+      // Incoming messages listener
+      client.addEventHandler(async (event: any) => {
+        await this.handleIncoming(event, userId, tenantId, client);
+      }, new NewMessage({}));
+
+      return client;
+    })();
+
+    connectingPromises.set(userId, connectPromise);
+    try {
+      return await connectPromise;
+    } finally {
+      connectingPromises.delete(userId);
+    }
   }
 
   // ── Avatar yuklab olish va saqlash (telegramdan asl rasm) ────
@@ -454,13 +476,30 @@ export class TelegramPersonalService {
         where: { tenantId, channel: 'TELEGRAM', externalChatId: chatId },
       });
 
+      // BUG FIX: bir nechta joyda (getClient, verifyCode/verify2FA, getDialogs)
+      // client.addEventHandler(...) chaqirilishi mumkin edi — agar bitta xabar
+      // uchun 2-3 ta listener bir vaqtda ishlab ketsa (masalan tez-tez qayta
+      // ulanishlarda), har biri ALOHIDA Message yozuvi yaratardi — natijada
+      // xuddi bir xabar 2-3 marta takrorlanib chiqardi. getMessages() da
+      // avvaldan bor bo'lgan "externalMsgId bo'yicha tekshirish" ni bu yerga
+      // ham qo'shamiz — bu eng ishonchli himoya, listener nechta marta
+      // ishlab ketishidan qat'iy nazar, xabar FAQAT BIR MARTA saqlanadi.
+      if (conv) {
+        const dupe = await (this.prisma as any).message.findFirst({
+          where: { conversationId: conv.id, externalMsgId: String(m.id) },
+        });
+        if (dupe) return;
+      }
+
       // Yuboruvchi haqida telegramdan ism + rasm olib kelamiz —
       // shu orqali "Noma'lum" bo'lib ko'rinish muammosi hal bo'ladi.
       let profile: { firstName?: string; lastName?: string; username?: string; avatarUrl?: string } = {};
       if (!conv || !conv.firstName || !conv.avatarUrl) {
         try {
           const entity = await client.getEntity(chatId);
-          profile.firstName = (entity as any)?.firstName || '';
+          // Kanal/guruhlarda firstName emas, `title` bo'ladi — buni ham
+          // hisobga olamiz, aks holda ular har doim "Notanish" bo'lib qoladi.
+          profile.firstName = (entity as any)?.firstName || (entity as any)?.title || '';
           profile.lastName  = (entity as any)?.lastName || '';
           profile.username  = (entity as any)?.username || '';
           const avatarUrl = await this.saveAvatar(client, entity, chatId);
