@@ -22,6 +22,7 @@ import { TenantsModule } from './modules/tenants/tenants.module';
 import { ClientsModule } from './modules/clients/clients.module';
 import { PipelineModule } from './modules/pipeline/pipeline.module';
 import { OffersModule } from './modules/offers/offers.module';
+import { CurrencyModule } from './modules/currency/currency.module';
 import { InstagramModule } from './modules/instagram/instagram.module';
 import { BookingsModule } from './modules/bookings/bookings.module';
 import { PaymentsModule } from './modules/payments/payments.module';
@@ -76,6 +77,7 @@ import { HealthModule } from './modules/health/health.module';
     AuditModule,
 
     // Features
+    CurrencyModule,
     AuthModule,
     UsersModule,
     TenantsModule,
