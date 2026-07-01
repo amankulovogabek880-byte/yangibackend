@@ -144,7 +144,7 @@ export class PipelineService {
     if (role === 'AGENT') where.assignedAgentId = userId;
     else if (agentId) where.assignedAgentId = agentId;
 
-    const clients = await this.prisma.client.findMany({
+    const rawClients = await this.prisma.client.findMany({
       where,
       include: {
         assignedAgent: { select: { id: true, name: true, avatarUrl: true } },
@@ -152,6 +152,19 @@ export class PipelineService {
       },
       orderBy: { pipelineStageAt: 'desc' },
       take: 500,
+    });
+
+    // Yo'qotilgan (LOST) leadlar bosqichga tushgandan keyin 2 kun davomida
+    // pipelineda ko'rinib turadi (agentga ko'rish/qayta ko'rib chiqish uchun),
+    // shundan keyin avtomatik ravishda umumiy pipelinedan yo'qoladi va faqat
+    // "Yo'qotilgan leadlar" arxivida (getLostLeads) qoladi — bo'lmasa lidlar
+    // to'planib, odamni chalg'itadi.
+    const LOST_VISIBLE_MS = 2 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const clients = rawClients.filter((c: any) => {
+      if (c.pipelineStage !== 'LOST') return true;
+      const enteredAt = new Date(c.pipelineStageAt).getTime();
+      return now - enteredAt < LOST_VISIBLE_MS;
     });
 
     // If specific pipeline requested - show its custom stages
@@ -247,6 +260,30 @@ export class PipelineService {
     }
 
     return { stages };
+  }
+
+  // ─── Yo'qotilgan leadlar arxivi ─────────────────────────────────────────────
+  // Umumiy pipeline/dashboardda ko'rinmaydigan, lekin butunlay saqlanadigan
+  // LOST leadlar ro'yxati. Agentlar maxsus shu yerga kirib ishlashi mumkin.
+  async getLostLeads(tenantId: string, userId: string, role: string, agentId?: string) {
+    const where: any = { tenantId, pipelineStage: 'LOST' };
+    if (role === 'AGENT') where.assignedAgentId = userId;
+    else if (agentId) where.assignedAgentId = agentId;
+
+    const clients = await this.prisma.client.findMany({
+      where,
+      include: {
+        assignedAgent: { select: { id: true, name: true, avatarUrl: true } },
+        _count: { select: { bookings: true, conversations: true, calls: true } },
+      },
+      orderBy: { pipelineStageAt: 'desc' },
+      take: 500,
+    });
+
+    return {
+      count: clients.length,
+      clients: clients.map((c: any) => ({ ...this.mapClient(c), lostReason: c.lostReason })),
+    };
   }
 
   private mapClient(c: any) {
@@ -577,6 +614,11 @@ export class PipelineController {
 
   @Get('analytics')
   analytics(@CurrentUser() u: any) { return this.svc.analytics(u.tenantId); }
+
+  @Get('lost-leads')
+  lostLeads(@CurrentUser() u: any, @Query('agentId') aid?: string) {
+    return this.svc.getLostLeads(u.tenantId, u.id || u.sub, u.role, aid);
+  }
 
   @Get('client/:id/history')
   history(@CurrentUser() u: any, @Param('id') id: string) { return this.svc.getHistory(u.tenantId, id); }

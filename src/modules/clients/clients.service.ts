@@ -98,7 +98,14 @@ export class ClientsService {
     if (params.source && SOURCES.includes(params.source as LeadSource)) {
       where.source = params.source as LeadSource;
     }
-    if (params.stage) where.pipelineStage = params.stage as PipelineStage;
+    if (params.stage) {
+      where.pipelineStage = params.stage as PipelineStage;
+    } else {
+      // Yo'qotilgan (LOST) klientlar asosiy Klientlar dashboardida ko'rinmaydi —
+      // ular chalg'itadi va ular bilan hozircha ish yuritilmaydi.
+      // Faqat foydalanuvchi maxsus "Yo'qotildi" bosqichini tanlasa ko'rsatiladi.
+      where.pipelineStage = { not: 'LOST' as PipelineStage };
+    }
     if (params.agentId && role !== 'AGENT') where.assignedAgentId = params.agentId;
     if (params.tag) where.tags = { has: params.tag };
 
