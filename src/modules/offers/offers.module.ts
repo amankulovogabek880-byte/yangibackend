@@ -49,6 +49,27 @@ export class OffersService {
       fx = { rate, source: 'cbu.uz' };
     }
 
+    const pax = Math.max(1, parseInt(String(data.pax)) || 1);
+    const clientPriceTotal = actualPrice + markup;
+    const pricePerPerson = Math.round((clientPriceTotal / pax) * 100) / 100;
+
+    // ── Mehmonxonalar (2-5 ta variant, har biriga rasmlar) ──
+    let hotels: any[] = Array.isArray(data.hotels)
+      ? data.hotels
+          .slice(0, 5)
+          .map((h: any) => ({
+            name: (h?.name || '').toString().trim(),
+            stars: h?.stars ? Number(h.stars) : null,
+            photos: Array.isArray(h?.photos) ? h.photos.filter((p: any) => typeof p === 'string').slice(0, 6) : [],
+          }))
+          .filter((h: any) => h.name)
+      : [];
+    // Eski (bitta mehmonxona) formatidan kelgan so'rovlar bilan moslik
+    if (!hotels.length && data.hotelName) {
+      hotels = [{ name: data.hotelName, stars: data.hotelStars ? Number(data.hotelStars) : null, photos: [] }];
+    }
+    const mealPlan = ['NONE', 'BREAKFAST', 'FULL_BOARD'].includes(data.mealPlan) ? data.mealPlan : 'NONE';
+
     const offer = {
       id: Date.now().toString(),
       agentId,
@@ -56,10 +77,13 @@ export class OffersService {
       destination: data.destination || null,
       departDate: data.departDate || null,
       returnDate: data.returnDate || null,
-      pax: data.pax || 1,
+      departFlightTime: data.departFlightTime || null,
+      returnFlightTime: data.returnFlightTime || null,
+      pax,
       actualPrice,           // ── har doim USD ──
       markup,                 // ── har doim USD ──
-      clientPrice: actualPrice + markup,
+      clientPrice: clientPriceTotal,
+      pricePerPerson,
       currency: 'USD',
       // Shaffoflik uchun: agent qaysi valyutada va qanday kursda kiritgani
       originalCurrency: enteredCurrency !== 'USD' ? enteredCurrency : undefined,
@@ -68,11 +92,16 @@ export class OffersService {
       exchangeRate: fx ? fx.rate : undefined,
       exchangeRateSource: fx ? fx.source : undefined,
       exchangeRateAt: fx ? new Date().toISOString() : undefined,
-      hotelName: data.hotelName || null,
-      hotelStars: data.hotelStars || null,
+      hotels,
+      // Eski maydonlar — eski frontend/hisobotlar bilan moslik uchun (birinchi mehmonxona)
+      hotelName: hotels[0]?.name || null,
+      hotelStars: hotels[0]?.stars || null,
+      mealPlan,
       includesVisa: data.includesVisa || false,
       includesFlight: data.includesFlight !== false,
       includesHotel: data.includesHotel !== false,
+      includesTransfer: data.includesTransfer || false,
+      includesInsurance: data.includesInsurance || false,
       notes: data.notes || null,
       status: 'DRAFT',
       createdAt: new Date().toISOString(),
