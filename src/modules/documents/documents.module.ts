@@ -67,7 +67,13 @@ export class DocumentsService {
         name: data.name || file.originalname,
         category: safeEnum(data.category, CATEGORIES, 'OTHER'),
         fileName: file.originalname,
-        fileUrl: `${process.env.API_BASE_URL || process.env.FRONTEND_URL?.replace('3001','3000') || 'http://localhost:3000'}/uploads/${file.filename}`,
+        // BUG FIX: avval `|| process.env.FRONTEND_URL?.replace('3001','3000')`
+        // degan noto'g'ri zaxira bor edi — agar API_BASE_URL o'rnatilmagan bo'lsa,
+        // bu FRONTEND (Vercel) domenidan URL yasab, "/uploads/..." fayllarini
+        // frontendning o'zidan qidirar edi (u yerda bunday route yo'q — 404).
+        // Endi boshqa barcha joylardagi (telegram modullari) bilan bir xil: faqat
+        // API_BASE_URL (backend manzili) ishlatiladi.
+        fileUrl: `${process.env.API_BASE_URL || 'http://localhost:3000'}/uploads/${file.filename}`,
         fileMimeType: file.mimetype,
         fileSize: file.size,
         description: data.description,

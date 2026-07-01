@@ -469,11 +469,33 @@ export class V8Service {
     const balance = totalSpent - totalPaid;
 
     // Aktiv suhbat
-    const activeConversation = await this.prisma.conversation.findFirst({
+    // BUG FIX: avval faqat {id, channel, lastMessageAt, unreadCount} tanlanardi —
+    // isPersonal umuman tanlanmagani uchun frontend har doim uni "false/undefined"
+    // deb o'ylab, BOT orqali yuborishga urinardi. Agar shu tenant uchun bot ulanmagan
+    // bo'lsa (demo holatlarda ko'p uchraydi), bu "Bot aktiv emas" xatosiga olib kelardi
+    // — garchi suhbat aslida agentning SHAXSIY Telegram accounti orqali borgan bo'lsa ham.
+    const activeConversationRaw = await this.prisma.conversation.findFirst({
       where: { tenantId, clientId },
       orderBy: { lastMessageAt: { sort: 'desc', nulls: 'last' } },
-      select: { id: true, channel: true, lastMessageAt: true, unreadCount: true },
+      select: {
+        id: true, channel: true, lastMessageAt: true, unreadCount: true,
+        externalChatId: true, clientId: true,
+        account: { select: { isPersonal: true } },
+      },
     });
+    const activeConversation = activeConversationRaw
+      ? {
+          id: activeConversationRaw.id,
+          channel: activeConversationRaw.channel,
+          lastMessageAt: activeConversationRaw.lastMessageAt,
+          unreadCount: activeConversationRaw.unreadCount,
+          externalChatId: activeConversationRaw.externalChatId,
+          clientId: activeConversationRaw.clientId,
+          // account bo'lmasa ham (masalan eski yozuvlar) — xavfsiz tomonga: shaxsiy deb hisoblaymiz,
+          // chunki bot har doim ham ulanmagan bo'ladi, shaxsiy Telegram esa ko'proq ishonchli.
+          isPersonal: activeConversationRaw.account?.isPersonal ?? true,
+        }
+      : null;
 
     // Faol tasklar
     const activeTasks = await this.prisma.task.findMany({

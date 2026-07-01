@@ -355,7 +355,30 @@ export class ClientsService {
       throw new BadRequestException("Agentlar klientlarni o'chira olmaydi");
     }
     await this.findOne(tenantId, id, userId, role);
-    await this.prisma.client.delete({ where: { id } });
+
+    // BUG FIX: avval to'g'ridan-to'g'ri `prisma.client.delete()` chaqirilardi —
+    // lekin Booking/Invoice/Payment kabi moliyaviy yozuvlar Client bilan CASCADE
+    // BOG'LANMAGAN (atayin — moliyaviy tarix tasodifan o'chib ketmasligi uchun),
+    // shuning uchun bookingi bor har qanday klientni o'chirishga urinish har doim
+    // "Foreign key constraint" xatosi bilan tugardi va foydalanuvchiga tushunarsiz
+    // ko'rinardi ("ishlamayapti"). Endi buni aniq xabar bilan bloklaymiz.
+    const bookingsCount = await this.prisma.booking.count({ where: { clientId: id } });
+    if (bookingsCount > 0) {
+      throw new BadRequestException(
+        `Bu klientda ${bookingsCount} ta booking bor — moliyaviy tarixni yo'qotmaslik uchun bookingi bor klientlarni o'chirib bo'lmaydi. Kerak bo'lsa, klientni "Yo'qotildi" bosqichiga o'tkazing.`,
+      );
+    }
+
+    // Moliyaviy bo'lmagan bog'liq yozuvlarni (suhbat, vazifa, hujjat, qo'ng'iroq,
+    // tarix) klient bilan birga tozalaymiz — bular Client'ga CASCADE bog'lanmagan
+    // (chunki clientId ixtiyoriy), shuning uchun qo'lda, bitta tranzaksiyada o'chiramiz.
+    await this.prisma.$transaction([
+      this.prisma.conversation.deleteMany({ where: { clientId: id } }),
+      this.prisma.task.deleteMany({ where: { clientId: id } }),
+      this.prisma.document.deleteMany({ where: { clientId: id } }),
+      this.prisma.call.deleteMany({ where: { clientId: id } }),
+      this.prisma.client.delete({ where: { id } }),
+    ]);
     return { ok: true };
   }
 
