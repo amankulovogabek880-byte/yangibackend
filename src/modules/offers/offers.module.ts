@@ -7,6 +7,7 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators';
 import { convertToUSD } from '../../common/utils/helpers';
 import { BookingsModule, BookingsService } from '../bookings/bookings.module';
+import { PaymentsModule, PaymentsService } from '../payments/payments.module';
 
 // Offers stored in Client.preferences.offers JSON array
 // No schema migration needed!
@@ -18,6 +19,7 @@ export class OffersService {
   constructor(
     private prisma: PrismaService,
     private bookings: BookingsService,
+    private payments: PaymentsService,
   ) {}
 
   async list(tenantId: string, clientId: string) {
@@ -289,6 +291,22 @@ export class OffersService {
     //    tasdiqlagandagidek — Commission yozuvi avtomatik yaratiladi)
     const confirmed = await this.bookings.update(tenantId, booking.id, userId, role, { status: 'CONFIRMED' });
 
+    // 2.5) Taklif "sotildi" deb belgilanganda — mijoz to'lovni allaqachon
+    //      kelishib olgan deb hisoblanadi, shuning uchun booking to'liq
+    //      TO'LANGAN deb avtomatik belgilanadi (to'liq summaga Payment
+    //      yozuvi yaratiladi). Kerak bo'lsa, agent buni keyinchalik
+    //      To'lovlar bo'limidan qo'lda tuzatishi mumkin.
+    if (confirmed.totalPrice > 0) {
+      await this.payments.addManual(tenantId, userId, role, {
+        bookingId: confirmed.id,
+        amount: confirmed.totalPrice,
+        currency: 'USD',
+        method: 'CASH',
+        note: "Taklif 'Sotildi' deb belgilanganda avtomatik to'langan deb qayd etildi",
+      }).catch(() => {}); // to'lov yaratishda xato bo'lsa ham booking yaratilishi buzilmasin
+
+    }
+
     // 3) Taklifni SOTILDI deb belgilaymiz va yaratilgan bookingga bog'laymiz
     list[idx] = { ...offer, status: 'SOLD', soldAt: new Date().toISOString(), bookingId: confirmed.id };
     prefs.offers = list;
@@ -342,7 +360,7 @@ export class OffersController {
 }
 
 @Module({
-  imports: [BookingsModule],
+  imports: [BookingsModule, PaymentsModule],
   controllers: [OffersController],
   providers: [OffersService],
   exports: [OffersService],
