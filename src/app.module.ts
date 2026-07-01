@@ -22,7 +22,6 @@ import { TenantsModule } from './modules/tenants/tenants.module';
 import { ClientsModule } from './modules/clients/clients.module';
 import { PipelineModule } from './modules/pipeline/pipeline.module';
 import { OffersModule } from './modules/offers/offers.module';
-import { CurrencyModule } from './modules/currency/currency.module';
 import { InstagramModule } from './modules/instagram/instagram.module';
 import { BookingsModule } from './modules/bookings/bookings.module';
 import { PaymentsModule } from './modules/payments/payments.module';
@@ -54,6 +53,7 @@ import { LeadFormsModule } from './modules/v9/lead-forms.module';
 import { PhoneProvidersModule } from './modules/phone-providers/phone-providers.module';
 import { WhatsAppModule } from './modules/whatsapp/whatsapp.module';
 import { HealthModule } from './modules/health/health.module';
+import { ExchangeRateModule } from './modules/exchange-rate/exchange-rate.module';
 
 @Module({
   imports: [
@@ -77,7 +77,6 @@ import { HealthModule } from './modules/health/health.module';
     AuditModule,
 
     // Features
-    CurrencyModule,
     AuthModule,
     UsersModule,
     TenantsModule,
@@ -115,6 +114,7 @@ import { HealthModule } from './modules/health/health.module';
     PhoneProvidersModule,
     HealthModule,
     WhatsAppModule, // BUG1 FIX
+    ExchangeRateModule, // v10: CBU.uz valyuta kursi (offer/booking currency konvertatsiyasi)
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

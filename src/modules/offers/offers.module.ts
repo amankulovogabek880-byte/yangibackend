@@ -5,14 +5,16 @@ import {
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators';
-import { CurrencyModule, CurrencyService } from '../currency/currency.module';
+import { convertToUSD } from '../../common/utils/helpers';
 
 // Offers stored in Client.preferences.offers JSON array
 // No schema migration needed!
 
+const OFFER_CURRENCIES = ['USD', 'EUR', 'UZS', 'RUB'];
+
 @Injectable()
 export class OffersService {
-  constructor(private prisma: PrismaService, private currency: CurrencyService) {}
+  constructor(private prisma: PrismaService) {}
 
   async list(tenantId: string, clientId: string) {
     const client = await this.prisma.client.findFirst({ where: { id: clientId, tenantId } });
@@ -27,35 +29,24 @@ export class OffersService {
     const prefs: any = (client as any).preferences || {};
     if (!prefs.offers) prefs.offers = [];
 
-    const currency = (data.currency || 'USD').toUpperCase();
-    const actualPrice = Number(data.actualPrice) || 0;
-    const markup = Number(data.markup) || 0;
-    const clientPrice = actualPrice + markup;
+    // ── v10: Valyuta konvertatsiyasi ──
+    // Agent EUR yoki UZS kiritsa, CBU.uz rasmiy kursi bo'yicha USD ga
+    // o'giramiz. actualPrice/markup/clientPrice HAR DOIM USD da
+    // saqlanadi — shu tufayli agent komissiyasi, hisobotlar va KPI
+    // hammasi bitta valyutada (USD) to'g'ri hisoblanadi.
+    const enteredCurrency = OFFER_CURRENCIES.includes(data.currency) ? data.currency : 'USD';
+    const rawActualPrice = Number(data.actualPrice) || 0;
+    const rawMarkup = Number(data.markup) || 0;
 
-    // ── Valyuta konvertatsiyasi ──
-    // Taklif USD bo'lmagan valyutada yaratilsa, YARATILGAN PAYTDAGI CBU kursi
-    // bo'yicha USD ekvivalenti hisoblanadi va SHU KURS taklif ichida "muzlatib"
-    // saqlanadi. Keyinchalik kurs o'zgarsa ham, bu taklifning USD qiymati
-    // o'zgarmay qoladi — dashboard/hisobotlar shu USD qiymatlarga tayanadi.
-    let actualPriceUSD = actualPrice;
-    let markupUSD = markup;
-    let clientPriceUSD = clientPrice;
-    let exchangeRate = 1;       // 1 <currency> = X USD
-    let exchangeRateDate: string | null = null;
+    let actualPrice = rawActualPrice;
+    let markup = rawMarkup;
+    let fx: { rate: number; source: string } | null = null;
 
-    if (currency !== 'USD') {
-      try {
-        const clientConv = await this.currency.toUSD(clientPrice, currency);
-        const actualConv = await this.currency.toUSD(actualPrice, currency);
-        clientPriceUSD = clientConv.amount;
-        actualPriceUSD = actualConv.amount;
-        markupUSD = Math.round((clientPriceUSD - actualPriceUSD) * 100) / 100;
-        exchangeRate = clientConv.rate;
-        exchangeRateDate = clientConv.rateDate;
-      } catch {
-        // Kurs olib bo'lmasa ham taklif yaratilishi to'xtab qolmasin —
-        // USD maydonlari original qiymat bilan qoladi (taxminiy)
-      }
+    if (enteredCurrency !== 'USD') {
+      const rate = (await convertToUSD(1, enteredCurrency)).rate; // kursni 1 marta olamiz
+      actualPrice = Math.round((rawActualPrice / rate) * 100) / 100;
+      markup = Math.round((rawMarkup / rate) * 100) / 100;
+      fx = { rate, source: 'cbu.uz' };
     }
 
     const offer = {
@@ -66,16 +57,17 @@ export class OffersService {
       departDate: data.departDate || null,
       returnDate: data.returnDate || null,
       pax: data.pax || 1,
-      actualPrice,
-      markup,
-      clientPrice,
-      currency,
-      // Hisobot/dashboard har doim shu USD qiymatlarga tayanadi:
-      actualPriceUSD,
-      markupUSD,
-      clientPriceUSD,
-      exchangeRate,
-      exchangeRateDate,
+      actualPrice,           // ── har doim USD ──
+      markup,                 // ── har doim USD ──
+      clientPrice: actualPrice + markup,
+      currency: 'USD',
+      // Shaffoflik uchun: agent qaysi valyutada va qanday kursda kiritgani
+      originalCurrency: enteredCurrency !== 'USD' ? enteredCurrency : undefined,
+      originalActualPrice: enteredCurrency !== 'USD' ? rawActualPrice : undefined,
+      originalMarkup: enteredCurrency !== 'USD' ? rawMarkup : undefined,
+      exchangeRate: fx ? fx.rate : undefined,
+      exchangeRateSource: fx ? fx.source : undefined,
+      exchangeRateAt: fx ? new Date().toISOString() : undefined,
       hotelName: data.hotelName || null,
       hotelStars: data.hotelStars || null,
       includesVisa: data.includesVisa || false,
@@ -104,11 +96,8 @@ export class OffersService {
         userId: agentId,
         type: 'offer_created',
         title: 'Taklif yaratildi: ' + data.tourName,
-        description:
-          currency === 'USD'
-            ? '$' + clientPriceUSD.toLocaleString()
-            : `${currency} ${clientPrice.toLocaleString()} (≈ $${clientPriceUSD.toLocaleString()})`,
-        metadata: { offerId: offer.id, tourName: data.tourName, currency, clientPriceUSD },
+        description: '$' + offer.clientPrice.toLocaleString(),
+        metadata: { offerId: offer.id, tourName: data.tourName },
       } as any,
     }).catch(() => {});
 
@@ -168,7 +157,6 @@ export class OffersController {
 }
 
 @Module({
-  imports: [CurrencyModule],
   controllers: [OffersController],
   providers: [OffersService],
   exports: [OffersService],

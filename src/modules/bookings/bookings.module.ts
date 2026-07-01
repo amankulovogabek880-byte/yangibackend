@@ -5,7 +5,7 @@ import {
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators';
-import { safeEnum, paginate, meta, generateRef, clean } from '../../common/utils/helpers';
+import { safeEnum, paginate, meta, generateRef, clean, convertToUSD } from '../../common/utils/helpers';
 import { ClientsService } from '../clients/clients.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
@@ -92,8 +92,8 @@ export class BookingsService {
     if (!data.clientId) throw new BadRequestException('clientId majburiy');
     if (!data.tourName?.trim()) throw new BadRequestException('tourName majburiy');
     if (!data.destination?.trim()) throw new BadRequestException('destination majburiy');
-    const totalPrice = Number(data.totalPrice);
-    if (!Number.isFinite(totalPrice) || totalPrice <= 0) {
+    const rawTotalPrice = Number(data.totalPrice);
+    if (!Number.isFinite(rawTotalPrice) || rawTotalPrice <= 0) {
       throw new BadRequestException('totalPrice musbat bo\'lishi kerak');
     }
 
@@ -111,12 +111,33 @@ export class BookingsService {
     }
     const agentId = (role === 'AGENT' ? userId : data.agentId) || userId;
 
-    // ── v5: Profit avtomatik hisoblanadi ──
+    // ── v10: Valyuta konvertatsiyasi ──
+    // Agent EUR yoki UZS kiritsa, CBU.uz rasmiy kursi bo'yicha USD ga
+    // o'giramiz. totalPrice/supplierCost/discount/profit HAR DOIM USD
+    // da saqlanadi — shu tufayli agent komissiyasi, hisobotlar va KPI
+    // hammasi bitta valyutada (USD) to'g'ri hisoblanadi.
+    const enteredCurrency = safeEnum(data.currency, CURRENCIES, 'USD');
+    const rawSupplierCost = Number(data.supplierCost) || 0;
+    const rawDiscount = Number(data.discount) || 0;
+
+    let totalPrice = rawTotalPrice;
+    let supplierCost = rawSupplierCost;
+    let discount = rawDiscount;
+    let fxRate: number | null = null;
+
+    if (enteredCurrency !== 'USD') {
+      fxRate = (await convertToUSD(1, enteredCurrency)).rate; // kursni 1 marta olamiz, hammasiga qo'llaymiz
+      totalPrice = Math.round((rawTotalPrice / fxRate) * 100) / 100;
+      supplierCost = Math.round((rawSupplierCost / fxRate) * 100) / 100;
+      discount = Math.round((rawDiscount / fxRate) * 100) / 100;
+    }
+
+    // ── v5: Profit avtomatik hisoblanadi (USD da) ──
     // profit = totalPrice - supplierCost - discount
-    const supplierCost = Number(data.supplierCost) || 0;
-    const discount = Number(data.discount) || 0;
     const autoProfit = Math.max(0, totalPrice - supplierCost - discount);
-    const manualProfit = data.profit !== undefined ? Number(data.profit) : autoProfit;
+    const manualProfit = data.profit !== undefined
+      ? (fxRate ? Math.round((Number(data.profit) / fxRate) * 100) / 100 : Number(data.profit))
+      : autoProfit;
 
     const booking = await this.prisma.booking.create({
       data: {
@@ -136,7 +157,11 @@ export class BookingsService {
         children: Number(data.children) || 0,
         infants: Number(data.infants) || 0,
         totalPrice,
-        currency: safeEnum(data.currency, CURRENCIES, 'USD'),
+        currency: 'USD',
+        originalCurrency: enteredCurrency !== 'USD' ? enteredCurrency : undefined,
+        originalAmount: enteredCurrency !== 'USD' ? rawTotalPrice : undefined,
+        exchangeRate: fxRate ?? undefined,
+        exchangeRateAt: fxRate ? new Date() : undefined,
         discount,
         commissionAmount: Number(data.commission) || 0,
         profit: manualProfit,
@@ -296,7 +321,34 @@ export class BookingsService {
     }
 
     if (safe.tourType) safe.tourType = safeEnum(safe.tourType, TOUR_TYPES, existing.tourType);
-    if (safe.currency) safe.currency = safeEnum(safe.currency, CURRENCIES, existing.currency);
+
+    // ── v10: Valyuta konvertatsiyasi ──
+    // Tizim faqat USD bilan ishlaydi (hisobotlar/KPI aralashib
+    // ketmasligi uchun). Agar tahrirlashda narx maydonlari (totalPrice/
+    // supplierCost/discount) EUR yoki UZS da kiritilsa, CBU.uz rasmiy
+    // kursi bo'yicha USD ga o'giramiz va shundan keyin saqlaymiz.
+    const requestedCurrency = safe.currency ? safeEnum(safe.currency, CURRENCIES, 'USD') : 'USD';
+    const hasFinancialChange =
+      safe.totalPrice !== undefined || safe.supplierCost !== undefined || safe.discount !== undefined;
+
+    if (requestedCurrency !== 'USD' && hasFinancialChange) {
+      const rawTotal = safe.totalPrice !== undefined ? Number(safe.totalPrice) || 0 : undefined;
+      const rawCost = safe.supplierCost !== undefined ? Number(safe.supplierCost) || 0 : undefined;
+      const rawDisc = safe.discount !== undefined ? Number(safe.discount) || 0 : undefined;
+
+      const rate = (await convertToUSD(1, requestedCurrency)).rate; // kursni 1 marta olamiz
+      if (rawTotal !== undefined) {
+        safe.originalAmount = rawTotal;
+        safe.totalPrice = Math.round((rawTotal / rate) * 100) / 100;
+      }
+      if (rawCost !== undefined) safe.supplierCost = Math.round((rawCost / rate) * 100) / 100;
+      if (rawDisc !== undefined) safe.discount = Math.round((rawDisc / rate) * 100) / 100;
+      safe.originalCurrency = requestedCurrency;
+      safe.exchangeRate = rate;
+      safe.exchangeRateAt = new Date();
+    }
+    // Bazada currency maydoni har doim USD — asl valyuta originalCurrency'da saqlanadi
+    if (safe.currency !== undefined) safe.currency = 'USD';
 
     // ── v5: Date fields convert ──
     const dateFields = [

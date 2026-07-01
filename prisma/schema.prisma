@@ -711,13 +711,23 @@ model Booking {
   children      Int           @default(0)
   infants       Int           @default(0)
 
-  totalPrice    Float          // Sale Price (mijoz to'laydigan)
+  totalPrice    Float          // Sale Price (mijoz to'laydigan) — HAR DOIM USD da saqlanadi
   currency      Currency      @default(USD)
   paidAmount    Float         @default(0)
   discount      Float         @default(0)
   commissionPercent Float         @default(0)  // % komissiya (Commission model ham bor)
   profit        Float         @default(0)  // Auto: totalPrice - supplierCost - discount
   commissionAmount Float        @default(0)  // Agent komissiya summasi
+
+  // ── v10: Valyuta konvertatsiyasi ──
+  // Agent EUR/UZS/RUB kiritsa, CBU.uz rasmiy kursi bilan USD ga
+  // o'giriladi (yuqoridagi totalPrice/discount/supplierCost/profit
+  // maydonlari HAR DOIM USD). Quyidagi maydonlar faqat izoh/shaffoflik
+  // uchun — agent qaysi valyutada va qanday kursda kiritganini bildiradi.
+  originalCurrency Currency?    // Agent kiritgan asl valyuta (USD bo'lsa — null)
+  originalAmount   Float?       // Asl valyutadagi totalPrice (konvertatsiyadan oldin)
+  exchangeRate     Float?       // 1 USD = necha originalCurrency (konvertatsiya vaqtidagi CBU kursi)
+  exchangeRateAt   DateTime?    // Kurs qachon olingani
 
   status        BookingStatus @default(DRAFT)
   statusHistory Json          @default("[]")

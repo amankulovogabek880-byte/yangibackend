@@ -101,6 +101,108 @@ export function clean<T extends Record<string, any>>(obj: T): Partial<T> {
   return out;
 }
 
+// ═══════════════════════════════════════════════════════════════
+// VALYUTA KURSI (CBU.uz — O'zbekiston Markaziy banki rasmiy kursi)
+// ═══════════════════════════════════════════════════════════════
+// Taklif (offer) va booking yaratilganda agent EUR yoki UZS kiritsa,
+// shu funksiyalar orqali CBU.uz rasmiy kursi bo'yicha USD ga
+// o'giriladi. Tizimdagi BARCHA hisob-kitob (profit, agent
+// komissiyasi, hisobotlar, KPI) faqat USD da yuritiladi.
+
+export interface FxRates {
+  USD: number;   // 1 USD = necha UZS
+  EUR: number;   // 1 EUR = necha UZS
+  RUB: number;   // 1 RUB = necha UZS
+  fetchedAt: number;
+  source: 'cbu.uz' | 'fallback';
+}
+
+// CBU.uz vaqtincha ishlamay qolsa ishlatiladigan taxminiy kurs (oxirgi chora)
+const FX_FALLBACK: FxRates = { USD: 12700, EUR: 13700, RUB: 150, fetchedAt: 0, source: 'fallback' };
+const FX_CACHE_TTL_MS = 3 * 60 * 60 * 1000; // 3 soat — CBU kursi kuniga 1 marta yangilanadi
+let _fxCache: FxRates | null = null;
+
+/**
+ * CBU.uz dan rasmiy valyuta kurslarini oladi (UZS bazasida).
+ * Natija 3 soat keshlanadi. Fetch xato bersa — oxirgi keshlangan
+ * qiymat, u ham bo'lmasa taxminiy (fallback) qiymat qaytariladi.
+ */
+export async function getExchangeRates(): Promise<FxRates> {
+  if (_fxCache && Date.now() - _fxCache.fetchedAt < FX_CACHE_TTL_MS) {
+    return _fxCache;
+  }
+  try {
+    const axios = require('axios');
+    const { data } = await axios.get('https://cbu.uz/en/arkhiv-kursov-valyut/json/all/', {
+      timeout: 8000,
+    });
+    const rows: any[] = Array.isArray(data) ? data : [];
+    const find = (code: string): number | null => {
+      const row = rows.find((r) => r?.Ccy === code);
+      if (!row) return null;
+      const nominal = parseFloat(row.Nominal) || 1;
+      const rate = parseFloat(row.Rate);
+      return Number.isFinite(rate) && rate > 0 ? rate / nominal : null;
+    };
+    const usd = find('USD');
+    if (!usd) throw new Error('CBU javobida USD kursi topilmadi');
+    _fxCache = {
+      USD: usd,
+      EUR: find('EUR') || FX_FALLBACK.EUR,
+      RUB: find('RUB') || FX_FALLBACK.RUB,
+      fetchedAt: Date.now(),
+      source: 'cbu.uz',
+    };
+    return _fxCache;
+  } catch (e: any) {
+    console.error('[getExchangeRates] CBU.uz dan kurs olib bo\'lmadi:', e?.message || e);
+    if (_fxCache) return _fxCache;
+    return FX_FALLBACK;
+  }
+}
+
+/**
+ * 1 USD = necha dona berilgan valyuta ekanini qaytaradi.
+ * Masalan: getUsdRate('UZS') → { rate: 12700, ... }
+ *          getUsdRate('EUR') → { rate: 0.93, ... }
+ */
+export async function getUsdRate(
+  currency: string,
+): Promise<{ rate: number; source: 'cbu.uz' | 'fallback'; fetchedAt: number }> {
+  const cur = (currency || 'USD').toUpperCase();
+  if (cur === 'USD') return { rate: 1, source: 'cbu.uz', fetchedAt: Date.now() };
+
+  const rates = await getExchangeRates();
+  let rate = 1;
+  if (cur === 'UZS') rate = rates.USD;
+  else if (cur === 'EUR') rate = rates.USD / rates.EUR;
+  else if (cur === 'RUB') rate = rates.USD / rates.RUB;
+  // Noma'lum valyuta bo'lsa 1:1 qaytaramiz (xavfsiz default)
+
+  return { rate, source: rates.source, fetchedAt: rates.fetchedAt };
+}
+
+/** Berilgan kurs asosida summani USD ga o'giradi (2 xonagacha yaxlitlab) */
+export function applyUsdRate(amount: number, rate: number): number {
+  const amt = Number(amount) || 0;
+  if (!rate || rate <= 0) return amt;
+  return Math.round((amt / rate) * 100) / 100;
+}
+
+/**
+ * Qulaylik uchun: berilgan summani to'g'ridan-to'g'ri USD ga o'giradi.
+ * currency === 'USD' bo'lsa tarmoqqa murojaat qilinmaydi.
+ */
+export async function convertToUSD(
+  amount: number,
+  currency: string,
+): Promise<{ usd: number; rate: number; source: 'cbu.uz' | 'fallback' }> {
+  const cur = (currency || 'USD').toUpperCase();
+  if (cur === 'USD') return { usd: Number(amount) || 0, rate: 1, source: 'cbu.uz' };
+  const { rate, source } = await getUsdRate(cur);
+  return { usd: applyUsdRate(amount, rate), rate, source };
+}
+
 /**
  * ROUND-ROBIN: Keyingi agentni qaytaradi
  * - lastAssignedAt null = hech qachon olmagan = BIRINCHI navbatda
