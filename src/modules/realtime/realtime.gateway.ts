@@ -47,6 +47,12 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       // Join rooms
       client.join(`user:${userId}`);
       client.join(`tenant:${tenantId}`);
+      // v10 MUAMMO 4 FIX: rolga asoslangan xona — shu orqali "faqat
+      // TENANT_ADMIN/MANAGER'larga" yoki "faqat AGENT'larga" yuborish mumkin
+      // bo'ladi, butun tenant emas.
+      if (payload.role) {
+        client.join(`role:${tenantId}:${payload.role}`);
+      }
 
       this.logger.log(`✅ Ulandi: user=${userId} socket=${client.id}`);
       client.emit('connected', { userId, tenantId });
@@ -100,8 +106,47 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.server.to(`user:${userId}`).emit(event, data);
   }
 
+  /**
+   * v10 MUAMMO 4 FIX: avval BARCHA tenant xabarlari `emitToTenant` orqali
+   * butun tenant xonasiga (har qanday autentifikatsiyalangan foydalanuvchi
+   * a'zo bo'lgan `tenant:${tenantId}`) yuborilardi — ya'ni istalgan agent
+   * boshqa agentning shaxsiy suhbatidagi xabarlarni ham real-vaqtda ko'rib
+   * turardi. Bu xavfsizlik/maxfiylik muammosi edi.
+   *
+   * `emitToTenant` umumiy tenant-darajasidagi hodisalar uchun (masalan
+   * sozlamalar o'zgarishi) qoldirilgan — lekin SUHBAT/XABAR hodisalari uchun
+   * quyidagi ikkita metoddan foydalaniladi.
+   */
   emitToTenant(tenantId: string, event: string, data: any) {
     this.server.to(`tenant:${tenantId}`).emit(event, data);
+  }
+
+  /** Faqat berilgan rol(lar)dagi foydalanuvchilarga yuboradi (masalan faqat adminlarga) */
+  emitToRole(tenantId: string, roles: string[], event: string, data: any) {
+    for (const role of roles) {
+      this.server.to(`role:${tenantId}:${role}`).emit(event, data);
+    }
+  }
+
+  /**
+   * v10 MUAMMO 4 FIX: suhbat/xabar hodisasini FAQAT tegishli odamlarga
+   * yuboradi:
+   *  - Suhbat biriktirilgan bo'lsa (assignedAgentId bor) — o'sha agentga.
+   *  - Har doim TENANT_ADMIN va MANAGER'larga (nazorat/eskalatsiya uchun).
+   *  - Agar hech kimga biriktirilmagan bo'lsa — "umumiy lead" sifatida
+   *    barcha AGENT'larga ham yuboriladi (front-end buni alohida "Umumiy"
+   *    belgisi bilan ko'rsatishi kerak — Muammo 5).
+   * Barcha telegram/telegram-personal modullaridagi eski
+   * `emitToTenant(tenantId, 'message:new'/'conversation:updated', ...)`
+   * chaqiruvlari shu metodga almashtirildi.
+   */
+  emitConversationEvent(tenantId: string, assignedAgentId: string | null | undefined, event: string, data: any) {
+    if (assignedAgentId) {
+      this.emitToUser(assignedAgentId, event, data);
+    } else {
+      this.emitToRole(tenantId, ['AGENT'], event, data);
+    }
+    this.emitToRole(tenantId, ['TENANT_ADMIN', 'MANAGER'], event, data);
   }
 
   emitToConversation(conversationId: string, event: string, data: any) {

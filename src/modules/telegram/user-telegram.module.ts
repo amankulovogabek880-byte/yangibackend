@@ -28,6 +28,7 @@ import { CurrentUser } from '../../common/decorators';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { normalizeChatId, inferChatTypeFromGramjs } from './chat-id.util';
 
 // Telegram API credentials - admin tomonidan sozlanadi (my.telegram.org dan olinadi)
 // Default: demo credentials (faqat test uchun)
@@ -101,7 +102,9 @@ export class UserTelegramService implements OnModuleInit {
       fs.writeFileSync(path.join(uploadDir, fileName), buf);
       const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
       return `${baseUrl}/uploads/${fileName}?v=${Date.now()}`;
-    } catch {
+    } catch (e: any) {
+      // MUAMMO 6 FIX: xato sababini log qilamiz (avval sirli yutilar edi)
+      this.logger.warn(`saveAvatar xato (key=${key}): ${e?.message || e}`);
       return undefined;
     }
   }
@@ -309,11 +312,20 @@ export class UserTelegramService implements OnModuleInit {
           const date = new Date((msg.date || 0) * 1000);
           const text = msg.message || '';
 
-          // Suhbat kim bilan: kiruvchi bo'lsa senderId, chiquvchi bo'lsa peerId
-          const peerId = isOut
-            ? String((msg as any).peerId?.userId || (msg as any).chatId || '')
-            : (msg.senderId?.toString() || '');
+          // MUAMMO 1 FIX: avval INBOUND xabarlar uchun `msg.senderId` ishlatilardi —
+          // bu GURUH xabarlarida XATO edi, chunki senderId xabarni YOZGAN odamning
+          // ID'si, guruhning o'zi emas! Natijada guruhdagi har bir kishi bilan
+          // ALOHIDA-ALOHIDA "shaxsiy suhbat" yaratilib ketardi. GramJS'ning
+          // `msg.chatId` getter'i esa yo'nalishdan qat'iy nazar har doim xabar
+          // tegishli bo'lgan HAQIQIY suhbatni (shaxsiy/guruh/kanal) to'g'ri beradi.
+          const rawChatId = (msg as any).chatId;
+          const isGroupOrChannel = !!(msg.isGroup || msg.isChannel);
+          const peerId = rawChatId
+            ? normalizeChatId(rawChatId.toString(), 'gramjs', isGroupOrChannel)
+            : '';
           if (!peerId) return;
+          // MUAMMO 2 FIX: suhbat turini ham saqlaymiz.
+          const chatType = inferChatTypeFromGramjs(msg);
 
           if (isOut) {
             // ── Agent o'z Telegram'idan yozgan (OUTBOUND) ────────────────────
@@ -349,7 +361,7 @@ export class UserTelegramService implements OnModuleInit {
 
             // Real-time: boshqa tab/qurilmada ham darhol ko'rinsin
             this.realtime.emitToUser(agentId, 'message:new', savedOut);
-            this.realtime.emitToTenant(tenantId, 'conversation:updated', {
+            this.realtime.emitConversationEvent(tenantId, agentId, 'conversation:updated', {
               conversationId: conv.id, lastMessageText: text.slice(0, 200), lastMessageAt: date,
             });
             return;
@@ -373,6 +385,17 @@ export class UserTelegramService implements OnModuleInit {
           let conv = await this.prisma.conversation.findFirst({
             where: { tenantId, channel: 'TELEGRAM', externalChatId: peerId },
           });
+
+          // MUAMMO 1 FIX: bu yerda avval hech qanday dublikat tekshiruvi yo'q edi
+          // (faqat OUTBOUND tarmoqda bor edi) — shu sabab bitta xabar bir necha
+          // marta ushlab qolinsa (masalan qayta ulanishda), har safar YANGI
+          // Message yozuvi yaratilib, chatda takrorlanib chiqardi.
+          if (conv) {
+            const dup = await this.prisma.message.findFirst({
+              where: { conversationId: conv.id, externalMsgId: String(msg.id) },
+            });
+            if (dup) return;
+          }
 
           // Telegramdan profil rasmini yuklab olamiz
           let avatarUrl: string | undefined;
@@ -398,7 +421,8 @@ export class UserTelegramService implements OnModuleInit {
                 assignedAgentId: agentId, channel: 'TELEGRAM',
                 externalChatId: peerId, firstName, lastName, username, avatarUrl,
                 lastMessageAt: date, lastMessageText: text.slice(0, 200),
-              },
+                chatType,
+              } as any,
             });
           } else {
             conv = await this.prisma.conversation.update({
@@ -408,8 +432,9 @@ export class UserTelegramService implements OnModuleInit {
                 firstName: conv.firstName || firstName,
                 lastName: conv.lastName || lastName,
                 username: conv.username || username,
+                chatType: (conv as any).chatType || chatType,
                 ...(avatarUrl ? { avatarUrl } : {}),
-              },
+              } as any,
             });
           }
 
@@ -422,11 +447,11 @@ export class UserTelegramService implements OnModuleInit {
             },
           });
 
-          // Real-time notify
+          // Real-time notify — v10 MUAMMO 4 FIX: tenant-keng emas
           if (agentId) {
             this.realtime.emitToUser(agentId, 'message:new', savedMsg);
           }
-          this.realtime.emitToTenant(tenantId, 'conversation:updated', {
+          this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId || agentId, 'conversation:updated', {
             conversationId: conv.id,
             lastMessageText: text.slice(0, 200),
             lastMessageAt: date,
@@ -594,9 +619,10 @@ export class UserTelegramService implements OnModuleInit {
       });
 
       // Refresh qilmasdan darhol ko'rinishi uchun — barcha ulangan
-      // sessiyalarga (boshqa tab/qurilma) ham real xabarni yuboramiz
+      // sessiyalarga (boshqa tab/qurilma) ham real xabarni yuboramiz.
+      // v10 MUAMMO 4 FIX: tenant-keng emas, faqat tegishlilarga.
       this.realtime.emitToUser(agentId, 'message:new', savedMsg);
-      this.realtime.emitToTenant(tenantId, 'conversation:updated', {
+      this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId || agentId, 'conversation:updated', {
         conversationId: conv.id,
         lastMessageText: data.text.slice(0, 200),
         lastMessageAt: new Date(),

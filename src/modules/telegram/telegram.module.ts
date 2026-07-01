@@ -13,6 +13,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import { paginate, meta } from '../../common/utils/helpers';
 import { Prisma } from '@prisma/client';
 import { MessageType, Language } from '../../prisma-types';;
+import { normalizeChatId } from './chat-id.util';
 
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
@@ -108,10 +109,23 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
   /** Round-robin: pick agent with least active conversations */
   private async pickAgent(tenantId: string): Promise<string | null> {
-    const agents = await this.prisma.user.findMany({
+    let agents = await this.prisma.user.findMany({
       where: { tenantId, role: { in: ['AGENT', 'MANAGER'] }, status: 'ACTIVE' },
       select: { id: true },
     });
+    // v10 MUAMMO 5 BONUS FIX: agar tenant'da hali AGENT/MANAGER rolidagi
+    // hech kim bo'lmasa (masalan kichik/yangi agentlik — faqat egasi
+    // TENANT_ADMIN sifatida ishlayotgan bo'lsa), oldin bu funksiya har doim
+    // `null` qaytarardi va HAR BIR yangi suhbat abadiy "biriktirilmagan"
+    // holda qolib ketardi. Endi shunday holatda faol TENANT_ADMIN'larga
+    // zaxira sifatida tayinlaymiz — hech kimga umuman tegmasdan qolishdan
+    // ko'ra shu ma'qulroq.
+    if (!agents.length) {
+      agents = await this.prisma.user.findMany({
+        where: { tenantId, role: 'TENANT_ADMIN', status: 'ACTIVE' },
+        select: { id: true },
+      });
+    }
     if (!agents.length) return null;
     const counts = await Promise.all(
       agents.map(async (a) => ({
@@ -145,7 +159,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       fs.writeFileSync(path.join(uploadDir, fileName), Buffer.from(resp.data));
       const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
       return `${baseUrl}/uploads/${fileName}?v=${Date.now()}`;
-    } catch {
+    } catch (e: any) {
+      // MUAMMO 6 FIX: avval xato sababi sirli yutilar edi (`catch { return undefined }`),
+      // keyingi safar nega rasm saqlanmaganini debug qilib bo'lmasdi.
+      this.logger.warn(`saveAvatarFromBot xato (tgUserId=${tgUserId}): ${e?.message || e}`);
       return undefined;
     }
   }
@@ -168,7 +185,11 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     tenantId: string,
     bot: TelegramBot,
   ) {
-    const chatId = String(msg.chat.id);
+    // MUAMMO 1 FIX: normalizatsiya qilingan chatId — GramJS (shaxsiy akkaunt)
+    // orqali kelgan bir xil guruh/kanal bilan bir xil formatga tushishi uchun.
+    const chatId = normalizeChatId(msg.chat.id, 'bot', msg.chat.type !== 'private');
+    // MUAMMO 2 FIX: suhbat turi (private/group/supergroup/channel) endi saqlanadi.
+    const chatType = msg.chat.type;
     const tgUserId = msg.from?.id ? String(msg.from.id) : undefined;
     const text = msg.text || msg.caption || '';
 
@@ -213,7 +234,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           startPayload,
           clientId: client?.id,
           assignedAgentId,
-        },
+          chatType,
+        } as any,
       });
 
       if (assignedAgentId) {
@@ -226,7 +248,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           metadata: { conversationId: conv.id },
         }).catch(() => {});
       }
-    } else if (avatarUrl || !conv.firstName) {
+    } else if (avatarUrl || !conv.firstName || !(conv as any).chatType) {
       conv = await this.prisma.conversation.update({
         where: { id: conv.id },
         data: {
@@ -234,7 +256,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           firstName: conv.firstName || msg.from?.first_name,
           lastName: conv.lastName || msg.from?.last_name,
           username: conv.username || msg.from?.username,
-        },
+          chatType: (conv as any).chatType || chatType,
+        } as any,
       });
     }
 
@@ -260,11 +283,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       },
     });
 
-    // Real-time emit (WebSocket) — tenant xonasiga, chunki frontend shu xonaga avtomatik qo'shiladi
+    // Real-time emit (WebSocket) — v10 MUAMMO 4 FIX: butun tenant o'rniga
+    // faqat biriktirilgan agent + admin/manager'larga (yoki agent
+    // biriktirilmagan bo'lsa — barcha agentlarga "umumiy" sifatida)
     try {
-      this.realtime.emitToTenant(tenantId, 'message:new', newMsg);
+      this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'message:new', newMsg);
       this.realtime.emitToConversation(conv.id, 'message:new', newMsg);
-      this.realtime.emitToTenant(tenantId, 'conversation:updated', {
+      this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'conversation:updated', {
         conversationId: conv.id,
         lastMessageText: (msg.text || msg.caption || `[${messageType}]`).slice(0, 200),
         lastMessageAt: new Date(),
@@ -360,11 +385,12 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
-    // Realtime emit
+    // Realtime emit — v10 MUAMMO 4 FIX: tenant-keng emas, faqat tegishlilarga
     try {
-      this.realtime.emitToTenant(tenantId, 'message:new', msg);
+      const targetAgentId = conv.assignedAgentId || agentId;
+      this.realtime.emitConversationEvent(tenantId, targetAgentId, 'message:new', msg);
       this.realtime.emitToConversation(conversationId, 'message:new', msg);
-      this.realtime.emitToTenant(tenantId, 'conversation:updated', {
+      this.realtime.emitConversationEvent(tenantId, targetAgentId, 'conversation:updated', {
         conversationId,
         lastMessageText: text.slice(0, 200),
         lastMessageAt: new Date(),
@@ -483,7 +509,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
-      this.realtime.emitToTenant(tenantId, 'message:new', msg);
+      this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId || agentId, 'message:new', msg);
       this.realtime.emitToConversation(conversationId, 'message:new', msg);
     } catch {}
 
@@ -614,7 +640,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           data: { lastMessageAt: new Date(), lastMessageText: filledText.slice(0, 200) },
         });
 
-        this.realtime.emitToTenant(tenantId, 'message:new', msg);
+        this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId || agentId, 'message:new', msg);
         this.realtime.emitToUser(agentId, 'message:new', msg);
       } finally {
         try { await client2.disconnect(); } catch {}

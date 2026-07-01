@@ -973,6 +973,10 @@ model Conversation {
   username        String?
   avatarUrl       String?
   startPayload    String?
+  // v10 MUAMMO 2: suhbat turi — "private" | "group" | "supergroup" | "channel".
+  // Bot API va GramJS ikkalasi ham bu maydonni to'ldiradi (chat-id.util.ts
+  // orqali GramJS xabarlaridan aniqlanadi, Bot API esa msg.chat.type dan).
+  chatType        String?
 
   isResolved      Boolean          @default(false)
   isPinned        Boolean          @default(false)
