@@ -897,6 +897,21 @@ export class ReportsService {
     const salaryNotes: any = ((tenant as any).settings as any)?.salaryNotes || {};
     const agentSalaryNote = salaryNotes[userId] || {};
 
+    // v10: Jamoadagi reytingni aniqlaymiz — agentSalaries() dagi bir xil
+    // mantiq (KPI tier, oy oralig'i) qayta ishlatiladi, shunda ikkalasi
+    // har doim bir-biriga mos keladi. Boshqa agentlarning ismi yoki aniq
+    // summasi bu yerga QAYTARILMAYDI — faqat o'rin raqami va jami son.
+    let myRank: number | null = null;
+    let totalAgents = 0;
+    try {
+      const allAgentSalaries = await this.agentSalaries(tenantId, monthOffset);
+      totalAgents = allAgentSalaries.length;
+      const idx = allAgentSalaries.findIndex((a: any) => a.id === userId);
+      myRank = idx === -1 ? null : idx + 1; // 1-o'rin = eng yuqori oylik
+    } catch {
+      // Reyting hisoblanmasa ham asosiy maosh ma'lumoti qaytishi kerak
+    }
+
     return {
       monthStart, monthEnd,
       currency: tenant.currency,
@@ -911,6 +926,8 @@ export class ReportsService {
       grossSalary,
       alreadyPaid,
       pending,
+      myRank,       // v10: masalan 2 — jamoada 2-o'rinda
+      totalAgents,  // v10: masalan 5 — jami nechta faol agent bor
       bookings: bookings.slice(0, 20),
       breakdown: bookings.map((b: any) => ({
         id: b.id,

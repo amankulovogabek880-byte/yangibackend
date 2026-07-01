@@ -44,7 +44,6 @@ import { UploadsModule } from './modules/uploads/uploads.module';
 import { V8Module } from './modules/v8/v8.module';
 // v9: Yangi modullar
 import { PassengersModule } from './modules/v9/passengers.module';
-import { ApprovalsModule } from './modules/v9/approvals.module';
 import { RoundRobinModule } from './modules/v9/round-robin.module';
 import { CommandPaletteModule } from './modules/v9/command-palette.module';
 import { ServicesModule } from './modules/v9/services.module';
@@ -105,7 +104,6 @@ import { ExchangeRateModule } from './modules/exchange-rate/exchange-rate.module
     V8Module,
     // v9:
     PassengersModule,
-    ApprovalsModule,
     RoundRobinModule,
     CommandPaletteModule,
     ServicesModule,

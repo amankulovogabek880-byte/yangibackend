@@ -156,7 +156,6 @@ export class CommandPaletteService {
     if (['TENANT_ADMIN', 'MANAGER'].includes(role)) {
       all.push(
         { type: 'action', id: 'team', title: '👥 Jamoa', subtitle: 'Agentlar va xodimlar', url: '/settings?tab=team', icon: '👥', keywords: ['team', 'jamoa', 'agent'] },
-        { type: 'action', id: 'approvals', title: '✅ Tasdiqlar', subtitle: 'Kutilayotgan so\'rovlar', url: '/approvals', icon: '✅', keywords: ['approval', 'tasdiq', 'so\'rov'] },
       );
     }
 
