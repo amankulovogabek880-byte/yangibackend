@@ -247,7 +247,7 @@ export class OffersService {
    * ko'rinadi). Qo'lda "Yangi booking" to'ldirish shart emas — narxni
    * qayta kiritish kerak bo'lmaydi, xatoliklarning oldi olinadi.
    */
-  async markSold(tenantId: string, userId: string, role: string, clientId: string, offerId: string) {
+  async markSold(tenantId: string, userId: string, role: string, clientId: string, offerId: string, overrides: any = {}) {
     const client = await this.prisma.client.findFirst({ where: { id: clientId, tenantId } });
     if (!client) throw new NotFoundException();
     const prefs: any = (client as any).preferences || {};
@@ -261,19 +261,24 @@ export class OffersService {
 
     const hotel = Array.isArray(offer.hotels) && offer.hotels.length ? offer.hotels[0] : null;
 
+    // v10.3: Frontend "Booking yaratish" modalidan kelgan tahrirlangan
+    // qiymatlar (overrides) offer qiymatlaridan ustun turadi — agent
+    // yaratishdan oldin narx/sana/pax ni o'zgartira oladi.
+    const ov = overrides || {};
+
     // 1) Booking DRAFT sifatida yaratiladi (offerdagi barcha ma'lumotlar bilan)
     const booking = await this.bookings.create(tenantId, userId, role, {
       clientId,
-      tourName: offer.tourName,
-      destination: offer.destination || offer.tourName,
-      departureDate: offer.departDate || undefined,
-      returnDate: offer.returnDate || undefined,
-      adults: offer.pax || 1,
-      children: 0,
-      totalPrice: offer.clientPrice,
-      supplierCost: offer.actualPrice,
-      discount: 0,
-      currency: 'USD', // taklif allaqachon USD da saqlangan
+      tourName: ov.tourName || offer.tourName,
+      destination: ov.destination || offer.destination || offer.tourName,
+      departureDate: ov.departureDate || offer.departDate || undefined,
+      returnDate: ov.returnDate || offer.returnDate || undefined,
+      adults: Number(ov.adults ?? offer.pax ?? 1) || 1,
+      children: Number(ov.children ?? 0) || 0,
+      totalPrice: Number(ov.totalPrice ?? offer.clientPrice) || 0,
+      supplierCost: Number(ov.supplierCost ?? offer.actualPrice) || 0,
+      discount: Number(ov.discount ?? 0) || 0,
+      currency: ov.currency || 'USD', // taklif allaqachon USD da saqlangan
       hotelName: hotel?.name || offer.hotelName || undefined,
       hotelStars: hotel?.stars || offer.hotelStars || undefined,
       mealPlan: offer.mealPlan || undefined,
@@ -282,7 +287,7 @@ export class OffersService {
       includesHotel: !!offer.includesHotel,
       includesTransfer: !!offer.includesTransfer,
       includesInsurance: !!offer.includesInsurance,
-      notes: offer.notes || undefined,
+      notes: ov.notes || offer.notes || undefined,
       status: 'DRAFT',
     });
 
@@ -355,7 +360,7 @@ export class OffersController {
 
   @Post(':id/mark-sold')
   markSold(@CurrentUser() u: any, @Body() body: any, @Param('id') offerId: string) {
-    return this.svc.markSold(u.tenantId, u.id || u.sub, u.role, body.clientId, offerId);
+    return this.svc.markSold(u.tenantId, u.id || u.sub, u.role, body.clientId, offerId, body.overrides);
   }
 }
 

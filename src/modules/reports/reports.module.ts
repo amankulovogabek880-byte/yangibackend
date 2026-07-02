@@ -914,6 +914,116 @@ export class ReportsService {
     return { grossSalary, pending, myCommissionPercent: appliedPercent, appliedTier, revenue, profit, bookingCount: bookings.length };
   }
 
+  // ─── v10.3: Agentlar oyma-oy tarixi ─────────────────────────────────────
+  // Admin: hamma agentning oxirgi N oy bo'yicha leadlari, bookinglari,
+  // conversion, daromadi, foydasi va maoshi (KPI tier hisobga olinadi).
+  // Agent: faqat o'zining tarixini oladi (boshqalar ko'rinmaydi).
+  async agentsMonthly(tenantId: string, userId: string, role: string, months = 6, agentIdFilter?: string) {
+    const isAgent = role === 'AGENT';
+    const targetAgentId = isAgent ? userId : (agentIdFilter || undefined);
+
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { agentCommissionPercent: true, kpiTiers: true, currency: true } as any,
+    });
+    const basePercent = Number((tenant as any)?.agentCommissionPercent ?? 10);
+    let kpiTiers: any[] = [];
+    try {
+      kpiTiers = Array.isArray((tenant as any)?.kpiTiers)
+        ? (tenant as any).kpiTiers
+        : JSON.parse(((tenant as any)?.kpiTiers as string) || '[]');
+      if (!Array.isArray(kpiTiers)) kpiTiers = [];
+    } catch { kpiTiers = []; }
+
+    const pickPercent = (revenue: number) => {
+      let percent = basePercent;
+      if (kpiTiers.length > 0) {
+        const sorted = [...kpiTiers].sort((a: any, b: any) => a.minRevenue - b.minRevenue);
+        let applied: any = null;
+        for (const tier of sorted) {
+          if (revenue >= tier.minRevenue && (tier.maxRevenue === null || revenue < tier.maxRevenue)) {
+            applied = tier; break;
+          }
+        }
+        if (!applied && sorted.length > 0) applied = sorted[sorted.length - 1];
+        if (applied) percent = applied.commissionPercent;
+      }
+      return percent;
+    };
+
+    // Agentlar ro'yxati
+    const agents = await this.prisma.user.findMany({
+      where: {
+        tenantId, status: 'ACTIVE',
+        role: { in: ['AGENT', 'MANAGER'] },
+        ...(targetAgentId ? { id: targetAgentId } : {}),
+      },
+      select: { id: true, name: true, role: true, avatarUrl: true },
+    });
+    if (agents.length === 0) return { months: [], agents: [] };
+    const agentIds = agents.map((a) => a.id);
+
+    const now = new Date();
+    const n = Math.min(Math.max(months, 1), 24);
+    const rangeStart = new Date(now.getFullYear(), now.getMonth() - (n - 1), 1);
+
+    // Bitta so'rovda hamma bookinglar va leadlar — keyin oylarga taqsimlaymiz
+    const [bookings, leads] = await Promise.all([
+      this.prisma.booking.findMany({
+        where: {
+          tenantId, agentId: { in: agentIds },
+          status: { in: ['DRAFT', 'CONFIRMED', 'COMPLETED'] },
+          createdAt: { gte: rangeStart },
+        },
+        select: { agentId: true, totalPrice: true, profit: true, createdAt: true },
+      }),
+      this.prisma.client.findMany({
+        where: { tenantId, assignedAgentId: { in: agentIds }, createdAt: { gte: rangeStart } },
+        select: { assignedAgentId: true, createdAt: true },
+      }),
+    ]);
+
+    const monthKey = (d: Date | string) => {
+      const x = new Date(d);
+      return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}`;
+    };
+
+    const monthKeys: string[] = [];
+    for (let i = n - 1; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      monthKeys.push(monthKey(d));
+    }
+
+    const result = agents.map((agent) => {
+      const rows = monthKeys.map((mk) => {
+        const bks = bookings.filter((b) => b.agentId === agent.id && monthKey(b.createdAt) === mk);
+        const lds = leads.filter((l) => l.assignedAgentId === agent.id && monthKey(l.createdAt) === mk);
+        const revenue = bks.reduce((s, b) => s + (b.totalPrice || 0), 0);
+        const profit = bks.reduce((s, b) => s + (b.profit || 0), 0);
+        const percent = pickPercent(revenue);
+        const salary = +(profit * percent / 100).toFixed(2);
+        const conversion = lds.length > 0 ? Math.round((bks.length / lds.length) * 100) : 0;
+        return {
+          month: mk,
+          leads: lds.length,
+          bookings: bks.length,
+          conversion,
+          revenue: Math.round(revenue),
+          profit: Math.round(profit),
+          commissionPercent: percent,
+          salary,
+        };
+      });
+      const totals = rows.reduce((t, r) => ({
+        leads: t.leads + r.leads, bookings: t.bookings + r.bookings,
+        revenue: t.revenue + r.revenue, profit: t.profit + r.profit, salary: t.salary + r.salary,
+      }), { leads: 0, bookings: 0, revenue: 0, profit: 0, salary: 0 });
+      return { agent, rows, totals: { ...totals, salary: +totals.salary.toFixed(2) } };
+    });
+
+    return { months: monthKeys, currency: (tenant as any)?.currency || 'USD', agents: result };
+  }
+
   async mySalary(tenantId: string, userId: string, monthOffset = 0) {
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth() + monthOffset, 1);
@@ -1648,6 +1758,16 @@ export class ReportsController {
     const y = Math.min(Math.max(Number(year) || now.getFullYear(), 2020), 2100);
     const m = Math.min(Math.max(Number(month) || (now.getMonth() + 1), 1), 12);
     return this.svc.calendarMonth(u.tenantId, u.sub, u.role, y, m);
+  }
+
+  // v10.3: Agentlar oyma-oy tarixi (admin — hammasi, agent — faqat o'ziniki)
+  @Get('agents-monthly')
+  agentsMonthly(
+    @CurrentUser() u: any,
+    @Query('months') months?: string,
+    @Query('agentId') agentId?: string,
+  ) {
+    return this.svc.agentsMonthly(u.tenantId, u.sub, u.role, Number(months) || 6, agentId);
   }
 
   @Get('call-analytics')
