@@ -1145,6 +1145,19 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     return { ok: true };
   }
 
+  // v12 FIX: suhbatni o'chirish — agent inboxdan keraksiz/xato suhbatlarni
+  // (masalan spam yoki eski test yozishmalarni) o'chira olishi kerak edi,
+  // lekin bunday funksiya umuman yo'q edi.
+  async deleteConversation(tenantId: string, conversationId: string) {
+    const conv = await this.prisma.conversation.findFirst({
+      where: { id: conversationId, tenantId },
+    });
+    if (!conv) throw new NotFoundException('Suhbat topilmadi');
+    // Message'lar `onDelete: Cascade` orqali avtomatik o'chadi
+    await this.prisma.conversation.delete({ where: { id: conversationId } });
+    return { ok: true };
+  }
+
   async linkClient(tenantId: string, conversationId: string, clientId: string) {
     const conv = await this.prisma.conversation.findFirst({
       where: { id: conversationId, tenantId },
@@ -1359,6 +1372,12 @@ export class TelegramController {
   @Patch('conversations/:id/resolve')
   resolve(@Param('id') id: string, @CurrentUser() u: any) {
     return this.svc.resolve(u.tenantId, id);
+  }
+
+  // v12 FIX: suhbatni o'chirish
+  @Delete('conversations/:id')
+  deleteConversation(@Param('id') id: string, @CurrentUser() u: any) {
+    return this.svc.deleteConversation(u.tenantId, id);
   }
 
   @Patch('conversations/:id/link-client')
