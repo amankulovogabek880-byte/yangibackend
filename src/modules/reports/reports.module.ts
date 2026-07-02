@@ -16,6 +16,109 @@ export class ReportsService {
   // ═══════════════════════════════════════════════════════════════
   // KALENDAR HISOBOTI — kunlik va oraliq
   // ═══════════════════════════════════════════════════════════════
+  // ─── v10.2: Oylik kalendar eventlari ────────────────────────────────────
+  // Tour CRM kalendari: parvozlar (ketish/qaytish), viza muddati,
+  // invoice to'lov muddati, vazifalar va follow-uplar — bitta gridda.
+  async calendarMonth(tenantId: string, userId: string, role: string, year: number, month: number) {
+    const agentFilter: any       = role === 'AGENT' ? { agentId: userId } : {};
+    const clientAgentFilter: any = role === 'AGENT' ? { assignedAgentId: userId } : {};
+
+    const start = new Date(year, month - 1, 1, 0, 0, 0);
+    const end   = new Date(year, month, 0, 23, 59, 59); // oyning oxirgi kuni
+    const df = { gte: start, lte: end };
+
+    const [departures, returns, visas, tasks, followups, invoices] = await Promise.all([
+      this.prisma.booking.findMany({
+        where: { tenantId, ...agentFilter, departureDate: df, status: { not: 'CANCELLED' } },
+        select: {
+          id: true, bookingRef: true, tourName: true, destination: true,
+          departureDate: true, airline: true, flightNumber: true,
+          client: { select: { id: true, fullName: true } },
+        },
+      }),
+      this.prisma.booking.findMany({
+        where: { tenantId, ...agentFilter, returnDate: df, status: { not: 'CANCELLED' } },
+        select: {
+          id: true, bookingRef: true, tourName: true, returnDate: true,
+          client: { select: { id: true, fullName: true } },
+        },
+      }),
+      this.prisma.booking.findMany({
+        where: { tenantId, ...agentFilter, visaExpiryDate: df, status: { not: 'CANCELLED' } },
+        select: {
+          id: true, bookingRef: true, visaExpiryDate: true, visaType: true,
+          client: { select: { id: true, fullName: true } },
+        },
+      }),
+      this.prisma.task.findMany({
+        where: {
+          tenantId, dueAt: df, status: { not: 'DONE' },
+          ...(role === 'AGENT' ? { assigneeId: userId } : {}),
+        },
+        select: { id: true, title: true, dueAt: true, priority: true, clientId: true },
+      }).catch(() => [] as any[]),
+      this.prisma.followUp.findMany({
+        where: {
+          tenantId, dueAt: df, done: false,
+          ...(role === 'AGENT' ? { agentId: userId } : {}),
+        },
+        select: { id: true, note: true, dueAt: true, clientId: true },
+      }).catch(() => [] as any[]),
+      this.prisma.invoice.findMany({
+        where: { tenantId, dueDate: df, status: { notIn: ['PAID', 'CANCELLED'] as any } },
+        select: {
+          id: true, number: true, totalAmount: true, currency: true, dueDate: true,
+          client: { select: { id: true, fullName: true } },
+        },
+      }).catch(() => [] as any[]),
+    ]);
+
+    const events: any[] = [];
+    const day = (d: any) => new Date(d).toISOString().slice(0, 10);
+
+    for (const b of departures) events.push({
+      type: 'departure', date: day(b.departureDate),
+      title: (b.client?.fullName || b.bookingRef) + ' — ' + (b.destination || b.tourName),
+      sub: [b.airline, b.flightNumber].filter(Boolean).join(' '),
+      link: '/bookings/' + b.id,
+    });
+    for (const b of returns) events.push({
+      type: 'return', date: day(b.returnDate),
+      title: (b.client?.fullName || b.bookingRef) + ' — qaytish',
+      sub: b.tourName, link: '/bookings/' + b.id,
+    });
+    for (const b of visas) events.push({
+      type: 'visa', date: day(b.visaExpiryDate),
+      title: (b.client?.fullName || b.bookingRef) + ' — viza tugaydi',
+      sub: b.visaType || '', link: '/bookings/' + b.id,
+    });
+    for (const t of tasks as any[]) events.push({
+      type: 'task', date: day(t.dueAt),
+      title: t.title, sub: t.priority,
+      link: t.clientId ? '/clients/' + t.clientId : '/tasks',
+    });
+    for (const f of followups as any[]) events.push({
+      type: 'followup', date: day(f.dueAt),
+      title: f.note || 'Follow-up', sub: '',
+      link: f.clientId ? '/clients/' + f.clientId : '/followups',
+    });
+    for (const inv of invoices as any[]) events.push({
+      type: 'payment', date: day(inv.dueDate),
+      title: (inv.client?.fullName || inv.number) + " — to'lov muddati",
+      sub: '$' + Number(inv.totalAmount || 0).toLocaleString(),
+      link: '/invoices/' + inv.id,
+    });
+
+    // Kun bo'yicha guruhlash
+    const byDate: Record<string, any[]> = {};
+    for (const e of events) (byDate[e.date] = byDate[e.date] || []).push(e);
+
+    return { year, month, events, byDate, counts: {
+      departure: departures.length, return: returns.length, visa: visas.length,
+      task: (tasks as any[]).length, followup: (followups as any[]).length, payment: (invoices as any[]).length,
+    } };
+  }
+
   async calendarReport(tenantId: string, userId: string, role: string, date?: string, from?: string, to?: string) {
     const agentFilter: any       = role === 'AGENT' ? { agentId: userId } : {};
     const clientAgentFilter: any = role === 'AGENT' ? { assignedAgentId: userId } : {};
@@ -1532,6 +1635,19 @@ export class ReportsController {
     @Query('to') to?: string,
   ) {
     return this.svc.calendarReport(u.tenantId, u.sub, u.role, date, from, to);
+  }
+
+  // v10.2: Oylik kalendar (parvoz/viza/to'lov/vazifa eventlari)
+  @Get('calendar-month')
+  calendarMonth(
+    @CurrentUser() u: any,
+    @Query('year') year?: string,
+    @Query('month') month?: string,
+  ) {
+    const now = new Date();
+    const y = Math.min(Math.max(Number(year) || now.getFullYear(), 2020), 2100);
+    const m = Math.min(Math.max(Number(month) || (now.getMonth() + 1), 1), 12);
+    return this.svc.calendarMonth(u.tenantId, u.sub, u.role, y, m);
   }
 
   @Get('call-analytics')
