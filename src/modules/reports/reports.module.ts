@@ -67,7 +67,7 @@ export class ReportsService {
       this.prisma.invoice.findMany({
         where: { tenantId, dueDate: df, status: { notIn: ['PAID', 'CANCELLED'] as any } },
         select: {
-          id: true, number: true, totalAmount: true, currency: true, dueDate: true,
+          id: true, invoiceNumber: true, totalAmount: true, currency: true, dueDate: true,
           client: { select: { id: true, fullName: true } },
         },
       }).catch(() => [] as any[]),
@@ -104,7 +104,7 @@ export class ReportsService {
     });
     for (const inv of invoices as any[]) events.push({
       type: 'payment', date: day(inv.dueDate),
-      title: (inv.client?.fullName || inv.number) + " — to'lov muddati",
+      title: (inv.client?.fullName || inv.invoiceNumber) + " — to'lov muddati",
       sub: '$' + Number(inv.totalAmount || 0).toLocaleString(),
       link: '/invoices/' + inv.id,
     });
