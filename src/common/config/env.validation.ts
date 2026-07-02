@@ -84,3 +84,4 @@ export function validateEnv(): void {
     logger.log('✅ ENV validatsiya muvaffaqiyatli');
   }
 }
+// salom
