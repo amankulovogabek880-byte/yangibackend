@@ -13,7 +13,6 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { AuditInterceptor } from './common/interceptors/audit.interceptor';
 import { PrismaService } from './prisma/prisma.service';
 
-import { TelegramPersonalService } from './modules/telegram-personal/telegram-personal.module';
 async function bootstrap() {
   // ENV tekshirish
   validateEnv();
@@ -161,11 +160,6 @@ Webhook: \`POST /api/v1/calls/webhook\`
     customSiteTitle: 'Omon CRM API Docs',
   });
 
-  // Restore Telegram personal sessions
-  try {
-    const tgPersonal = app.get(TelegramPersonalService, { strict: false });
-    if (tgPersonal) await tgPersonal.restoreAllSessions();
-  } catch {}
 
   await app.listen(port);
 

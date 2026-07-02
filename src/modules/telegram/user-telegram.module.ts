@@ -356,7 +356,11 @@ export class UserTelegramService implements OnModuleInit {
 
             await this.prisma.conversation.update({
               where: { id: conv.id },
-              data: { lastMessageAt: date, lastMessageText: text.slice(0, 200) },
+              data: {
+                lastMessageAt: date, lastMessageText: text.slice(0, 200),
+                // v11 FIX: accountId yo'q bo'lsa tuzatamiz (pastdagi izohga qarang)
+                ...((conv as any).accountId ? {} : { accountId: acc.id }),
+              },
             });
 
             // Real-time: boshqa tab/qurilmada ham darhol ko'rinsin
@@ -434,6 +438,11 @@ export class UserTelegramService implements OnModuleInit {
                 username: conv.username || username,
                 chatType: (conv as any).chatType || chatType,
                 ...(avatarUrl ? { avatarUrl } : {}),
+                // v11 FIX: eski (endi o'chirilgan) TelegramPersonalModule
+                // ba'zi suhbatlarni accountId'siz yaratib qoldirgan edi —
+                // shu tufayli ular doim "Bot" deb ko'rinardi. Endi har bir
+                // xabar kelganda accountId yo'q bo'lsa, avtomatik tuzatamiz.
+                ...((conv as any).accountId ? {} : { accountId: acc.id }),
               } as any,
             });
           }
@@ -590,6 +599,8 @@ export class UserTelegramService implements OnModuleInit {
               clientId: conv.clientId || data.clientId || null,
               assignedAgentId: conv.assignedAgentId || agentId,
               ...(avatarUrl ? { avatarUrl } : {}),
+              // v11 FIX: accountId yo'q bo'lsa tuzatamiz
+              ...(conv.accountId ? {} : { accountId: account.id }),
             },
           });
         }
@@ -600,6 +611,8 @@ export class UserTelegramService implements OnModuleInit {
             lastMessageAt: new Date(),
             lastMessageText: data.text.slice(0, 200),
             clientId: conv.clientId || data.clientId || null,
+            // v11 FIX: accountId yo'q bo'lsa tuzatamiz
+            ...(conv.accountId ? {} : { accountId: account.id }),
           },
         });
       }
@@ -640,6 +653,133 @@ export class UserTelegramService implements OnModuleInit {
       }
       throw new BadRequestException(`Xato: ${e.message}`);
     }
+  }
+
+  // ─── v11 FIX (davomi): Media/fayl yuborish (shaxsiy akkaunt orqali) ──────
+  // Shablonga biriktirilgan rasm/fayl endi faqat caption-matn sifatida emas,
+  // HAQIQIY fayl sifatida (MTProto orqali) yuboriladi — xuddi bot orqali
+  // yuborilgandagidek.
+  private async sendPersonalMedia(
+    tenantId: string, agentId: string, conversationId: string,
+    fileUrl: string, caption?: string,
+  ) {
+    const conv = await this.prisma.conversation.findFirst({
+      where: { id: conversationId, tenantId },
+    });
+    if (!conv) throw new NotFoundException('Suhbat topilmadi');
+
+    const account = await this.prisma.telegramAccount.findFirst({
+      where: { tenantId, userId: agentId, isPersonal: true, isActive: true },
+    });
+    if (!account) throw new BadRequestException('Shaxsiy Telegram account ulanmagan');
+
+    let client = activeSessions.get(account.id);
+    if (!client || !(await client.isUserAuthorized().catch(() => false))) {
+      client = await this.restoreSession(account) || undefined;
+      if (!client) throw new BadRequestException('Session yaroqsiz. Settings → Telegram dan qayta ulaning');
+    }
+
+    const peer = await client.getInputEntity(conv.externalChatId);
+
+    // Faylni URL'dan yuklab olamiz, so'ng Telegramga o'zimiz jo'natamiz
+    const axios = require('axios');
+    const resp = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+    const buf = Buffer.from(resp.data);
+    const fileName = fileUrl.split('/').pop()?.split('?')[0] || `file_${Date.now()}`;
+    const isImage = !!fileName.match(/\.(jpg|jpeg|png|gif|webp)$/i);
+
+    const sent = await client.sendFile(peer, {
+      file: buf,
+      caption: caption || '',
+      forceDocument: !isImage,
+      workers: 1,
+      attributes: [{ className: 'DocumentAttributeFilename', fileName }] as any,
+    } as any);
+
+    const savedMsg = await this.prisma.message.create({
+      data: {
+        conversationId: conv.id,
+        agentId,
+        direction: 'OUTBOUND',
+        messageType: isImage ? 'PHOTO' : 'DOCUMENT',
+        text: caption || '',
+        fileUrl,
+        externalMsgId: String((sent as any).id || Date.now()),
+        isDelivered: true,
+      } as any,
+      include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
+    });
+
+    await this.prisma.conversation.update({
+      where: { id: conv.id },
+      data: {
+        lastMessageAt: new Date(),
+        lastMessageText: caption?.slice(0, 200) || '📎 Fayl',
+        ...(conv.accountId ? {} : { accountId: account.id }),
+      },
+    });
+
+    this.realtime.emitToUser(agentId, 'message:new', savedMsg);
+    this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId || agentId, 'conversation:updated', {
+      conversationId: conv.id,
+      lastMessageText: caption?.slice(0, 200) || '📎 Fayl',
+      lastMessageAt: new Date(),
+    });
+
+    return savedMsg;
+  }
+
+  // Public wrapper — controller orqali chaqiriladi (masalan "Rasm" tugmasi)
+  async sendMedia(tenantId: string, agentId: string, conversationId: string, fileUrl: string, caption?: string) {
+    return this.sendPersonalMedia(tenantId, agentId, conversationId, fileUrl, caption);
+  }
+
+  // ─── v11 FIX: Shablon yuborish (shaxsiy akkaunt orqali) ──────────────────
+  // Ilgari "Shablon" tugmasi shaxsiy (isPersonal) suhbatlarda ham har doim
+  // BOT endpointiga (`/telegram/conversations/:id/template/:id`) yuborardi —
+  // bu shaxsiy akkauntga tegishli emas edi, shu sabab xabar hech qachon
+  // to'g'ri yetkazilmas yoki socket orqali darhol ko'rinmas edi (faqat
+  // sahifani qayta yuklaganda — "restart" qilinganda — bazadan tasodifan
+  // ko'rinib qolishi mumkin edi). Endi shaxsiy suhbatlar uchun MTProto
+  // orqali to'g'ridan-to'g'ri shu yerdan yuboriladi.
+  async sendTemplate(tenantId: string, agentId: string, conversationId: string, templateId: string) {
+    const template = await this.prisma.messageTemplate.findFirst({
+      where: { id: templateId, tenantId, isActive: true } as any,
+    });
+    if (!template) throw new NotFoundException('Shablon topilmadi');
+
+    await this.prisma.messageTemplate.update({
+      where: { id: templateId },
+      data: { useCount: { increment: 1 } } as any,
+    }).catch(() => {});
+
+    const sent: any[] = [];
+
+    if ((template as any).text?.trim()) {
+      const r = await this.sendPersonalMessage(tenantId, agentId, {
+        conversationId,
+        text: (template as any).text,
+      });
+      if (r?.message) sent.push(r.message);
+    }
+
+    const mediaItems = [
+      ...((template as any).mediaUrl ? [{ url: (template as any).mediaUrl, caption: (template as any).mediaCaption || '' }] : []),
+      ...((Array.isArray((template as any).attachments) ? (template as any).attachments : []) as any[])
+        .filter((a: any) => a?.url)
+        .map((a: any) => ({ url: a.url, caption: a.caption || '' })),
+    ];
+
+    for (const item of mediaItems) {
+      try {
+        const savedMsg = await this.sendPersonalMedia(tenantId, agentId, conversationId, item.url, item.caption);
+        sent.push(savedMsg);
+      } catch (e: any) {
+        this.logger.warn('Shaxsiy shablon media yuborilmadi: ' + e?.message);
+      }
+    }
+
+    return { sent: sent.length, messages: sent };
   }
 
   // ─── Get my personal account status ──────────────────────────────────────
@@ -723,6 +863,20 @@ export class UserTelegramController {
   @Post('send')
   sendMessage(@CurrentUser() u: any, @Body() body: any) {
     return this.svc.sendPersonalMessage(u.tenantId, u.id || u.sub, body);
+  }
+
+  // v11 FIX: shaxsiy akkaunt orqali shablon yuborish
+  @ApiOperation({ summary: 'Shablon yuborish (shaxsiy akkaunt orqali)' })
+  @Post('send-template')
+  sendTemplate(@CurrentUser() u: any, @Body() body: { conversationId: string; templateId: string }) {
+    return this.svc.sendTemplate(u.tenantId, u.id || u.sub, body.conversationId, body.templateId);
+  }
+
+  // v11 FIX: shaxsiy akkaunt orqali rasm/fayl yuborish
+  @ApiOperation({ summary: 'Rasm/fayl yuborish (shaxsiy akkaunt orqali)' })
+  @Post('send-media')
+  sendMedia(@CurrentUser() u: any, @Body() body: { conversationId: string; fileUrl: string; caption?: string }) {
+    return this.svc.sendMedia(u.tenantId, u.id || u.sub, body.conversationId, body.fileUrl, body.caption);
   }
 
   // Status

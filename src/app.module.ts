@@ -25,7 +25,11 @@ import { OffersModule } from './modules/offers/offers.module';
 import { InstagramModule } from './modules/instagram/instagram.module';
 import { BookingsModule } from './modules/bookings/bookings.module';
 import { PaymentsModule } from './modules/payments/payments.module';
-import { TelegramPersonalModule } from './modules/telegram-personal/telegram-personal.module';
+// v11 FIX: TelegramPersonalModule (eski) olib tashlandi — u UserTelegramModule
+// bilan bitta shaxsiy Telegram akkauntga PARALLEL ikkinchi MTProto ulanish
+// ochib, xabarlarni ikki marta/nomuvofiq mantiq bilan qayta ishlar edi.
+// Bu — dublikat suhbatlar, "hammasi Bot" ko'rinishi, o'z xabari begonaga
+// o'xshab qolishi va ulanish beqarorligining bosh sababi edi.
 import { TelegramModule } from './modules/telegram/telegram.module';
 import { UserTelegramModule } from './modules/telegram/user-telegram.module';
 import { ReportsModule } from './modules/reports/reports.module';
@@ -86,7 +90,6 @@ import { ExchangeRateModule } from './modules/exchange-rate/exchange-rate.module
     BookingsModule,
     PaymentsModule,
     TelegramModule,
-    TelegramPersonalModule,
     UserTelegramModule,
     ReportsModule,
     OwnerModule,
