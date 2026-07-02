@@ -160,6 +160,12 @@ Webhook: \`POST /api/v1/calls/webhook\`
     customSiteTitle: 'Omon CRM API Docs',
   });
 
+  // v11 FIX: Eski TelegramPersonalService orqali sessiya tiklash olib
+  // tashlandi. UserTelegramService o'zining onModuleInit()'ida BARCHA
+  // shaxsiy Telegram sessiyalarini allaqachon avtomatik tiklaydi — bu yerda
+  // ikkinchi marta tiklash faqat bitta akkauntga 2 ta parallel MTProto
+  // ulanish ochib, xabarlarni ikki marta/nomuvofiq qayta ishlashga sabab
+  // bo'lardi (dublikat suhbatlar, "Bot" bo'lib ko'rinish, va h.k.).
 
   await app.listen(port);
 
