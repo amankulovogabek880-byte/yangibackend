@@ -47,15 +47,30 @@ async function bootstrap() {
   app.use(cookieParser());
 
   // ─── CORS ────────────────────────────────────────────────
-  const corsOrigins = process.env.CORS_ORIGINS || '*';
+  // XAVFSIZLIK: `*` + credentials kombinatsiyasi taqiqlanadi.
+  // Production'da CORS_ORIGINS env MAJBURIY (vergul bilan ajratilgan ro'yxat).
+  // Development'da faqat localhost'larga ruxsat.
+  const isProd = process.env.NODE_ENV === 'production';
+  const rawOrigins = (process.env.CORS_ORIGINS || '').trim();
+
+  if (isProd && (!rawOrigins || rawOrigins === '*')) {
+    throw new Error(
+      "CORS_ORIGINS env production'da majburiy va '*' bo'lishi mumkin emas. " +
+      'Masalan: CORS_ORIGINS=https://crm.example.uz,https://app.example.uz',
+    );
+  }
+
+  const allowedOrigins = rawOrigins && rawOrigins !== '*'
+    ? rawOrigins.split(',').map((s) => s.trim()).filter(Boolean)
+    : ['http://localhost:3001', 'http://127.0.0.1:3001']; // dev fallback
+
   app.enableCors({
-    origin: corsOrigins === '*'
-      ? true
-      : (origin: string | undefined, cb: any) => {
-          const allowed = corsOrigins.split(',').map((s) => s.trim());
-          if (!origin || allowed.includes(origin)) return cb(null, true);
-          cb(null, false);
-        },
+    origin: (origin: string | undefined, cb: any) => {
+      // Origin'siz so'rovlar (curl, server-to-server, mobil app) — ruxsat,
+      // lekin cookie'lar bunda baribir yuborilmaydi.
+      if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+      cb(null, false);
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'x-refresh-token'],
@@ -87,19 +102,26 @@ async function bootstrap() {
 
   // ─── Static files ─────────────────────────────────────────
   const express = require('express');
-  // Serve uploads with basic token check (prevent direct access without auth)
+  const jwt = require('jsonwebtoken');
   const uploadDir = config.get('UPLOAD_DIR', './uploads');
+
+  // XAVFSIZLIK TUZATISH: oldin har qanday "Bearer xxx" yoki 10+ belgili
+  // ?token= qabul qilinardi (soxta token bilan hamma fayl ochiq edi).
+  // Endi JWT haqiqiy tekshiriladi.
   app.use('/uploads', (req: any, res: any, next: any) => {
-    // Authorization header yoki ?token=... query param orqali ruxsat
-    const authHeader = req.headers.authorization;
-    const tokenQuery = req.query?.token;
-    if (
-      (authHeader && authHeader.startsWith('Bearer ')) ||
-      (tokenQuery && typeof tokenQuery === 'string' && tokenQuery.length > 10)
-    ) {
+    const authHeader = req.headers.authorization as string | undefined;
+    const tokenQuery = typeof req.query?.token === 'string' ? req.query.token : undefined;
+    const token = authHeader?.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : tokenQuery;
+
+    if (!token) return res.status(401).json({ message: 'Unauthorized' });
+    try {
+      jwt.verify(token, process.env.JWT_ACCESS_SECRET);
       return next();
+    } catch {
+      return res.status(401).json({ message: 'Unauthorized' });
     }
-    return res.status(401).json({ message: 'Unauthorized' });
   }, express.static(uploadDir));
 
   // ─── Swagger API Documentation ──────────────────────────

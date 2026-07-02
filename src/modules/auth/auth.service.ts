@@ -218,26 +218,11 @@ export class AuthService {
         },
       });
     } catch (sessionErr: any) {
-      if (sessionErr?.code === 'P2002') {
-        // Eski sessiyalarni o'chir va qayta yarat
-        await this.prisma.userSession.updateMany({
-          where: { userId: user.id, revokedAt: null },
-          data: { revokedAt: new Date(), revokedReason: 'duplicate_session' },
-        });
-        await this.prisma.userSession.create({
-          data: {
-            userId: user.id,
-            refreshTokenHash: refreshHash + '_retry_' + Date.now(),
-            ip, userAgent,
-            deviceName: device,
-            country: geo.country,
-            city: geo.city,
-            isCurrent: true,
-            expiresAt: new Date(Date.now() + refreshExpiresInDays * 86400000),
-          },
-        });
-      }
-      // Boshqa xatolarda token qaytarishni bloklamaymiz
+      // TUZATISH: eski `refreshHash + '_retry_'` hack olib tashlandi —
+      // u yaroqsiz hash yozib, o'sha sessiyani refresh qilib bo'lmas holga
+      // keltirardi. Endi jti tufayli P2002 chiqmaydi; boshqa DB xatolari
+      // log qilinadi, lekin login bloklanmaydi.
+      this.logger.error('Session yaratishda xato: ' + (sessionErr?.message || sessionErr));
     }
 
     await this.prisma.user.update({
@@ -525,13 +510,16 @@ export class AuthService {
   }
 
   private async generateTokens(user: any) {
-    const payload = { sub: user.id, email: user.email, role: user.role, tenantId: user.tenantId };
+    // TUZATISH: `jti` (unique ID) qo'shildi — bir soniya ichida ikkita login
+    // bo'lsa ham token har doim unikal bo'ladi. Bu eski `_retry_` hack'ining
+    // ildiz sababi edi (bir xil payload + bir xil iat = bir xil token = P2002).
+    const basePayload = { sub: user.id, email: user.email, role: user.role, tenantId: user.tenantId };
     const [accessToken, refreshToken] = await Promise.all([
-      this.jwt.signAsync(payload, {
+      this.jwt.signAsync({ ...basePayload, jti: crypto.randomUUID() }, {
         secret: process.env.JWT_ACCESS_SECRET,
         expiresIn: process.env.JWT_ACCESS_EXPIRES || '15m',
       }),
-      this.jwt.signAsync(payload, {
+      this.jwt.signAsync({ ...basePayload, jti: crypto.randomUUID() }, {
         secret: process.env.JWT_REFRESH_SECRET,
         expiresIn: process.env.JWT_REFRESH_EXPIRES || '7d',
       }),

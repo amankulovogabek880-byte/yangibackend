@@ -1,14 +1,58 @@
 import {
   Controller, Post, Get, Patch, Delete, Body, Param,
-  Req, UseGuards, HttpCode, BadRequestException,
+  Req, Res, UseGuards, HttpCode, BadRequestException,
 } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
-import { Request } from 'express';
+import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser, Public, Roles } from '../../common/decorators';
 import { LoginRateLimitGuard } from '../../common/guards/rate-limit.guard';
+
+// ─────────────────────────────────────────────────────────────
+// XAVFSIZLIK TUZATISH (v10.1):
+// Refresh token endi httpOnly cookie'da saqlanadi — JS unga yeta olmaydi,
+// demak XSS orqali o'g'irlab bo'lmaydi. Access token esa qisqa muddatli
+// (15m) va frontend uni faqat xotirada (memory) ushlaydi.
+//
+// Orqaga moslik: body'dagi refreshToken hali ham qabul qilinadi
+// (mobil app / eski client'lar uchun), lekin cookie ustuvor.
+//
+// ENV sozlamalari:
+//   COOKIE_DOMAIN   — masalan `.omoncrm.uz` (frontend/backend subdomenlarda bo'lsa)
+//   COOKIE_SAMESITE — 'lax' (default, bir sayt) | 'none' (turli domenlar, HTTPS shart)
+// ─────────────────────────────────────────────────────────────
+
+const REFRESH_COOKIE = 'omon_rt';
+
+function refreshCookieOptions() {
+  const isProd = process.env.NODE_ENV === 'production';
+  const sameSite = (process.env.COOKIE_SAMESITE || 'lax') as 'lax' | 'strict' | 'none';
+  const days = parseInt((process.env.JWT_REFRESH_EXPIRES || '7d').replace('d', ''), 10) || 7;
+  return {
+    httpOnly: true,
+    secure: isProd || sameSite === 'none', // sameSite=none faqat secure bilan ishlaydi
+    sameSite,
+    domain: process.env.COOKIE_DOMAIN || undefined,
+    path: '/api/v1/auth', // cookie faqat auth endpointlariga yuboriladi
+    maxAge: days * 86400000,
+  } as const;
+}
+
+function setRefreshCookie(res: Response, token: string) {
+  res.cookie(REFRESH_COOKIE, token, refreshCookieOptions());
+}
+
+function clearRefreshCookie(res: Response) {
+  const { maxAge, ...opts } = refreshCookieOptions();
+  res.clearCookie(REFRESH_COOKIE, opts);
+}
+
+function readRefreshToken(req: Request, body?: { refreshToken?: string }): string | undefined {
+  // 1) httpOnly cookie (ustuvor)  2) body fallback (eski clientlar)
+  return (req.cookies?.[REFRESH_COOKIE] as string | undefined) || body?.refreshToken;
+}
 
 @Controller('auth')
 export class AuthController {
@@ -23,18 +67,37 @@ export class AuthController {
   async login(
     @Body() body: { email: string; password: string; twoFactorCode?: string },
     @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
   ) {
     const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip;
     const userAgent = req.headers['user-agent'];
-    return this.auth.login(body.email, body.password, body.twoFactorCode, ip, userAgent);
+    const result = await this.auth.login(body.email, body.password, body.twoFactorCode, ip, userAgent);
+
+    // 2FA talab qilinsa token hali yo'q
+    if ((result as any).requires2FA) return result;
+
+    const { refreshToken, ...rest } = result as any;
+    setRefreshCookie(res, refreshToken);
+    // refreshToken javob body'sida ham qaytadi (mobil client fallback),
+    // lekin web frontend uni ENDI localStorage'ga yozmaydi.
+    return { ...rest, refreshToken };
   }
 
   @Post('refresh')
   @Public()
   @HttpCode(200)
-  async refresh(@Body() body: { refreshToken: string }, @Req() req: Request) {
+  async refresh(
+    @Body() body: { refreshToken?: string },
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
     const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip;
-    return this.auth.refresh(body.refreshToken, ip, req.headers['user-agent']);
+    const token = readRefreshToken(req, body);
+    const result = await this.auth.refresh(token as string, ip, req.headers['user-agent']);
+
+    const { refreshToken, ...rest } = result as any;
+    setRefreshCookie(res, refreshToken); // rotation: yangi token cookie'ga
+    return { ...rest, refreshToken };
   }
 
   // ─── AUTHENTICATED ENDPOINTS ─────────────────────────────
@@ -42,14 +105,21 @@ export class AuthController {
   @Post('logout')
   @UseGuards(JwtAuthGuard)
   @HttpCode(200)
-  async logout(@Body() body: { refreshToken: string }) {
-    return this.auth.logout(body.refreshToken);
+  async logout(
+    @Body() body: { refreshToken?: string },
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const token = readRefreshToken(req, body);
+    clearRefreshCookie(res);
+    return this.auth.logout(token || '');
   }
 
   @Post('logout-all')
   @UseGuards(JwtAuthGuard)
   @HttpCode(200)
-  async logoutAll(@CurrentUser() u: any) {
+  async logoutAll(@CurrentUser() u: any, @Res({ passthrough: true }) res: Response) {
+    clearRefreshCookie(res);
     return this.auth.logoutAll(u.sub);
   }
 
@@ -101,7 +171,10 @@ export class AuthController {
   @Get('sessions')
   @UseGuards(JwtAuthGuard)
   async sessions(@CurrentUser() u: any, @Req() req: Request) {
-    const refreshToken = req.headers['x-refresh-token'] as string | undefined;
+    // Cookie'dan (yoki eski x-refresh-token header'dan) joriy sessiyani aniqlaymiz
+    const refreshToken =
+      (req.cookies?.[REFRESH_COOKIE] as string | undefined) ||
+      (req.headers['x-refresh-token'] as string | undefined);
     return this.auth.sessions(u.sub, refreshToken);
   }
 

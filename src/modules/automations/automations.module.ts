@@ -26,13 +26,21 @@ export class AutomationsService {
   ) {}
 
   // BUG2 FIX: Automation executor
+  // v10.1 TUZATISHLAR:
+  //  - `(this.prisma as any)` olib tashlandi (type-safety qaytdi)
+  //  - client/task yozuvlarida tenantId sharti qo'shildi (tenant izolyatsiyasi —
+  //    boshqa tenant clientini o'zgartirib bo'lmaydi, hatto xato event kelsa ham)
+  //  - stage/priority qiymatlari safeEnum bilan tekshiriladi
   private async executeAutomation(tenantId: string, trigger: string, context: any) {
     try {
+      if (!TRIGGERS.includes(trigger as AutomationTrigger)) return;
+      const safeTrigger = trigger as AutomationTrigger;
+
       const automations = await this.prisma.automation.findMany({
-        where: { tenantId, trigger: trigger as any, isActive: true },
+        where: { tenantId, trigger: safeTrigger, isActive: true },
       });
       for (const automation of automations) {
-        const actions: any[] = Array.isArray(automation.actions) ? automation.actions : [];
+        const actions: any[] = Array.isArray(automation.actions) ? (automation.actions as any[]) : [];
         for (const action of actions) {
           try {
             if (action.type === 'SEND_NOTIFICATION') {
@@ -48,32 +56,60 @@ export class AutomationsService {
               }
             } else if (action.type === 'CHANGE_STAGE') {
               if (context.clientId && action.stage) {
-                await (this.prisma as any).client.update({
-                  where: { id: context.clientId },
+                // updateMany + tenantId: begona tenant clientiga yozib bo'lmaydi
+                await this.prisma.client.updateMany({
+                  where: { id: context.clientId, tenantId },
                   data: { pipelineStage: action.stage },
                 });
               }
             } else if (action.type === 'ASSIGN_AGENT') {
               if (context.clientId && action.agentId) {
-                await (this.prisma as any).client.update({
-                  where: { id: context.clientId },
-                  data: { assignedAgentId: action.agentId },
+                // Agent shu tenantga tegishli ekanini tekshiramiz
+                const agent = await this.prisma.user.findFirst({
+                  where: { id: action.agentId, tenantId },
+                  select: { id: true },
                 });
+                if (agent) {
+                  await this.prisma.client.updateMany({
+                    where: { id: context.clientId, tenantId },
+                    data: { assignedAgentId: action.agentId },
+                  });
+                }
               }
             } else if (action.type === 'CREATE_TASK') {
+              // YASHIRIN BUG TUZATILDI: Task.assigneeId/creatorId sxemada MAJBURIY,
+              // eski kod `null` yuborardi va `as any` xatoni yashirardi —
+              // natijada agent biriktirilmagan leadlarda avtomatik vazifa
+              // jimgina yaratilmay qolardi. Endi: agent yo'q bo'lsa tenant
+              // adminiga biriktiriladi.
               if (context.clientId) {
-                await (this.prisma as any).task.create({
-                  data: {
-                    tenantId,
-                    title: action.title || 'Avtomatik vazifa',
-                    clientId: context.clientId,
-                    assigneeId: context.assignedAgentId || null,
-                    creatorId: context.assignedAgentId || null,
-                    dueAt: action.dueDays ? new Date(Date.now() + action.dueDays * 86400000) : null,
-                    priority: action.priority || 'MEDIUM',
-                    status: 'TODO',
-                  },
+                const client = await this.prisma.client.findFirst({
+                  where: { id: context.clientId, tenantId },
+                  select: { id: true },
                 });
+                let assigneeId: string | null = context.assignedAgentId || null;
+                if (!assigneeId) {
+                  const admin = await this.prisma.user.findFirst({
+                    where: { tenantId, role: 'TENANT_ADMIN', status: 'ACTIVE' },
+                    select: { id: true },
+                  });
+                  assigneeId = admin?.id || null;
+                }
+                if (client && assigneeId) {
+                  const priority = safeEnum(action.priority, ['LOW', 'MEDIUM', 'HIGH', 'URGENT'] as const, 'MEDIUM');
+                  await this.prisma.task.create({
+                    data: {
+                      tenantId,
+                      title: action.title || 'Avtomatik vazifa',
+                      clientId: context.clientId,
+                      assigneeId,
+                      creatorId: assigneeId,
+                      dueAt: action.dueDays ? new Date(Date.now() + action.dueDays * 86400000) : null,
+                      priority: priority as any,
+                      status: 'TODO',
+                    },
+                  });
+                }
               }
             }
           } catch (ae: any) {

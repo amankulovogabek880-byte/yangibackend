@@ -12,7 +12,10 @@ const config: EnvConfig = {
   optional: {
     PORT: '3000',
     NODE_ENV: 'development',
-    CORS_ORIGINS: '*',
+    // XAVFSIZLIK: '*' default olib tashlandi. Production'da majburiy (main.ts tekshiradi).
+    CORS_ORIGINS: '(production-da MAJBURIY, masalan: https://crm.example.uz)',
+    COOKIE_DOMAIN: '(ixtiyoriy, masalan: .omoncrm.uz)',
+    COOKIE_SAMESITE: 'lax',
     JWT_ACCESS_EXPIRES: '15m',
     JWT_REFRESH_EXPIRES: '7d',
     THROTTLE_TTL: '60',
@@ -64,6 +67,15 @@ export function validateEnv(): void {
     if (val && val.length < 32) {
       warnings.push(`${jwtKey} kamida 32 belgi bo'lishi kerak`);
     }
+  }
+
+  // CORS: production'da '*' yoki bo'sh bo'lishi mumkin emas
+  const cors = (process.env.CORS_ORIGINS || '').trim();
+  if (isProd && (!cors || cors === '*')) {
+    throw new Error(
+      "CORS_ORIGINS production'da majburiy va '*' bo'lishi mumkin emas. " +
+      'Masalan: CORS_ORIGINS=https://crm.example.uz',
+    );
   }
 
   for (const w of warnings) logger.warn(`⚠️  ${w}`);
