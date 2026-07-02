@@ -161,9 +161,14 @@ export class AuthController {
   @Post('2fa/disable')
   @UseGuards(JwtAuthGuard)
   @HttpCode(200)
-  async disable2FA(@CurrentUser() u: any, @Body() body: { password: string }) {
-    if (!body.password) throw new BadRequestException("Parol kerak");
-    return this.auth.disable2FA(u.sub, body.password);
+  async disable2FA(
+    @CurrentUser() u: any,
+    @Body() body: { credential?: string; password?: string; code?: string },
+  ) {
+    // Yangi frontend `credential` yuboradi; eski `password`/`code` bilan ham ishlaydi.
+    const credential = body.credential ?? body.password ?? body.code;
+    if (!credential) throw new BadRequestException("Parol yoki kod kerak");
+    return this.auth.disable2FA(u.sub, credential);
   }
 
   // ─── SESSIONS ────────────────────────────────────────────

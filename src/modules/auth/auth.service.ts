@@ -462,13 +462,44 @@ export class AuthService {
     return { ok: true, backupCodes };
   }
 
-  async disable2FA(userId: string, password: string) {
+  /**
+   * 2FA'ni o'chirish. Tasdiqlash uchun foydalanuvchi QUYIDAGILARDAN BIRINI
+   * kiritishi kifoya:
+   *   • akkaunt paroli, YOKI
+   *   • authenticator ilovasidagi joriy 6 xonali kod, YOKI
+   *   • zaxira (backup) kodlardan biri.
+   * Shu tufayli parolni eslay olmagan foydalanuvchi ham har kuni kiritadigan
+   * kod bilan 2FA'ni o'chira oladi (bloklanib qolmaydi).
+   *
+   * MUHIM: noto'g'ri kredda 401 EMAS, 400 (BadRequest) qaytariladi — aks holda
+   * frontenddagi global 401-interceptor bu xatoni "sessiya tugadi" deb ushlab,
+   * foydalanuvchini login sahifasiga uloqtirib yuboradi (o'chirish o'rniga).
+   */
+  async disable2FA(userId: string, credential: string) {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new UnauthorizedException();
     if (!user.twoFactorEnabled) throw new BadRequestException('2FA yoqilmagan');
 
-    const ok = await verifyPassword(user.passwordHash, password);
-    if (!ok) throw new UnauthorizedException("Parol noto'g'ri");
+    const cred = (credential || '').trim();
+    if (!cred) throw new BadRequestException("Parol yoki kod kiritilmadi");
+
+    // 1) Parol sifatida tekshiramiz
+    let verified = await verifyPassword(user.passwordHash, cred);
+
+    // 2) Parol mos kelmasa — authenticator kodi yoki backup kod sifatida tekshiramiz
+    if (!verified && user.twoFactorSecret) {
+      const clean = cred.replace(/\s/g, '');
+      const secret = this.encryption.decrypt(user.twoFactorSecret);
+      if (secret && authenticator.verify({ token: clean, secret })) {
+        verified = true;
+      } else if ((user.twoFactorBackup || []).some((bc) => this.encryption.decrypt(bc) === clean)) {
+        verified = true;
+      }
+    }
+
+    if (!verified) {
+      throw new BadRequestException("Parol yoki kod noto'g'ri");
+    }
 
     await this.prisma.user.update({
       where: { id: userId },
