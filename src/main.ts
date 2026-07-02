@@ -107,7 +107,19 @@ async function bootstrap() {
   // XAVFSIZLIK TUZATISH: oldin har qanday "Bearer xxx" yoki 10+ belgili
   // ?token= qabul qilinardi (soxta token bilan hamma fayl ochiq edi).
   // Endi JWT haqiqiy tekshiriladi.
+  //
+  // MUAMMO FIX (profil rasmlar ko'rinmasligi): avatarUrl "?v=timestamp" bilan
+  // saqlanadi, "?token=" bilan EMAS — chunki bitta avatar barcha agentlar
+  // uchun umumiy, bitta agentning shaxsiy tokenini unga qotirib qo'yib
+  // bo'lmaydi. Natijada brauzer <img> tegi (Authorization header yubora
+  // olmaydi) har doim 401 olardi va rasmlar hech qachon chiqmasdi.
+  // Yechim: faqat "tg_avatar_" bilan boshlanuvchi fayllarni (profil rasmlari —
+  // sezgir hujjat emas) tokensiz ochiq qilamiz; boshqa barcha fayllar
+  // (pasport, viza va h.k.) avvalgidek JWT bilan himoyalangan qoladi.
   app.use('/uploads', (req: any, res: any, next: any) => {
+    const fileName = (req.path || '').replace(/^\/+/, '');
+    if (fileName.startsWith('tg_avatar_')) return next();
+
     const authHeader = req.headers.authorization as string | undefined;
     const tokenQuery = typeof req.query?.token === 'string' ? req.query.token : undefined;
     const token = authHeader?.startsWith('Bearer ')

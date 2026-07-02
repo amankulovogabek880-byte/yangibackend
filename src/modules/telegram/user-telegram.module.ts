@@ -358,8 +358,15 @@ export class UserTelegramService implements OnModuleInit {
               where: { id: conv.id },
               data: {
                 lastMessageAt: date, lastMessageText: text.slice(0, 200),
-                // v11 FIX: accountId yo'q bo'lsa tuzatamiz (pastdagi izohga qarang)
-                ...((conv as any).accountId ? {} : { accountId: acc.id }),
+                // MUAMMO FIX: avvalgi shart `conv.accountId ? {} : {...}` edi —
+                // ya'ni FAQAT accountId bo'sh bo'lsagina yozardi. Lekin bu
+                // suhbat allaqachon Bot accountiga bog'langan bo'lsa (masalan
+                // mijoz avval botga yozgan), shart har doim "bor" deb topib,
+                // hech qachon o'zgartirmasdi — shuning uchun "Bot" belgisi
+                // umrbod yopishib qolardi. Endi har doim shaxsiy accountga
+                // ko'chiramiz, chunki hozir shu odamga aynan shaxsiy
+                // accountdan yozilyapti.
+                accountId: acc.id,
               },
             });
 
@@ -410,7 +417,7 @@ export class UserTelegramService implements OnModuleInit {
             } catch {}
           }
 
-          if (!conv) {
+          {
             let clientId: string | null = null;
             if (username) {
               const cl = await this.prisma.client.findFirst({
@@ -419,30 +426,35 @@ export class UserTelegramService implements OnModuleInit {
               if (cl) clientId = cl.id;
             }
 
-            conv = await this.prisma.conversation.create({
-              data: {
+            // MUAMMO FIX (dublikat suhbatlar): avval alohida findFirst→create/
+            // update qilinardi. Agar yangi kontakt bir necha xabarni bir-biriga
+            // juda yaqin (millisekundlar ichida) yuborsa, ikkala event ham
+            // "suhbat yo'q" deb ko'rib, ikkalasi ham create'ga urinardi —
+            // ikkinchisi unique constraint'ga urilib xato berardi va o'sha
+            // xabar SIRLI YO'QOLIB QOLARDI. Endi atomik upsert ishlatamiz.
+            conv = await this.prisma.conversation.upsert({
+              where: {
+                tenantId_channel_externalChatId: { tenantId, channel: 'TELEGRAM', externalChatId: peerId },
+              },
+              create: {
                 tenantId, accountId: acc.id, clientId,
                 assignedAgentId: agentId, channel: 'TELEGRAM',
                 externalChatId: peerId, firstName, lastName, username, avatarUrl,
                 lastMessageAt: date, lastMessageText: text.slice(0, 200),
                 chatType,
               } as any,
-            });
-          } else {
-            conv = await this.prisma.conversation.update({
-              where: { id: conv.id },
-              data: {
+              update: {
                 lastMessageAt: date, lastMessageText: text.slice(0, 200),
-                firstName: conv.firstName || firstName,
-                lastName: conv.lastName || lastName,
-                username: conv.username || username,
-                chatType: (conv as any).chatType || chatType,
+                firstName: conv?.firstName || firstName,
+                lastName: conv?.lastName || lastName,
+                username: conv?.username || username,
+                chatType: (conv as any)?.chatType || chatType,
                 ...(avatarUrl ? { avatarUrl } : {}),
-                // v11 FIX: eski (endi o'chirilgan) TelegramPersonalModule
-                // ba'zi suhbatlarni accountId'siz yaratib qoldirgan edi —
-                // shu tufayli ular doim "Bot" deb ko'rinardi. Endi har bir
-                // xabar kelganda accountId yo'q bo'lsa, avtomatik tuzatamiz.
-                ...((conv as any).accountId ? {} : { accountId: acc.id }),
+                // MUAMMO FIX: avvalgi shart `conv.accountId ? {} : {...}` edi —
+                // ya'ni FAQAT accountId bo'sh bo'lsagina yozardi, shuning uchun
+                // Bot-akkauntga bog'langan eski suhbatlar umrbod "Bot" deb
+                // qolib ketardi. Endi har doim shaxsiy accountga ko'chiramiz.
+                accountId: acc.id,
               } as any,
             });
           }
@@ -468,7 +480,16 @@ export class UserTelegramService implements OnModuleInit {
         } catch (e: any) {
           this.logger.warn('Personal incoming handler error: ' + e.message);
         }
-      }, new NewMessage({ incoming: true }));
+        // MUAMMO FIX: avval `{ incoming: true }` berilgan edi. GramJS buni
+        // ichkarida `outgoing = false` deb talqin qiladi (events/NewMessage.js
+        // manbasida ko'rish mumkin), shu sabab agent shu Telegram accountidan
+        // TO'G'RIDAN-TO'G'RI (CRM'siz) yozgan xabarlari BU HANDLER'GA UMUMAN
+        // YETIB KELMASDI — yuqoridagi "isOut" bo'limi yozilgan bo'lsa ham hech
+        // qachon ishlamasdi. Natijada bunday xabarlar CRM'da ko'rinmasdi yoki
+        // (agar boshqa yo'l bilan sinxronlansa) xuddi mijoz yozganday bir xil
+        // (kulrang) rangda chiqardi. Filtrni olib tashlab, ikkala yo'nalishni
+        // ham ushlaymiz — pastdagi isOut tekshiruvi endi ishga tushadi.
+      }, new NewMessage({}));
     } catch (e: any) {
       this.logger.warn('startListening error: ' + e.message);
     }
@@ -599,8 +620,12 @@ export class UserTelegramService implements OnModuleInit {
               clientId: conv.clientId || data.clientId || null,
               assignedAgentId: conv.assignedAgentId || agentId,
               ...(avatarUrl ? { avatarUrl } : {}),
-              // v11 FIX: accountId yo'q bo'lsa tuzatamiz
-              ...(conv.accountId ? {} : { accountId: account.id }),
+              // MUAMMO FIX: avvalgi shart `conv.accountId ? {} : {...}` faqat
+              // accountId bo'sh bo'lsagina yozardi — Bot-akkauntga bog'langan
+              // eski suhbat bo'lsa hech qachon o'zgarmasdi. Endi har doim
+              // shaxsiy accountga ko'chiramiz, chunki hozir CRM orqali shu
+              // odamga aynan shaxsiy accountdan yozilyapti.
+              accountId: account.id,
             },
           });
         }
@@ -611,8 +636,8 @@ export class UserTelegramService implements OnModuleInit {
             lastMessageAt: new Date(),
             lastMessageText: data.text.slice(0, 200),
             clientId: conv.clientId || data.clientId || null,
-            // v11 FIX: accountId yo'q bo'lsa tuzatamiz
-            ...(conv.accountId ? {} : { accountId: account.id }),
+            // MUAMMO FIX: xuddi yuqoridagidek — endi har doim yangilanadi.
+            accountId: account.id,
           },
         });
       }
@@ -715,7 +740,8 @@ export class UserTelegramService implements OnModuleInit {
       data: {
         lastMessageAt: new Date(),
         lastMessageText: caption?.slice(0, 200) || '📎 Fayl',
-        ...(conv.accountId ? {} : { accountId: account.id }),
+        // MUAMMO FIX: xuddi yuqoridagi joylardagidek — endi har doim yangilanadi.
+        accountId: account.id,
       },
     });
 
