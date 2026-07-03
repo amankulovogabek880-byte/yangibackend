@@ -8,6 +8,8 @@ import { CurrentUser } from '../../common/decorators';
 import { convertToUSD } from '../../common/utils/helpers';
 import { BookingsModule, BookingsService } from '../bookings/bookings.module';
 import { PaymentsModule, PaymentsService } from '../payments/payments.module';
+import { TelegramModule, TelegramService } from '../telegram/telegram.module';
+import { UserTelegramModule, UserTelegramService } from '../telegram/user-telegram.module';
 
 // Offers stored in Client.preferences.offers JSON array
 // No schema migration needed!
@@ -20,6 +22,8 @@ export class OffersService {
     private prisma: PrismaService,
     private bookings: BookingsService,
     private payments: PaymentsService,
+    private telegram: TelegramService,
+    private userTelegram: UserTelegramService,
   ) {}
 
   async list(tenantId: string, clientId: string) {
@@ -106,6 +110,78 @@ export class OffersService {
       includesInsurance: data.includesInsurance || false,
       notes: data.notes || null,
     };
+  }
+
+  /**
+   * v11: Taklifni Telegram uchun chiroyli, tushunarli formatda matnga aylantiradi.
+   * Bitta joyda — shablon o'zgarsa, faqat shu yerni tahrirlash kifoya.
+   */
+  private buildOfferMessage(offer: any): string {
+    const MEAL_LABELS: Record<string, string> = {
+      NONE: "Ovqatlanishsiz",
+      BREAKFAST: "Nonushta bilan",
+      FULL_BOARD: "To'liq ovqatlanish (3 mahal)",
+    };
+    const fmtDate = (d: any) => {
+      if (!d) return null;
+      try {
+        return new Date(d).toLocaleDateString('uz-UZ', { day: '2-digit', month: '2-digit', year: 'numeric' });
+      } catch { return null; }
+    };
+    const money = (n: any) => '$' + Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+
+    const lines: string[] = [];
+    lines.push(`🌍 ${offer.tourName || 'Tur taklifi'}`);
+    if (offer.destination) lines.push(`📍 Yo'nalish: ${offer.destination}`);
+
+    const dep = fmtDate(offer.departDate);
+    const ret = fmtDate(offer.returnDate);
+    if (dep || ret) lines.push(`📅 Sana: ${dep || '—'}${ret ? ` — ${ret}` : ''}`);
+    if (offer.departFlightTime) lines.push(`✈️ Uchish: ${offer.departFlightTime}`);
+
+    lines.push(`👥 Kishilar soni: ${offer.pax || 1} kishi`);
+    lines.push('');
+
+    const hotels = Array.isArray(offer.hotels) ? offer.hotels : [];
+    if (hotels.length) {
+      lines.push('🏨 Mehmonxona variantlari:');
+      for (const h of hotels) {
+        const stars = h.stars ? '⭐'.repeat(Math.min(7, Number(h.stars))) : '';
+        lines.push(`   • ${h.name}${stars ? ` ${stars}` : ''}`);
+      }
+    } else if (offer.hotelName) {
+      const stars = offer.hotelStars ? '⭐'.repeat(Math.min(7, Number(offer.hotelStars))) : '';
+      lines.push(`🏨 Mehmonxona: ${offer.hotelName}${stars ? ` ${stars}` : ''}`);
+    }
+    if (offer.mealPlan && MEAL_LABELS[offer.mealPlan]) {
+      lines.push(`🍽 Ovqatlanish: ${MEAL_LABELS[offer.mealPlan]}`);
+    }
+    lines.push('');
+
+    const includes: string[] = [];
+    if (offer.includesFlight) includes.push('✈️ Aviachipta');
+    if (offer.includesHotel) includes.push('🏨 Mehmonxona');
+    if (offer.includesTransfer) includes.push('🚐 Transfer');
+    if (offer.includesVisa) includes.push('🛂 Viza yordami');
+    if (offer.includesInsurance) includes.push('🛡 Sug\'urta');
+    if (includes.length) {
+      lines.push('✅ Narxga kiradi:');
+      for (const i of includes) lines.push(`   • ${i}`);
+      lines.push('');
+    }
+
+    lines.push(`💰 1 kishi uchun: ${money(offer.pricePerPerson)}`);
+    lines.push(`💵 Jami narx (${offer.pax || 1} kishi): ${money(offer.clientPrice)}`);
+
+    if (offer.notes) {
+      lines.push('');
+      lines.push(`📝 ${offer.notes}`);
+    }
+
+    lines.push('');
+    lines.push("Savolingiz bo'lsa, bemalol yozing! 😊");
+
+    return lines.join('\n');
   }
 
   async create(tenantId: string, agentId: string, data: any) {
@@ -211,12 +287,54 @@ export class OffersService {
     return updated;
   }
 
-  async send(tenantId: string, clientId: string, offerId: string) {
+  /**
+   * v11: Taklifni endi shunchaki "SENT" deb belgilab qo'ymaymiz — chiroyli
+   * shablon asosida HAQIQATDA Telegram orqali yuboramiz:
+   *   • Klient bilan mavjud Telegram suhbat bo'lsa — o'sha suhbat qaysi
+   *     kanaldan (bot yoki shaxsiy akkaunt) borayotgan bo'lsa, o'shandan davom etadi.
+   *   • Klient bilan hali suhbat bo'lmasa (birinchi xabar) — albatta agentning
+   *     SHAXSIY Telegram akkaunti orqali yuboriladi (sovuq xabar botdan emas,
+   *     jonli odamdan kelgandek bo'lishi uchun).
+   */
+  async send(tenantId: string, clientId: string, offerId: string, agentId: string, role: string) {
     const client = await this.prisma.client.findFirst({ where: { id: clientId, tenantId } });
     if (!client) throw new NotFoundException();
     const prefs: any = (client as any).preferences || {};
-    prefs.offers = (prefs.offers || []).map((o: any) =>
-      o.id === offerId ? { ...o, status: 'SENT', sentAt: new Date().toISOString() } : o
+    const list = prefs.offers || [];
+    const offer = list.find((o: any) => o.id === offerId);
+    if (!offer) throw new NotFoundException('Taklif topilmadi');
+
+    const text = this.buildOfferMessage(offer);
+
+    // Klient bilan eng so'nggi Telegram suhbatini qidiramiz
+    const existingConv = await this.prisma.conversation.findFirst({
+      where: { tenantId, clientId, channel: 'TELEGRAM' },
+      include: { account: true },
+      orderBy: { lastMessageAt: 'desc' },
+    });
+
+    let deliveryInfo: { via: 'bot' | 'personal'; conversationId: string };
+
+    if (existingConv && !(existingConv as any).account?.isPersonal && existingConv.accountId) {
+      // Mavjud suhbat — umumiy (bot) akkaunt orqali borayapti, shu yerdan davom etamiz
+      await this.telegram.sendMessage(tenantId, existingConv.id, text, agentId, role, false);
+      deliveryInfo = { via: 'bot', conversationId: existingConv.id };
+    } else {
+      // Mavjud suhbat shaxsiy akkauntdan borayapti YOKI umuman suhbat yo'q (birinchi xabar)
+      // — ikkala holatda ham agentning shaxsiy Telegram akkaunti orqali yuboramiz.
+      const result = await this.userTelegram.sendPersonalMessage(tenantId, agentId, {
+        conversationId: existingConv?.id,
+        username: !existingConv ? (client.telegramUsername || undefined) : undefined,
+        phone: !existingConv ? (client.phone || undefined) : undefined,
+        userId: !existingConv ? (client.telegramId || undefined) : undefined,
+        text,
+        clientId,
+      });
+      deliveryInfo = { via: 'personal', conversationId: result.conversationId };
+    }
+
+    prefs.offers = list.map((o: any) =>
+      o.id === offerId ? { ...o, status: 'SENT', sentAt: new Date().toISOString(), sentVia: deliveryInfo.via } : o
     );
     // Move pipeline stage to NEGOTIATION after offer sent
     const updateData: any = { preferences: prefs };
@@ -232,13 +350,14 @@ export class OffersService {
     await this.prisma.clientTimeline.create({
       data: {
         clientId,
+        userId: agentId,
         type: 'offer_sent',
-        title: 'Taklif yuborildi',
-        metadata: { offerId },
+        title: `Taklif yuborildi (${deliveryInfo.via === 'personal' ? 'shaxsiy Telegram' : 'Telegram bot'})`,
+        metadata: { offerId, conversationId: deliveryInfo.conversationId },
       } as any,
     }).catch(() => {});
 
-    return { success: true };
+    return { success: true, ...deliveryInfo };
   }
 
   /**
@@ -355,7 +474,7 @@ export class OffersController {
 
   @Post(':id/send')
   send(@CurrentUser() u: any, @Body() body: any, @Param('id') offerId: string) {
-    return this.svc.send(u.tenantId, body.clientId, offerId);
+    return this.svc.send(u.tenantId, body.clientId, offerId, u.id || u.sub, u.role);
   }
 
   @Post(':id/mark-sold')
@@ -365,7 +484,7 @@ export class OffersController {
 }
 
 @Module({
-  imports: [BookingsModule, PaymentsModule],
+  imports: [BookingsModule, PaymentsModule, TelegramModule, UserTelegramModule],
   controllers: [OffersController],
   providers: [OffersService],
   exports: [OffersService],

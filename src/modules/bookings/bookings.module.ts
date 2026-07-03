@@ -372,15 +372,10 @@ export class BookingsService {
       safe.profit = Math.max(0, total - cost - discount);
     }
 
-    // ── AGENT supplier fieldlarini o'zgartira olmaydi ──
-    if (role === 'AGENT') {
-      delete safe.supplierName;
-      delete safe.supplierContact;
-      delete safe.supplierCost;
-      delete safe.supplierRef;
-      delete safe.supplierPaid;
-      delete safe.supplierNotes;
-    }
+    // v11: Agent endi admin bilan bir xil huquqqa ega — supplier/tannarx
+    // maydonlarini o'zi kiritadi, chunki uning komissiyasi aynan shu
+    // yerdan hisoblangan profit'ga (tenant.agentCommissionPercent %) bog'liq.
+    // Eski cheklov (agent supplierCost'ni o'zgartira olmasligi) olib tashlandi.
 
     const updated = await this.prisma.booking.update({ where: { id }, data: clean(safe) });
 
