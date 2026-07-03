@@ -459,11 +459,24 @@ export class UserTelegramService implements OnModuleInit {
             });
           }
 
+          // v12 DUBLIKAT FIX: bir xil Telegram accounti bir necha marta ulangan
+          // bo'lsa (yoki listener ikki marta ishga tushsa), AYNAN bir xabar ikki
+          // marta kelib, ikki marta saqlanardi. Endi (conversationId + Telegram
+          // msg.id) bo'yicha allaqachon saqlangan bo'lsa — o'tkazib yuboramiz.
+          const tgMsgId = String(msg.id || '');
+          if (tgMsgId) {
+            const already = await this.prisma.message.findFirst({
+              where: { conversationId: conv.id, externalMsgId: tgMsgId, direction: 'INBOUND' },
+              select: { id: true },
+            });
+            if (already) return;
+          }
+
           const savedMsg = await this.prisma.message.create({
             data: {
               conversationId: conv.id,
               direction: 'INBOUND', messageType: 'TEXT', text,
-              externalMsgId: String(msg.id || Date.now()),
+              externalMsgId: tgMsgId || String(Date.now()),
               isDelivered: true, createdAt: date,
             },
           });
