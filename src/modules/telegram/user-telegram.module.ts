@@ -90,20 +90,20 @@ export class UserTelegramService implements OnModuleInit {
   // ─── Telegramdan profil rasmini yuklab olish va saqlash ───────────────────
   private async saveAvatar(client: TelegramClient, entity: any, key: string): Promise<string | undefined> {
     try {
-      const fs = require('fs');
-      const path = require('path');
-      const uploadDir = process.env.UPLOAD_DIR || './uploads';
-      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
       const buf = await client.downloadProfilePhoto(entity, {} as any) as Buffer;
       if (!buf || !buf.length) return undefined;
 
-      const fileName = `tg_avatar_${key}.jpg`;
-      fs.writeFileSync(path.join(uploadDir, fileName), buf);
-      const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
-      return `${baseUrl}/uploads/${fileName}?v=${Date.now()}`;
+      // v12 FIX: avval rasm faylga yozilib, `${API_BASE_URL}/uploads/...jpg`
+      // URL qaytarilardi. Ikki muammo bor edi:
+      //   1) URL SAQLASH paytida hosil bo'lardi — API_BASE_URL o'sha paytda
+      //      qo'yilmagan bo'lsa, bazaga "http://localhost:3000/..." yozilib
+      //      qolar, keyin env to'g'rilansa ham eski URL o'zgarmasdi.
+      //   2) Render'ning vaqtincha diskidagi fayl restartda yo'qolardi.
+      // Endi rasmni to'g'ridan-to'g'ri base64 (data URL) qilib qaytaramiz —
+      // hech qanday fayl/URL/env/disk kerak emas, bazada saqlanadi va hamma
+      // joyda ishlaydi.
+      return `data:image/jpeg;base64,${buf.toString('base64')}`;
     } catch (e: any) {
-      // MUAMMO 6 FIX: xato sababini log qilamiz (avval sirli yutilar edi)
       this.logger.warn(`saveAvatar xato (key=${key}): ${e?.message || e}`);
       return undefined;
     }
@@ -410,7 +410,9 @@ export class UserTelegramService implements OnModuleInit {
 
           // Telegramdan profil rasmini yuklab olamiz
           let avatarUrl: string | undefined;
-          if (!conv || !conv.avatarUrl) {
+          // v12: rasm yo'q BO'LSA yoki eski (localhost/http) URL bo'lsa qayta
+          // yuklaymiz — shunda eski buzuq URL'lar avtomat base64'ga almashadi.
+          if (!conv || !conv.avatarUrl || !String(conv.avatarUrl).startsWith('data:')) {
             try {
               const sender = await msg.getSender();
               avatarUrl = await this.saveAvatar(client, sender, peerId);
@@ -603,7 +605,7 @@ export class UserTelegramService implements OnModuleInit {
         });
 
         let avatarUrl: string | undefined;
-        if (!conv || !conv.avatarUrl) {
+        if (!conv || !conv.avatarUrl || !String(conv.avatarUrl).startsWith('data:')) {
           avatarUrl = await this.saveAvatar(client, chat || peer, externalChatId);
         }
 
