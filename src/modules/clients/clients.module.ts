@@ -47,6 +47,19 @@ export class ClientsController {
     return this.svc.getStats(u.tenantId, u.sub, u.role);
   }
 
+  // v12: Yo'qotilgan leadlar — umumiy hovuz (hamma agent ko'radi).
+  // MUHIM: bu ':id' route'idan OLDIN turishi kerak, aks holda 'lost' so'zi
+  // id sifatida qabul qilinib ketadi.
+  @Get('lost')
+  lostLeads(
+    @CurrentUser() u: any,
+    @Query('search') search?: string,
+    @Query('page') page?: any,
+    @Query('limit') limit?: any,
+  ) {
+    return this.svc.lostLeads(u.tenantId, { search, page, limit });
+  }
+
   @Get(':id')
   one(@Param('id') id: string, @CurrentUser() u: any) {
     return this.svc.findOne(u.tenantId, id, u.sub, u.role);

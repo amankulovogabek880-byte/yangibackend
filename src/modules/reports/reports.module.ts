@@ -417,9 +417,25 @@ export class ReportsService {
       // Net foyda = profit - agent maoshlari
       const netProfit = this.round2(Math.max(0, profitMonth - totalAgentSalaries));
 
+      // v12 FIX: "Bugun" (newToday) qiymatlari ilgari QATTIQ 0 edi — shuning
+      // uchun bugun lead tushса ham dashboard "Bugun: +0" ko'rsatardi. Endi
+      // haqiqiy hisoblanadi (bu oygi hisoblar bilan bir xil filtrlar bilan).
+      const [newClientsToday, newLeadsToday] = await Promise.all([
+        this.prisma.client.count({
+          where: { tenantId, ...clientAgentFilter, createdAt: { gte: todayStart } },
+        }).catch(() => 0),
+        this.prisma.client.count({
+          where: {
+            tenantId, ...clientAgentFilter,
+            pipelineStage: { in: ['NEW_LEAD', 'CONTACTED', 'INTERESTED'] as any[] },
+            createdAt: { gte: todayStart },
+          },
+        }).catch(() => 0),
+      ]);
+
       return {
-        clients:  { total: totalClients, newThisMonth: newClientsMonth, newToday: 0 },
-        leads:    { total: totalLeads, newThisMonth: this.safeNumber(newLeadsMonth), newToday: 0 }, // BUG5 FIX
+        clients:  { total: totalClients, newThisMonth: newClientsMonth, newToday: this.safeNumber(newClientsToday) },
+        leads:    { total: totalLeads, newThisMonth: this.safeNumber(newLeadsMonth), newToday: this.safeNumber(newLeadsToday) }, // BUG5 FIX
         bookings: { total: totalBookings, thisMonth: booksMonth, today: 0, pending: pendingBookings },
         revenue: {
           thisMonth: revMonth,

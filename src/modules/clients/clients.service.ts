@@ -144,8 +144,43 @@ export class ClientsService {
     return { data, meta: meta(total, page, limit) };
   }
 
+  // ── v12: YO'QOTILGAN LEADLAR (umumiy hovuz) ──────────────────────────
+  // Barcha agentlar KO'RADI (agentId bo'yicha BO'LINMAYDI) — istalgan agent
+  // yo'qotilgan lead bilan qayta bog'lanishi mumkin.
+  async lostLeads(
+    tenantId: string,
+    params: { search?: string; page?: any; limit?: any } = {},
+  ) {
+    const { skip, take, page, limit } = paginate(params.page, params.limit);
+    const where: any = { tenantId, pipelineStage: 'LOST' as PipelineStage };
+    if (params.search?.trim()) {
+      where.OR = [
+        { fullName: { contains: params.search, mode: 'insensitive' } },
+        { phone: { contains: params.search } },
+      ];
+    }
+    const [data, total] = await Promise.all([
+      this.prisma.client.findMany({
+        where,
+        skip,
+        take,
+        orderBy: { pipelineStageAt: 'desc' },
+        include: {
+          assignedAgent: { select: { id: true, name: true } },
+          _count: { select: { bookings: true } },
+        },
+      }),
+      this.prisma.client.count({ where }),
+    ]);
+    return { data, total, page, limit };
+  }
+
   async findOne(tenantId: string, id: string, userId: string, role: string) {
-    const where = this.where(tenantId, userId, role, { id });
+    // v12: Agent o'z klientini ko'radi; QO'SHIMCHA — YO'QOTILGAN (LOST) leadni
+    // ham ko'radi (umumiy hovuz — hamma agent qayta bog'lanishi mumkin).
+    const where: any = role === 'AGENT'
+      ? { tenantId, id, OR: [{ assignedAgentId: userId }, { pipelineStage: 'LOST' as PipelineStage }] }
+      : { tenantId, id };
     const client = await this.prisma.client.findFirst({
       where,
       include: {
