@@ -333,6 +333,33 @@ export class OffersService {
       deliveryInfo = { via: 'personal', conversationId: result.conversationId };
     }
 
+    // v11: Taklif matni bilan birga mehmonxona rasmlari ham ketsin —
+    // avval faqat matn yuborilardi, rasmlar hech qachon klientga
+    // yetib bormasdi. Endi har bir mehmonxonaning rasmlari, nomi
+    // (va yulduzlari) caption sifatida, alohida xabar bo'lib ketadi.
+    const hotelsForPhotos = Array.isArray(offer.hotels) ? offer.hotels : [];
+    for (const h of hotelsForPhotos) {
+      const photos: string[] = Array.isArray(h?.photos) ? h.photos.slice(0, 6) : [];
+      if (!photos.length) continue;
+      const stars = h.stars ? ' ' + '⭐'.repeat(Math.min(7, Number(h.stars))) : '';
+      for (const photoUrl of photos) {
+        try {
+          if (deliveryInfo.via === 'bot') {
+            await this.telegram.sendMedia(tenantId, deliveryInfo.conversationId, agentId, role, {
+              fileUrl: photoUrl,
+              mediaType: 'photo',
+              caption: `🏨 ${h.name}${stars}`,
+            });
+          } else {
+            await this.userTelegram.sendMedia(tenantId, agentId, deliveryInfo.conversationId, photoUrl, `🏨 ${h.name}${stars}`);
+          }
+        } catch {
+          // Bitta rasm yuborilmasa ham qolganlari va matn allaqachon ketgan —
+          // butun taklifni bekor qilmaymiz.
+        }
+      }
+    }
+
     prefs.offers = list.map((o: any) =>
       o.id === offerId ? { ...o, status: 'SENT', sentAt: new Date().toISOString(), sentVia: deliveryInfo.via } : o
     );
