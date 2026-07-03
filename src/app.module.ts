@@ -53,6 +53,10 @@ import { CommandPaletteModule } from './modules/v9/command-palette.module';
 import { ServicesModule } from './modules/v9/services.module';
 import { PublicLeadsModule } from './modules/v9/public-leads.module';
 import { LeadFormsModule } from './modules/v9/lead-forms.module';
+// FIX: ApprovalsModule oldin hech qayerga ulanmagan edi — natijada
+// /api/v1/approvals route'lari ro'yxatga olinmasdi va frontend '/approvals'
+// sahifasi 404 qaytarardi. Endi ulandi.
+import { ApprovalsModule } from './modules/v9/approvals.module';
 import { PhoneProvidersModule } from './modules/phone-providers/phone-providers.module';
 import { WhatsAppModule } from './modules/whatsapp/whatsapp.module';
 import { HealthModule } from './modules/health/health.module';
@@ -112,6 +116,7 @@ import { ExchangeRateModule } from './modules/exchange-rate/exchange-rate.module
     ServicesModule,
     PublicLeadsModule,
     LeadFormsModule,
+    ApprovalsModule, // FIX: oldin ulanmagan edi — /approvals endi ishlaydi
     PhoneProvidersModule,
     HealthModule,
     WhatsAppModule, // BUG1 FIX

@@ -1,0 +1,48 @@
+# ─── Dependencies ───────────────────────────────
+node_modules/
+.pnp
+.pnp.js
+
+# ─── Build output ───────────────────────────────
+dist/
+build/
+*.tsbuildinfo
+
+# ─── Environment / secrets (MUHIM!) ─────────────
+.env
+.env.*
+!.env.example
+
+# ─── Logs ───────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ─── Foydalanuvchi yuklagan fayllar (pasport/viza — git'da bo'lmasin!) ───
+uploads/
+!uploads/.gitkeep
+
+# ─── Backups ────────────────────────────────────
+backups/
+*.sql
+*.dump
+
+# ─── Test / coverage ────────────────────────────
+coverage/
+.nyc_output/
+
+# ─── Prisma (generatsiya qilingan mijoz node_modules ichida) ───
+# schema.prisma va migratsiyalar SAQLANADI (ular git'da bo'lishi kerak)
+
+# ─── OS ─────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── IDE ────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
