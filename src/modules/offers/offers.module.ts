@@ -1,6 +1,6 @@
 import {
   Module, Injectable, Controller,
-  Get, Post, Put, Param, Body, UseGuards, NotFoundException, BadRequestException,
+  Get, Post, Put, Param, Body, UseGuards, NotFoundException, BadRequestException, Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -18,6 +18,8 @@ const OFFER_CURRENCIES = ['USD', 'EUR', 'UZS', 'RUB'];
 
 @Injectable()
 export class OffersService {
+  private readonly logger = new Logger('Offers');
+
   constructor(
     private prisma: PrismaService,
     private bookings: BookingsService,
@@ -338,6 +340,8 @@ export class OffersService {
     // yetib bormasdi. Endi har bir mehmonxonaning rasmlari, nomi
     // (va yulduzlari) caption sifatida, alohida xabar bo'lib ketadi.
     const hotelsForPhotos = Array.isArray(offer.hotels) ? offer.hotels : [];
+    let photosSent = 0;
+    let photosFailed = 0;
     for (const h of hotelsForPhotos) {
       const photos: string[] = Array.isArray(h?.photos) ? h.photos.slice(0, 6) : [];
       if (!photos.length) continue;
@@ -353,11 +357,20 @@ export class OffersService {
           } else {
             await this.userTelegram.sendMedia(tenantId, agentId, deliveryInfo.conversationId, photoUrl, `🏨 ${h.name}${stars}`);
           }
-        } catch {
+          photosSent++;
+        } catch (e: any) {
+          photosFailed++;
           // Bitta rasm yuborilmasa ham qolganlari va matn allaqachon ketgan —
-          // butun taklifni bekor qilmaymiz.
+          // butun taklifni bekor qilmaymiz, lekin sababini logga yozamiz —
+          // aks holda nima uchun rasm ketmaganini hech qachon bilib bo'lmaydi.
+          this.logger.warn(
+            `Taklif rasmi yuborilmadi (offerId=${offerId}, hotel=${h.name}, via=${deliveryInfo.via}, url=${photoUrl}): ${e?.message || e}`,
+          );
         }
       }
+    }
+    if (photosFailed > 0) {
+      this.logger.warn(`Taklif ${offerId}: ${photosSent} ta rasm yuborildi, ${photosFailed} ta yuborilmadi`);
     }
 
     prefs.offers = list.map((o: any) =>
@@ -384,7 +397,7 @@ export class OffersService {
       } as any,
     }).catch(() => {});
 
-    return { success: true, ...deliveryInfo };
+    return { success: true, ...deliveryInfo, photosSent, photosFailed };
   }
 
   /**
