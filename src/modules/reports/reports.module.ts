@@ -811,7 +811,39 @@ export class ReportsService {
     const costMonth    = revenueMonth - profitMonth;
     // BUG9 FIX: alohida await o'rniga Promise.all natijasidan
     const kpiTenant = kpiTenantFromPA as any;
-    const kpi = kpiTenant?.agentCommissionPercent ?? 10;
+    const basePercent = kpiTenant?.agentCommissionPercent ?? 10;
+    // v12 FIX: komissiya foizi admin belgilagan KPI tier'laridan (daromad
+    // oralig'i bo'yicha) olinadi — flat foiz emas. Shu tufayli dashboarddagi
+    // "Mening oyligim", uning foiz yorlig'i va "Kompaniyaga" (netProfit)
+    // /reports/my-salary bilan bir xil bo'ladi (ilgari bu yer flat 8%,
+    // my-salary esa tier 12% ishlatib, raqamlar mos kelmasdi).
+    let kpiTiers: any[] = [];
+    try {
+      kpiTiers = Array.isArray(kpiTenant?.kpiTiers)
+        ? kpiTenant.kpiTiers
+        : JSON.parse((kpiTenant?.kpiTiers as string) || '[]');
+      if (!Array.isArray(kpiTiers)) kpiTiers = [];
+    } catch { kpiTiers = []; }
+    let kpi = basePercent;
+    let appliedTier: string | null = null;
+    if (kpiTiers.length > 0) {
+      const sortedTiers = [...kpiTiers].sort((a: any, b: any) => (a.minRevenue || 0) - (b.minRevenue || 0));
+      for (const tier of sortedTiers) {
+        if (
+          revenueMonth >= (tier.minRevenue || 0) &&
+          (tier.maxRevenue == null || revenueMonth < tier.maxRevenue)
+        ) {
+          kpi = tier.commissionPercent || basePercent;
+          appliedTier = tier.name || null;
+          break;
+        }
+      }
+      // Hech bir oraliqqa tushmasa — eng yuqori tier
+      if (!appliedTier) {
+        kpi = sortedTiers[sortedTiers.length - 1].commissionPercent || basePercent;
+        appliedTier = sortedTiers[sortedTiers.length - 1].name || null;
+      }
+    }
     const salaryMonth = Math.round(profitMonth * kpi / 100);
 
     return {
@@ -830,7 +862,7 @@ export class ReportsService {
         avgPerBooking: avgBookingValue,
       },
       // Maosh
-      salary: { kpiPercent: kpi, mySalaryThisMonth: salaryMonth, formula: `Foyda × ${kpi}% / 100` },
+      salary: { kpiPercent: kpi, mySalaryThisMonth: salaryMonth, appliedTier, formula: `Foyda × ${kpi}% / 100` },
       // Revenue (dashboard uchun bir xil interfeys)
       revenue: { thisMonth: revenueMonth, prevMonth: 0, today: 0, growth: 0 },
       cost:    { thisMonth: costMonth },
