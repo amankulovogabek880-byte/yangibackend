@@ -1,7 +1,7 @@
 import { RoundRobinService, RoundRobinModule } from '../v9/round-robin.module';
 import {
   Module, Injectable, Controller,
-  Get, Post, Body, Query, Param,
+  Get, Post, Body, Query, Param, Req,
   UseGuards, Logger, BadRequestException,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
@@ -103,22 +103,29 @@ export class InstagramService {
     throw new BadRequestException('Webhook verification failed');
   }
 
-  async processWebhook(tenantId: string, body: any, signature?: string) {
+  async processWebhook(tenantId: string, body: any, signature?: string, rawBody?: Buffer) {
     if (body?.object !== 'instagram' && body?.object !== 'page') return { ok: true };
-    // Meta signature verification (X-Hub-Signature-256)
-    if (signature && process.env.NODE_ENV === 'production') {
-      const config = await this.getConfig(tenantId);
-      if (config.accessToken) {
-        try {
-          const crypto = await import('crypto');
-          const expected = 'sha256=' + crypto.createHmac('sha256', config.accessToken)
-            .update(JSON.stringify(body)).digest('hex');
-          if (signature !== expected) {
-            this.logger.warn('Instagram webhook: invalid signature');
-            return { ok: false };
-          }
-        } catch {}
+    // Meta signature verification (X-Hub-Signature-256 header).
+    // Meta imzoni App Secret bilan hisoblaydi (Page Access Token emas!),
+    // shuning uchun alohida INSTAGRAM_APP_SECRET env kerak.
+    const appSecret = process.env.INSTAGRAM_APP_SECRET;
+    if (signature && appSecret && rawBody) {
+      try {
+        const crypto = await import('crypto');
+        const expected = 'sha256=' + crypto.createHmac('sha256', appSecret)
+          .update(rawBody).digest('hex');
+        const sigBuf = Buffer.from(signature);
+        const expBuf = Buffer.from(expected);
+        const valid = sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf);
+        if (!valid) {
+          this.logger.warn('Instagram webhook: invalid signature');
+          return { ok: false };
+        }
+      } catch (e: any) {
+        this.logger.warn('Instagram webhook signature check error: ' + e.message);
       }
+    } else if (process.env.NODE_ENV === 'production' && !appSecret) {
+      this.logger.warn('Instagram webhook: INSTAGRAM_APP_SECRET env sozlanmagan — imzo tekshirilmayapti!');
     }
     this.logger.log('Instagram webhook received: ' + JSON.stringify(body).slice(0, 300));
     const entries: any[] = body?.entry || [];
@@ -337,10 +344,11 @@ export class InstagramController {
   webhook(
     @Param('tenantId') tenantId: string,
     @Body() body: any,
-    @Query('signature') sig?: string,
+    @Req() req: any,
   ) {
-    // Get signature from header via body raw (passed as query in some setups)
-    return this.svc.processWebhook(tenantId, body, sig);
+    const sig = req.headers['x-hub-signature-256'] as string | undefined;
+    const rawBody: Buffer | undefined = req.rawBody;
+    return this.svc.processWebhook(tenantId, body, sig, rawBody);
   }
 
   @ApiOperation({ summary: 'Instagram bot sozlamalarini olish' })

@@ -21,6 +21,9 @@ async function bootstrap() {
     logger: process.env.NODE_ENV === 'production'
       ? ['error', 'warn', 'log']
       : ['error', 'warn', 'log', 'debug', 'verbose'],
+    // rawBody: true → req.rawBody orqali original bayt oqimi saqlanadi.
+    // Instagram/Meta webhook imzosini (X-Hub-Signature-256) tekshirish uchun zarur.
+    rawBody: true,
   });
   const config = app.get(ConfigService);
   const port = config.get<number>('PORT', 3000);
