@@ -384,6 +384,24 @@ export class ClientsService {
     });
   }
 
+  // v14: mijozga ixtiyoriy "key = value" ma'lumotlar. preferences.customFields
+  // ichida saqlanadi. MAVJUD preferences (offers/travelInfo) bilan birlashtiriladi —
+  // hech narsa yo'qolmaydi. fields = [{ key, value }, ...]
+  async setCustomFields(tenantId: string, id: string, userId: string, role: string, fields: any) {
+    await this.findOne(tenantId, id, userId, role);
+    const client = await this.prisma.client.findFirst({ where: { id, tenantId } });
+    if (!client) throw new NotFoundException('Mijoz topilmadi');
+    const prefs: any = (client as any).preferences || {};
+    prefs.customFields = Array.isArray(fields)
+      ? fields
+          .filter((f: any) => f && (f.key || f.value))
+          .map((f: any) => ({ key: String(f.key || '').slice(0, 100), value: String(f.value || '').slice(0, 500) }))
+          .slice(0, 50)
+      : [];
+    await this.prisma.client.update({ where: { id }, data: { preferences: prefs } });
+    return { ok: true, customFields: prefs.customFields };
+  }
+
   async delete(tenantId: string, id: string, userId: string, role: string) {
     // Only ADMIN/MANAGER can delete
     if (role === 'AGENT') {

@@ -95,6 +95,13 @@ export class ClientsController {
     return this.svc.setTier(u.tenantId, id, u.sub, u.role, tier);
   }
 
+  // v14: mijozga ixtiyoriy "key = value" ma'lumotlar (masalan "Qayerga = Istanbul",
+  // "Byudjet = 7890"). Server-side merge — offers/travelInfo yo'qolmaydi.
+  @Patch(':id/custom-fields')
+  setCustomFields(@Param('id') id: string, @Body('fields') fields: any, @CurrentUser() u: any) {
+    return this.svc.setCustomFields(u.tenantId, id, u.sub, u.role, fields);
+  }
+
   /** v5: Open Chat — klient suhbatini Inbox'da ochish */
   @Get(':id/conversation')
   getConversation(@Param('id') id: string, @CurrentUser() u: any) {
