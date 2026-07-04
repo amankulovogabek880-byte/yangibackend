@@ -183,7 +183,9 @@ export class OffersService {
       const stars = offer.hotelStars ? '⭐'.repeat(Math.min(7, Number(offer.hotelStars))) : '';
       lines.push(`🏨 Mehmonxona: ${offer.hotelName}${stars ? ` ${stars}` : ''}`);
     }
-    if (offer.mealPlan && MEAL_LABELS[offer.mealPlan]) {
+    // v14: Ovqatlanish TANLANMAGAN (NONE) bo'lsa — hech narsa yozilmaydi
+    // (avval "Ovqatlanishsiz" deb chiqardi, endi umuman ko'rsatilmaydi).
+    if (offer.mealPlan && offer.mealPlan !== 'NONE' && MEAL_LABELS[offer.mealPlan]) {
       lines.push(`🍽 Ovqatlanish: ${MEAL_LABELS[offer.mealPlan]}`);
     }
     lines.push('');
