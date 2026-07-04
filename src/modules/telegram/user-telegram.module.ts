@@ -109,6 +109,103 @@ export class UserTelegramService implements OnModuleInit {
     }
   }
 
+  // ─── v14: Yagona KOMPANIYA (umumiy) shaxsiy accounti ──────────────────────
+  // Yangi model: har bir agent o'z Telegramini ULAMAYDI. Admin BITTA umumiy
+  // (shaxsiy/MTProto) account ulaydi, hamma agent SHU account orqali ishlaydi.
+  // Shuning uchun account'ni `userId` (egasi) bo'yicha emas, balki tenant
+  // bo'yicha topamiz — kim yuborayotganidan qat'iy nazar bitta umumiy account.
+  private async getSharedAccount(tenantId: string) {
+    return this.prisma.telegramAccount.findFirst({
+      where: { tenantId, isPersonal: true, isActive: true, sessionData: { not: null } },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  // ─── v14: Round-robin — yangi lead'ni eng kam bandligi bor agentga berish ──
+  // Ilgari shaxsiy account orqali kelgan HAR BIR suhbat account EGASIGA
+  // (ya'ni admin'ga) biriktirilardi — natijada round-robin ishlamas, hamma
+  // suhbat bitta odamga tushardi. Endi bot bilan bir xil round-robin.
+  private async pickAgent(tenantId: string): Promise<string | null> {
+    let agents = await this.prisma.user.findMany({
+      where: { tenantId, role: { in: ['AGENT', 'MANAGER'] }, status: 'ACTIVE' },
+      select: { id: true },
+    });
+    if (!agents.length) {
+      agents = await this.prisma.user.findMany({
+        where: { tenantId, role: 'TENANT_ADMIN', status: 'ACTIVE' },
+        select: { id: true },
+      });
+    }
+    if (!agents.length) return null;
+    const counts = await Promise.all(
+      agents.map(async (a) => ({
+        id: a.id,
+        cnt: await this.prisma.conversation.count({
+          where: { tenantId, assignedAgentId: a.id, isResolved: false },
+        }),
+      })),
+    );
+    counts.sort((a, b) => a.cnt - b.cnt);
+    return counts[0].id;
+  }
+
+  // ─── v14: Mijoz yuborgan media (ovoz/rasm/video/fayl) ni yuklab saqlash ────
+  // Ilgari shaxsiy (MTProto) suhbatda KIRUVCHI xabarlar HAR DOIM `TEXT` deb
+  // saqlanardi va fayl umuman yuklab olinmasdi — shu sabab mijoz yuborgan
+  // OVOZLI XABAR/RASM inbox'da ko'rinmasdi ("audio kelmayapti"). Endi Bot
+  // API'dagi kabi fayl yuklab olinib /uploads ichiga saqlanadi.
+  private async downloadIncomingMedia(
+    client: TelegramClient, msg: any, key: string,
+  ): Promise<{ messageType: string; fileUrl?: string; duration?: number }> {
+    let messageType = 'TEXT';
+    let ext = 'bin';
+    let duration: number | undefined;
+    try {
+      if (msg.voice) {
+        messageType = 'VOICE'; ext = 'ogg';
+        const attr = (msg.voice.attributes || []).find(
+          (a: any) => a.className === 'DocumentAttributeAudio',
+        );
+        duration = attr?.duration;
+      } else if (msg.videoNote) {
+        messageType = 'VIDEO'; ext = 'mp4';
+      } else if (msg.video || msg.gif) {
+        messageType = 'VIDEO'; ext = 'mp4';
+      } else if (msg.audio) {
+        messageType = 'VOICE'; ext = 'mp3';
+        const attr = (msg.audio.attributes || []).find(
+          (a: any) => a.className === 'DocumentAttributeAudio',
+        );
+        duration = attr?.duration;
+      } else if (msg.photo) {
+        messageType = 'PHOTO'; ext = 'jpg';
+      } else if (msg.document) {
+        messageType = 'DOCUMENT';
+        const nameAttr = (msg.document.attributes || []).find(
+          (a: any) => a.className === 'DocumentAttributeFilename',
+        );
+        ext = nameAttr?.fileName?.split('.').pop() || 'bin';
+      } else {
+        return { messageType: 'TEXT' };
+      }
+
+      const buf = (await client.downloadMedia(msg, {} as any)) as Buffer;
+      if (!buf || !buf.length) return { messageType, duration };
+
+      const fs = require('fs');
+      const path = require('path');
+      const uploadDir = process.env.UPLOAD_DIR || './uploads';
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+      const fileName = `tg_p_in_${key}_${Date.now()}.${ext}`;
+      fs.writeFileSync(path.join(uploadDir, fileName), buf);
+      const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
+      return { messageType, fileUrl: `${baseUrl}/uploads/${fileName}`, duration };
+    } catch (e: any) {
+      this.logger.warn(`downloadIncomingMedia xato (key=${key}): ${e?.message || e}`);
+      return { messageType, duration };
+    }
+  }
+
   // ─── Step 1: Send auth code ──────────────────────────────────────────────
   async sendCode(tenantId: string, userId: string, data: {
     phone: string;
@@ -419,44 +516,67 @@ export class UserTelegramService implements OnModuleInit {
             } catch {}
           }
 
+          // v14: mijoz yuborgan media (ovoz/rasm/video/fayl) ni yuklab olamiz.
+          const media = await this.downloadIncomingMedia(client, msg, peerId);
+          const mediaType = media.messageType; // 'TEXT' | 'VOICE' | 'PHOTO' | ...
+          const mediaLabel: Record<string, string> = {
+            VOICE: '🎤 Ovozli xabar', PHOTO: '📷 Rasm', VIDEO: '🎥 Video', DOCUMENT: '📎 Fayl',
+          };
+          const previewText = (text || mediaLabel[mediaType] || '').slice(0, 200);
+
           {
+            // v14: mijozni CRM'dagi klient bilan bog'lash (username orqali)
             let clientId: string | null = null;
+            let clientAgentId: string | null = null;
             if (username) {
               const cl = await this.prisma.client.findFirst({
                 where: { tenantId, telegramUsername: username } as any,
+                select: { id: true, assignedAgentId: true },
               }).catch(() => null);
-              if (cl) clientId = cl.id;
+              if (cl) { clientId = cl.id; clientAgentId = cl.assignedAgentId; }
             }
 
-            // MUAMMO FIX (dublikat suhbatlar): avval alohida findFirst→create/
-            // update qilinardi. Agar yangi kontakt bir necha xabarni bir-biriga
-            // juda yaqin (millisekundlar ichida) yuborsa, ikkala event ham
-            // "suhbat yo'q" deb ko'rib, ikkalasi ham create'ga urinardi —
-            // ikkinchisi unique constraint'ga urilib xato berardi va o'sha
-            // xabar SIRLI YO'QOLIB QOLARDI. Endi atomik upsert ishlatamiz.
+            // v14 ROUND-ROBIN + IZOLYATSIYA: yangi suhbat kimga biriktiriladi?
+            //  1) Mijoz CRM'da allaqachon biror agentga biriktirilgan bo'lsa —
+            //     o'sha agentga (mijoz doim bitta agent bilan gaplashadi).
+            //  2) Aks holda round-robin — eng kam bandligi bor agentga.
+            // Ilgari HAR DOIM account egasiga (admin'ga) biriktirilardi, shu
+            // sabab "bitta agent yozgan mijozni boshqasi ko'rmasin" talab
+            // buzilardi va hamma admin'ga tushardi.
+            const assignAgentId = conv?.assignedAgentId
+              || clientAgentId
+              || await this.pickAgent(tenantId);
+
+            // MUAMMO FIX (dublikat suhbatlar): atomik upsert.
             conv = await this.prisma.conversation.upsert({
               where: {
                 tenantId_channel_externalChatId: { tenantId, channel: 'TELEGRAM', externalChatId: peerId },
               },
               create: {
                 tenantId, accountId: acc.id, clientId,
-                assignedAgentId: agentId, channel: 'TELEGRAM',
+                assignedAgentId: assignAgentId, channel: 'TELEGRAM',
                 externalChatId: peerId, firstName, lastName, username, avatarUrl,
-                lastMessageAt: date, lastMessageText: text.slice(0, 200),
+                lastMessageAt: date, lastMessageText: previewText,
+                lastMessageType: mediaType as any,
                 chatType,
+                // v14: yangi kiruvchi xabar — o'qilmagan deb belgilanadi
+                unreadCount: 1,
+                isResolved: false,
               } as any,
               update: {
-                lastMessageAt: date, lastMessageText: text.slice(0, 200),
+                lastMessageAt: date, lastMessageText: previewText,
+                lastMessageType: mediaType as any,
                 firstName: conv?.firstName || firstName,
                 lastName: conv?.lastName || lastName,
                 username: conv?.username || username,
                 chatType: (conv as any)?.chatType || chatType,
+                clientId: conv?.clientId || clientId,
+                assignedAgentId: conv?.assignedAgentId || assignAgentId,
                 ...(avatarUrl ? { avatarUrl } : {}),
-                // MUAMMO FIX: avvalgi shart `conv.accountId ? {} : {...}` edi —
-                // ya'ni FAQAT accountId bo'sh bo'lsagina yozardi, shuning uchun
-                // Bot-akkauntga bog'langan eski suhbatlar umrbod "Bot" deb
-                // qolib ketardi. Endi har doim shaxsiy accountga ko'chiramiz.
                 accountId: acc.id,
+                // v14: o'qildi/o'qilmadi — kiruvchi xabar sonini oshiramiz
+                unreadCount: { increment: 1 },
+                isResolved: false,
               } as any,
             });
           }
@@ -477,19 +597,24 @@ export class UserTelegramService implements OnModuleInit {
           const savedMsg = await this.prisma.message.create({
             data: {
               conversationId: conv.id,
-              direction: 'INBOUND', messageType: 'TEXT', text,
+              direction: 'INBOUND',
+              // v14: endi haqiqiy tur (VOICE/PHOTO/VIDEO/DOCUMENT) va fayl saqlanadi
+              messageType: mediaType as any,
+              text: text || null,
+              fileUrl: media.fileUrl,
+              duration: media.duration,
               externalMsgId: tgMsgId || String(Date.now()),
               isDelivered: true, createdAt: date,
             },
           });
 
-          // Real-time notify — v10 MUAMMO 4 FIX: tenant-keng emas
-          if (agentId) {
-            this.realtime.emitToUser(agentId, 'message:new', savedMsg);
-          }
+          // v14: real-time xabar account EGASIGA emas, BIRIKTIRILGAN agentga
+          // (+admin/manager) boradi — round-robin natijasida boshqa agent bo'lishi mumkin.
+          this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'message:new', savedMsg);
+          this.realtime.emitToConversation(conv.id, 'message:new', savedMsg);
           this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId || agentId, 'conversation:updated', {
             conversationId: conv.id,
-            lastMessageText: text.slice(0, 200),
+            lastMessageText: previewText,
             lastMessageAt: date,
           });
         } catch (e: any) {
@@ -524,13 +649,12 @@ export class UserTelegramService implements OnModuleInit {
       throw new BadRequestException('Telefon raqami, username, Telegram ID yoki suhbat kerak');
     }
 
-    // Get agent's personal account
-    const account = await this.prisma.telegramAccount.findFirst({
-      where: { tenantId, userId: agentId, isPersonal: true, isActive: true },
-    });
+    // v14: agentning O'ZIGA tegishli account emas — KOMPANIYA (umumiy) accounti.
+    // Admin bitta account ulaydi, hamma agent shu orqali yozadi.
+    const account = await this.getSharedAccount(tenantId);
     if (!account) {
       throw new BadRequestException(
-        'Shaxsiy Telegram account ulanmagan. Settings → Telegram → Shaxsiy account ulang'
+        'Kompaniya Telegram accounti ulanmagan. Admin: Settings → Telegram bo\'limidan ulasin.'
       );
     }
 
@@ -701,17 +825,16 @@ export class UserTelegramService implements OnModuleInit {
   // yuborilgandagidek.
   private async sendPersonalMedia(
     tenantId: string, agentId: string, conversationId: string,
-    fileUrl: string, caption?: string,
+    fileUrl: string, caption?: string, mediaType?: string,
   ) {
     const conv = await this.prisma.conversation.findFirst({
       where: { id: conversationId, tenantId },
     });
     if (!conv) throw new NotFoundException('Suhbat topilmadi');
 
-    const account = await this.prisma.telegramAccount.findFirst({
-      where: { tenantId, userId: agentId, isPersonal: true, isActive: true },
-    });
-    if (!account) throw new BadRequestException('Shaxsiy Telegram account ulanmagan');
+    // v14: umumiy KOMPANIYA accounti (agent o'z accountiga ega emas)
+    const account = await this.getSharedAccount(tenantId);
+    if (!account) throw new BadRequestException('Kompaniya Telegram accounti ulanmagan');
 
     let client = activeSessions.get(account.id);
     if (!client || !(await client.isUserAuthorized().catch(() => false))) {
@@ -726,22 +849,58 @@ export class UserTelegramService implements OnModuleInit {
     const resp = await axios.get(fileUrl, { responseType: 'arraybuffer' });
     const buf = Buffer.from(resp.data);
     const fileName = fileUrl.split('/').pop()?.split('?')[0] || `file_${Date.now()}`;
-    const isImage = !!fileName.match(/\.(jpg|jpeg|png|gif|webp)$/i);
+    const isImage = mediaType === 'photo' || !!fileName.match(/\.(jpg|jpeg|png|gif|webp)$/i);
+    // v14: OVOZLI XABAR — inboxda mikrofonda yozilgani (audio/webm|ogg). Telegramga
+    // "voice note" sifatida yuborishga urinamiz; format qabul qilinmasa — oddiy
+    // audio fayl sifatida yuboramiz (baribir eshitiladi).
+    const isVoice = mediaType === 'voice' || !!fileName.match(/\.(ogg|oga|webm|mp3|m4a|wav|aac)$/i);
 
-    const sent = await client.sendFile(peer, {
-      file: buf,
-      caption: caption || '',
-      forceDocument: !isImage,
-      workers: 1,
-      attributes: [{ className: 'DocumentAttributeFilename', fileName }] as any,
-    } as any);
+    let sent: any;
+    let finalType: 'VOICE' | 'PHOTO' | 'VIDEO' | 'DOCUMENT' =
+      isVoice ? 'VOICE' : isImage ? 'PHOTO' : 'DOCUMENT';
+
+    try {
+      if (isVoice) {
+        sent = await client.sendFile(peer, {
+          file: buf,
+          caption: caption || '',
+          voiceNote: true,
+          workers: 1,
+        } as any);
+      } else {
+        sent = await client.sendFile(peer, {
+          file: buf,
+          caption: caption || '',
+          forceDocument: !isImage,
+          workers: 1,
+          attributes: [{ className: 'DocumentAttributeFilename', fileName }] as any,
+        } as any);
+      }
+    } catch (e: any) {
+      // Voice note formatida rad etilsa — oddiy audio fayl sifatida qayta yuboramiz
+      if (isVoice) {
+        this.logger.warn('Voice note yuborilmadi, oddiy audio sifatida urinilyapti: ' + e?.message);
+        sent = await client.sendFile(peer, {
+          file: buf,
+          caption: caption || '',
+          forceDocument: false,
+          workers: 1,
+          attributes: [{ className: 'DocumentAttributeFilename', fileName }] as any,
+        } as any);
+        finalType = 'VOICE';
+      } else {
+        throw e;
+      }
+    }
+
+    const label = { VOICE: '🎤 Ovozli xabar', PHOTO: '📷 Rasm', VIDEO: '🎥 Video', DOCUMENT: '📎 Fayl' }[finalType];
 
     const savedMsg = await this.prisma.message.create({
       data: {
         conversationId: conv.id,
         agentId,
         direction: 'OUTBOUND',
-        messageType: isImage ? 'PHOTO' : 'DOCUMENT',
+        messageType: finalType as any,
         text: caption || '',
         fileUrl,
         externalMsgId: String((sent as any).id || Date.now()),
@@ -754,25 +913,27 @@ export class UserTelegramService implements OnModuleInit {
       where: { id: conv.id },
       data: {
         lastMessageAt: new Date(),
-        lastMessageText: caption?.slice(0, 200) || '📎 Fayl',
-        // MUAMMO FIX: xuddi yuqoridagi joylardagidek — endi har doim yangilanadi.
+        lastMessageText: caption?.slice(0, 200) || label,
+        lastMessageType: finalType as any,
         accountId: account.id,
       },
     });
 
-    this.realtime.emitToUser(agentId, 'message:new', savedMsg);
+    // v14: biriktirilgan agentga (+admin) — account egasiga emas
+    this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId || agentId, 'message:new', savedMsg);
+    this.realtime.emitToConversation(conv.id, 'message:new', savedMsg);
     this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId || agentId, 'conversation:updated', {
       conversationId: conv.id,
-      lastMessageText: caption?.slice(0, 200) || '📎 Fayl',
+      lastMessageText: caption?.slice(0, 200) || label,
       lastMessageAt: new Date(),
     });
 
     return savedMsg;
   }
 
-  // Public wrapper — controller orqali chaqiriladi (masalan "Rasm" tugmasi)
-  async sendMedia(tenantId: string, agentId: string, conversationId: string, fileUrl: string, caption?: string) {
-    return this.sendPersonalMedia(tenantId, agentId, conversationId, fileUrl, caption);
+  // Public wrapper — controller orqali chaqiriladi (masalan "Rasm"/"Ovozli xabar" tugmasi)
+  async sendMedia(tenantId: string, agentId: string, conversationId: string, fileUrl: string, caption?: string, mediaType?: string) {
+    return this.sendPersonalMedia(tenantId, agentId, conversationId, fileUrl, caption, mediaType);
   }
 
   // ─── v11 FIX: Shablon yuborish (shaxsiy akkaunt orqali) ──────────────────
@@ -916,8 +1077,8 @@ export class UserTelegramController {
   // v11 FIX: shaxsiy akkaunt orqali rasm/fayl yuborish
   @ApiOperation({ summary: 'Rasm/fayl yuborish (shaxsiy akkaunt orqali)' })
   @Post('send-media')
-  sendMedia(@CurrentUser() u: any, @Body() body: { conversationId: string; fileUrl: string; caption?: string }) {
-    return this.svc.sendMedia(u.tenantId, u.id || u.sub, body.conversationId, body.fileUrl, body.caption);
+  sendMedia(@CurrentUser() u: any, @Body() body: { conversationId: string; fileUrl: string; caption?: string; mediaType?: string }) {
+    return this.svc.sendMedia(u.tenantId, u.id || u.sub, body.conversationId, body.fileUrl, body.caption, body.mediaType);
   }
 
   // Status

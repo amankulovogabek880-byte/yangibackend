@@ -26,6 +26,13 @@ if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
 const ALLOWED_MIME = new Set([
   'image/jpeg', 'image/png', 'image/webp', 'image/gif',
   'video/mp4', 'video/webm',
+  // v14 FIX: ovozli xabar (inboxdan mikrofonda yozilgan) — brauzer 'audio/webm'
+  // yoki 'audio/ogg' beradi. Avval bu turlar ro'yxatda YO'Q edi, shu sabab
+  // yuklashning o'zi "Fayl turi qollab-quvvatlanmaydi: audio/webm" xatosi
+  // bilan rad etilar, ovozli xabar hatto Telegramga yetib ham bormasdi.
+  'audio/webm', 'audio/ogg', 'audio/oga', 'audio/mpeg', 'audio/mp3',
+  'audio/mp4', 'audio/m4a', 'audio/x-m4a', 'audio/aac',
+  'audio/wav', 'audio/x-wav', 'audio/wave', 'audio/3gpp',
   'application/pdf',
   'application/msword',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',

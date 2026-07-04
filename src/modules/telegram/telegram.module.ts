@@ -1176,21 +1176,11 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     if (params.channel) where.channel = params.channel;
     if (params.unassigned === 'true') where.assignedAgentId = null;
     else if (role === 'AGENT') {
-      // v12 MAXFIYLIK FIX: agent FAQAT o'zining shaxsiy Telegram accountidagi
-      // suhbatlarni ko'radi (boshqa agentning shaxsiysini EMAS). Kompaniya boti
-      // suhbatlarini esa avvalgidek (o'ziga biriktirilgan yoki biriktirilmagan).
-      // Admin (bu shart AGENT'gagina tegishli) hammasini ko'radi.
-      where.OR = [
-        // 1) O'zining shaxsiy accountidagi suhbatlar — faqat egasi (+admin)
-        { account: { is: { isPersonal: true, userId } } },
-        // 2) Kompaniya boti / accountsiz suhbatlar
-        {
-          AND: [
-            { OR: [{ accountId: null }, { account: { is: { isPersonal: false } } }] },
-            { OR: [{ assignedAgentId: userId }, { assignedAgentId: null }] },
-          ],
-        },
-      ];
+      // v14 QAT'IY IZOLYATSIYA: agent FAQAT o'ziga biriktirilgan suhbatlarni
+      // ko'radi. Boshqa agentniki (biriktirilmagan "umumiy" bo'lsa ham) ko'rinmaydi.
+      // Yangi lead round-robin orqali darhol biriktiriladi, admin esa hammasini
+      // ko'radi va kerak bo'lsa qayta biriktiradi.
+      where.assignedAgentId = userId;
     } else if (params.agentId) {
       where.assignedAgentId = params.agentId;
     }
@@ -1223,16 +1213,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   ) {
     const where: any = { id: conversationId, tenantId };
     if (role === 'AGENT') {
-      // v12 MAXFIYLIK FIX: agent boshqa agentning shaxsiy suhbatini OCHA olmaydi.
-      where.OR = [
-        { account: { is: { isPersonal: true, userId } } },
-        {
-          AND: [
-            { OR: [{ accountId: null }, { account: { is: { isPersonal: false } } }] },
-            { OR: [{ assignedAgentId: userId }, { assignedAgentId: null }] },
-          ],
-        },
-      ];
+      // v14 QAT'IY IZOLYATSIYA: agent faqat O'ZIGA biriktirilgan suhbatni ocha oladi.
+      where.assignedAgentId = userId;
     }
     const conv = await this.prisma.conversation.findFirst({ where });
     if (!conv) throw new NotFoundException('Topilmadi');
@@ -1264,15 +1246,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   ) {
     const where: any = { id: conversationId, tenantId };
     if (role === 'AGENT') {
-      where.OR = [
-        { account: { is: { isPersonal: true, userId } } },
-        {
-          AND: [
-            { OR: [{ accountId: null }, { account: { is: { isPersonal: false } } }] },
-            { OR: [{ assignedAgentId: userId }, { assignedAgentId: null }] },
-          ],
-        },
-      ];
+      // v14 QAT'IY IZOLYATSIYA
+      where.assignedAgentId = userId;
     }
     const conv = await this.prisma.conversation.findFirst({ where });
     if (!conv) throw new NotFoundException('Topilmadi');
