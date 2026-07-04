@@ -127,7 +127,11 @@ export class UserTelegramService implements OnModuleInit {
   // suhbat bitta odamga tushardi. Endi bot bilan bir xil round-robin.
   private async pickAgent(tenantId: string): Promise<string | null> {
     let agents = await this.prisma.user.findMany({
-      where: { tenantId, role: { in: ['AGENT', 'MANAGER'] }, status: 'ACTIVE' },
+      where: {
+        tenantId, role: { in: ['AGENT', 'MANAGER'] }, status: 'ACTIVE',
+        // v14: pauza qilingan agent (ta'til/kasal) lead OLMAYDI
+        isPausedFromAssignment: false,
+      },
       select: { id: true },
     });
     if (!agents.length) {

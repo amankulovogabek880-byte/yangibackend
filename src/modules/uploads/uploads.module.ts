@@ -40,6 +40,18 @@ const ALLOWED_MIME = new Set([
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 ]);
 
+// v14 FIX (davomi): brauzer ba'zan `audio/webm;codecs=opus` kabi codecs
+// qo'shimchasi bilan mimetype yuboradi — bu YUQORIDAGI aniq ro'yxatga
+// mos kelmasdi va ovozli xabar baribir rad etilardi. Endi (1) codecs/params
+// qismini olib tashlaymiz, (2) har qanday audio/image/video ni prefiks
+// bo'yicha ham qabul qilamiz. Hujjatlar esa oldingidek ro'yxat bo'yicha.
+function isAllowedMime(mimetype?: string): boolean {
+  if (!mimetype) return false;
+  const base = mimetype.split(';')[0].trim().toLowerCase();
+  if (ALLOWED_MIME.has(base)) return true;
+  return base.startsWith('image/') || base.startsWith('audio/') || base.startsWith('video/');
+}
+
 function safeFileName(original: string): string {
   const safe = original.replace(/[^a-zA-Z0-9.\-_]/g, '_');
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safe}`;
@@ -154,7 +166,7 @@ export class UploadsController {
   @UseInterceptors(FileInterceptor('file', {
     limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB
     fileFilter: (_req, file, cb) => {
-      if (!ALLOWED_MIME.has(file.mimetype)) {
+      if (!isAllowedMime(file.mimetype)) {
         cb(new BadRequestException(`Fayl turi qollab-quvvatlanmaydi: ${file.mimetype}`), false);
         return;
       }
@@ -198,7 +210,7 @@ export class UploadsController {
   @UseInterceptors(FilesInterceptor('files', 10, {
     limits: { fileSize: 25 * 1024 * 1024 },
     fileFilter: (_req, file, cb) => {
-      if (!ALLOWED_MIME.has(file.mimetype)) {
+      if (!isAllowedMime(file.mimetype)) {
         cb(new BadRequestException(`Fayl turi: ${file.mimetype} qollab-quvvatlanmaydi`), false);
         return;
       }

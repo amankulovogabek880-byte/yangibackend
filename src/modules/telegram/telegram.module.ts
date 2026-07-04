@@ -110,7 +110,11 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   /** Round-robin: pick agent with least active conversations */
   private async pickAgent(tenantId: string): Promise<string | null> {
     let agents = await this.prisma.user.findMany({
-      where: { tenantId, role: { in: ['AGENT', 'MANAGER'] }, status: 'ACTIVE' },
+      where: {
+        tenantId, role: { in: ['AGENT', 'MANAGER'] }, status: 'ACTIVE',
+        // v14: pauza qilingan agent (ta'til/kasal) lead OLMAYDI
+        isPausedFromAssignment: false,
+      },
       select: { id: true },
     });
     // v10 MUAMMO 5 BONUS FIX: agar tenant'da hali AGENT/MANAGER rolidagi

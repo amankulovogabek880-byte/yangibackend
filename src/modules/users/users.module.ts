@@ -243,22 +243,39 @@ export class UsersService {
       }
     }
 
-    // Booking, client'lardagi agentId tegishliligini bo'shatish (cascade emas)
-    await this.prisma.client.updateMany({
-      where: { assignedAgentId: id },
-      data: { assignedAgentId: null },
-    });
-    await this.prisma.booking.updateMany({
-      where: { agentId: id },
-      data: { agentId: null },
-    });
-    await this.prisma.conversation.updateMany({
-      where: { assignedAgentId: id },
-      data: { assignedAgentId: null },
-    });
+    // v14 DATA-SAQLASH: agent ishdan bo'shasa, uni "o'chiramiz" — LEKIN hech
+    // qanday kompaniya datasi o'chib ketmasligi kerak. Ilgari `user.delete()`
+    // ishlatilardi — bu (a) Commission/FollowUp kabi MAJBURIY aloqalar sabab
+    // ba'zan umuman bloklanardi, (b) sessiyalar bilan birga ba'zi datani
+    // yo'qotardi. Endi YUMSHOQ o'chirish: user statusi INACTIVE bo'ladi
+    // (login bloklanadi, ro'yxatlardan yo'qoladi), lekin barcha xabar/booking/
+    // invoice/klient/komissiya tarixi kompaniyada TO'LIQ saqlanadi.
 
-    // Userni o'chirish (cascade sessions, login attempts)
-    await this.prisma.user.delete({ where: { id } });
+    // 1) Ochiq (hal qilinmagan) suhbatlarni bo'shatamiz — keyingi xabarda
+    //    round-robin orqali boshqa agentga avtomatik o'tadi (lead yo'qolmasin).
+    await this.prisma.conversation.updateMany({
+      where: { tenantId, assignedAgentId: id, isResolved: false },
+      data: { assignedAgentId: null },
+    });
+    // 2) Klientlarni bo'shatamiz (admin qayta taqsimlashi mumkin) — klient
+    //    yozuvlari o'chmaydi, faqat biriktirilmagan bo'ladi.
+    await this.prisma.client.updateMany({
+      where: { tenantId, assignedAgentId: id },
+      data: { assignedAgentId: null },
+    });
+    // DIQQAT: booking/invoice/message/commission agentId'sini NULL QILMAYMIZ —
+    // sotuv/moliya tarixi kim tomonidan qilinganini saqlab qolamiz.
+
+    // 3) Agentni round-robin'dan chiqaramiz va login'ni bloklaymiz (soft delete)
+    await this.prisma.user.update({
+      where: { id },
+      data: {
+        status: 'INACTIVE',
+        isPausedFromAssignment: true,
+      } as any,
+    });
+    // Faol sessiyalarni o'chiramiz — bloklangan agent kira olmasin
+    await this.prisma.userSession.deleteMany({ where: { userId: id } }).catch(() => {});
 
     return { ok: true };
   }
