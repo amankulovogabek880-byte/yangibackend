@@ -167,6 +167,32 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  // v13 FIX: mijoz yuborgan ovozli xabar/rasm/video/fayl — ilgari BUTUNLAY
+  // saqlanmasdi (faqat matn/caption yozilardi, fileUrl hech qachon
+  // to'ldirilmasdi). Shu sabab agent mijoz yuborgan ovozli xabarni HECH
+  // QACHON eshita olmasdi. Endi mos fayl Telegramdan yuklab olinib, xuddi
+  // bot orqali chiquvchi fayllar kabi /uploads ichiga saqlanadi.
+  private async saveIncomingFile(bot: TelegramBot, fileId: string, ext: string, key: string): Promise<string | undefined> {
+    try {
+      const fileLink = await bot.getFileLink(fileId);
+      const axios = require('axios');
+      const resp = await axios.get(fileLink, { responseType: 'arraybuffer' });
+
+      const fs = require('fs');
+      const path = require('path');
+      const uploadDir = process.env.UPLOAD_DIR || './uploads';
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+      const fileName = `tg_in_${key}_${Date.now()}.${ext}`;
+      fs.writeFileSync(path.join(uploadDir, fileName), Buffer.from(resp.data));
+      const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
+      return `${baseUrl}/uploads/${fileName}`;
+    } catch (e: any) {
+      this.logger.warn(`saveIncomingFile xato (fileId=${fileId}): ${e?.message || e}`);
+      return undefined;
+    }
+  }
+
   private inferType(msg: TelegramBot.Message): MessageType {
     if (msg.photo) return 'PHOTO';
     if (msg.document) return 'DOCUMENT';
@@ -218,7 +244,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
             where: { tenantId, telegramId: tgUserId },
           })
         : null;
-      const assignedAgentId = await this.pickAgent(tenantId);
+      // v13 FIX: agar bu Telegram foydalanuvchi CRM'da allaqachon biror
+      // agentga biriktirilgan klient/lid bo'lsa — round-robin o'rniga
+      // TO'G'RIDAN-TO'G'RI o'sha agentga yo'naltiramiz. Ilgari bu yerda
+      // har doim pickAgent() (round-robin) ishlatilardi, shu sabab bitta
+      // umumiy kompaniya raqami orqali yozgan klientlar tasodifiy boshqa
+      // agentlarga tushib, "kimniki-kimniki" bo'lib chalkashib ketardi.
+      const assignedAgentId = client?.assignedAgentId || await this.pickAgent(tenantId);
 
       conv = await this.prisma.conversation.create({
         data: {
@@ -248,20 +280,69 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           metadata: { conversationId: conv.id },
         }).catch(() => {});
       }
-    } else if (avatarUrl || !conv.firstName || !(conv as any).chatType) {
-      conv = await this.prisma.conversation.update({
-        where: { id: conv.id },
-        data: {
-          ...(avatarUrl ? { avatarUrl } : {}),
-          firstName: conv.firstName || msg.from?.first_name,
-          lastName: conv.lastName || msg.from?.last_name,
-          username: conv.username || msg.from?.username,
-          chatType: (conv as any).chatType || chatType,
-        } as any,
-      });
+    } else {
+      // v13 FIX: mavjud suhbat bo'lsa ham, agar bog'langan (yoki
+      // telegramId bo'yicha topilgan) klient CRM'da boshqa agentga
+      // biriktirilgan/qayta biriktirilgan bo'lsa — suhbatni ham o'sha
+      // agentga sinxronlaymiz. Aks holda agent CRM'da klientni o'ziga
+      // biriktirsa ham, eski suhbat hamon boshqa agentda (yoki
+      // "umumiy"da) qolib, klientlar chalkashib ketaverardi.
+      let linkedClient: { id: string; assignedAgentId: string | null } | null = null;
+      if (conv.clientId) {
+        linkedClient = await this.prisma.client.findFirst({
+          where: { id: conv.clientId, tenantId },
+          select: { id: true, assignedAgentId: true },
+        });
+      } else if (tgUserId) {
+        linkedClient = await this.prisma.client.findFirst({
+          where: { tenantId, telegramId: tgUserId },
+          select: { id: true, assignedAgentId: true },
+        });
+      }
+
+      const needsAvatarOrMeta = avatarUrl || !conv.firstName || !(conv as any).chatType;
+      const needsAgentSync = !!(linkedClient?.assignedAgentId && linkedClient.assignedAgentId !== conv.assignedAgentId);
+
+      if (needsAvatarOrMeta || needsAgentSync) {
+        conv = await this.prisma.conversation.update({
+          where: { id: conv.id },
+          data: {
+            ...(avatarUrl ? { avatarUrl } : {}),
+            firstName: conv.firstName || msg.from?.first_name,
+            lastName: conv.lastName || msg.from?.last_name,
+            username: conv.username || msg.from?.username,
+            chatType: (conv as any).chatType || chatType,
+            ...(needsAgentSync ? { assignedAgentId: linkedClient!.assignedAgentId, clientId: linkedClient!.id } : {}),
+          } as any,
+        });
+      }
     }
 
     const messageType = this.inferType(msg);
+
+    // v13 FIX: media fayllarni (ovozli xabar, rasm, video, hujjat) haqiqatan
+    // yuklab olib saqlaymiz — aks holda agent mijoz yuborgan ovozli xabar
+    // yoki rasmni ko'ra/eshita olmasdi.
+    let fileUrl: string | undefined;
+    let duration: number | undefined;
+    try {
+      if (messageType === 'VOICE' && msg.voice) {
+        fileUrl = await this.saveIncomingFile(bot, msg.voice.file_id, 'ogg', chatId);
+        duration = msg.voice.duration;
+      } else if (messageType === 'PHOTO' && msg.photo?.length) {
+        const largest = msg.photo[msg.photo.length - 1];
+        fileUrl = await this.saveIncomingFile(bot, largest.file_id, 'jpg', chatId);
+      } else if (messageType === 'VIDEO' && msg.video) {
+        fileUrl = await this.saveIncomingFile(bot, msg.video.file_id, 'mp4', chatId);
+        duration = msg.video.duration;
+      } else if (messageType === 'DOCUMENT' && msg.document) {
+        const ext = msg.document.file_name?.split('.').pop() || 'bin';
+        fileUrl = await this.saveIncomingFile(bot, msg.document.file_id, ext, chatId);
+      }
+    } catch (e: any) {
+      this.logger.warn(`Inbound media yuklashda xato: ${e?.message || e}`);
+    }
+
     const newMsg = await this.prisma.message.create({
       data: {
         conversationId: conv.id,
@@ -269,6 +350,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         direction: 'INBOUND',
         messageType,
         text: msg.text || msg.caption || null,
+        fileUrl,
+        duration,
       },
     });
 
@@ -368,6 +451,18 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       if (!bot) throw new BadRequestException('Bot aktiv emas');
       try {
         const sent = await bot.sendMessage(conv.externalChatId, text);
+        // v13 DUBLIKAT FIX: avval bu natija bazaga yozilar edi-yu, lekin
+        // pastdagi socket emit'da ESKI `msg` obyekti (externalMsgId=null)
+        // ishlatilardi. Ikkita alohida socket xonasiga ('user:X' va
+        // 'conv:Y') bir xil xabar externalMsgId=null bilan ikki marta
+        // yuborilardi — frontend buni "ikkita boshqa xabar" deb hisoblab
+        // ro'yxatga IKKALASINI HAM qo'shardi (shuning uchun agent yuborgan
+        // har bir xabar ekranda ikki marta ko'rinardi). Endi yangilangan
+        // qiymatni xotiradagi `msg` obyektiga ham yozamiz — shu orqali emit
+        // qilinadigan ikkala nusxa ham BIR XIL externalMsgId'ga ega bo'ladi
+        // va frontend ularni to'g'ri dublikat deb tanib, bittasini ko'rsatadi.
+        (msg as any).externalMsgId = String(sent.message_id);
+        (msg as any).isDelivered = true;
         await this.prisma.message.update({
           where: { id: msg.id },
           data: { externalMsgId: String(sent.message_id), isDelivered: true },
@@ -407,7 +502,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   async sendMedia(
     tenantId: string, conversationId: string,
     agentId: string, agentRole: string,
-    data: { fileUrl: string; mimeType?: string; caption?: string; mediaType?: 'photo' | 'document' | 'video' }
+    data: { fileUrl: string; mimeType?: string; caption?: string; mediaType?: 'photo' | 'document' | 'video' | 'voice' }
   ) {
     if (!data.fileUrl) throw new BadRequestException('Fayl URL bo\'sh');
 
@@ -434,7 +529,11 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       (data.mimeType?.startsWith('image/') ?? false);
     const isVideo = data.mediaType === 'video' ||
       (data.mimeType?.startsWith('video/') ?? false);
-    const msgType: any = isImage ? 'PHOTO' : isVideo ? 'VIDEO' : 'DOCUMENT';
+    // v13: ovozli xabar (voice) qo'llab-quvvatlash — agent mijozga ovozli
+    // xabar yubora oladigan bo'ldi.
+    const isVoice = data.mediaType === 'voice' ||
+      (data.mimeType?.startsWith('audio/') ?? false);
+    const msgType: any = isVoice ? 'VOICE' : isImage ? 'PHOTO' : isVideo ? 'VIDEO' : 'DOCUMENT';
 
     const msg = await this.prisma.message.create({
       data: {
@@ -473,7 +572,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
       try {
         let sent: any;
-        if (isImage) {
+        if (isVoice) {
+          sent = await bot.sendVoice(conv.externalChatId, fileToSend);
+        } else if (isImage) {
           sent = await bot.sendPhoto(conv.externalChatId, fileToSend, {
             caption: data.caption,
           });
@@ -486,6 +587,11 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
             caption: data.caption,
           });
         }
+        // v13 DUBLIKAT FIX: xuddi sendMessage'dagidek — emit qilinadigan
+        // `msg` obyektini ham yangilangan externalMsgId bilan sinxronlaymiz,
+        // aks holda rasm/fayl/ovozli xabarlar ham ikki marta ko'rinardi.
+        (msg as any).externalMsgId = String(sent.message_id);
+        (msg as any).isDelivered = true;
         await this.prisma.message.update({
           where: { id: msg.id },
           data: { externalMsgId: String(sent.message_id), isDelivered: true },
@@ -502,7 +608,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         where: { id: conversationId },
         data: {
           lastMessageAt: new Date(),
-          lastMessageText: data.caption?.slice(0, 200) || (isImage ? '📷 Rasm' : '📎 Fayl'),
+          lastMessageText: data.caption?.slice(0, 200) || (isVoice ? '🎤 Ovozli xabar' : isImage ? '📷 Rasm' : '📎 Fayl'),
           lastMessageType: msgType,
         },
       });
@@ -1149,6 +1255,46 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     return { messages, conversation: conv };
   }
 
+  // v13: "o'qildi / o'qilmadi" qo'lda belgilash. getMessages() faqat
+  // konversatsiyani OCHGANDA avtomatik o'qilgan qiladi — bu yerda esa
+  // agent ro'yxatdan turib xohlagan suhbatni o'qilgan/o'qilmagan deb
+  // belgilay oladi (email-client'lardagi kabi).
+  async setReadStatus(
+    tenantId: string, conversationId: string, userId: string, role: string, read: boolean,
+  ) {
+    const where: any = { id: conversationId, tenantId };
+    if (role === 'AGENT') {
+      where.OR = [
+        { account: { is: { isPersonal: true, userId } } },
+        {
+          AND: [
+            { OR: [{ accountId: null }, { account: { is: { isPersonal: false } } }] },
+            { OR: [{ assignedAgentId: userId }, { assignedAgentId: null }] },
+          ],
+        },
+      ];
+    }
+    const conv = await this.prisma.conversation.findFirst({ where });
+    if (!conv) throw new NotFoundException('Topilmadi');
+
+    if (read) {
+      await this.prisma.conversation.update({
+        where: { id: conversationId },
+        data: { unreadCount: 0 },
+      });
+      await this.prisma.message.updateMany({
+        where: { conversationId, direction: 'INBOUND', isRead: false },
+        data: { isRead: true },
+      });
+    } else {
+      await this.prisma.conversation.update({
+        where: { id: conversationId },
+        data: { unreadCount: conv.unreadCount > 0 ? conv.unreadCount : 1 },
+      });
+    }
+    return { ok: true };
+  }
+
   async assignAgent(tenantId: string, conversationId: string, agentId: string | null) {
     if (agentId) {
       const agent = await this.prisma.user.findFirst({
@@ -1197,7 +1343,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     if (!client) throw new NotFoundException('Klient topilmadi');
     await this.prisma.conversation.update({
       where: { id: conversationId },
-      data: { clientId },
+      data: {
+        clientId,
+        // v13 FIX: klient CRM'da allaqachon biror agentga biriktirilgan
+        // bo'lsa, suhbatni ham darhol o'sha agentga o'tkazamiz — shu orqali
+        // boshqa agentlarga bu suhbat ko'rinmay qoladi.
+        ...(client.assignedAgentId ? { assignedAgentId: client.assignedAgentId } : {}),
+      },
     });
     if (conv.externalUserId && conv.channel === 'TELEGRAM') {
       await this.prisma.client.update({
@@ -1390,6 +1542,12 @@ export class TelegramController {
   @Patch('conversations/:id/assign')
   assign(@Param('id') id: string, @Body() body: any, @CurrentUser() u: any) {
     return this.svc.assignAgent(u.tenantId, id, body.agentId || null);
+  }
+
+  /** v13: suhbatni qo'lda "o'qildi/o'qilmadi" deb belgilash */
+  @Patch('conversations/:id/read')
+  setRead(@Param('id') id: string, @Body() body: any, @CurrentUser() u: any) {
+    return this.svc.setReadStatus(u.tenantId, id, u.sub, u.role, body.read !== false);
   }
 
   @Patch('conversations/:id/claim')
