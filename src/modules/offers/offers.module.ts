@@ -65,6 +65,16 @@ export class OffersService {
     const clientPriceTotal = actualPrice + markup;
     const pricePerPerson = Math.round((clientPriceTotal / pax) * 100) / 100;
 
+    // v14: kattalar/bolalar breakdown (1 kishilik narxlar, USD ga o'girilgan).
+    // Bolalar arzon narxda — jami = kattalar×(op+mk) + bolalar×(bola_op+bola_mk).
+    const conv = (n: number) => (enteredCurrency !== 'USD' && fx) ? Math.round((n / fx.rate) * 100) / 100 : n;
+    const adults = Math.max(1, parseInt(String(data.adults ?? data.pax)) || 1);
+    const children = Math.max(0, parseInt(String(data.children)) || 0);
+    const adultActualPrice = conv(Number(data.adultActualPrice) || 0);
+    const adultMarkup = conv(Number(data.adultMarkup) || 0);
+    const childActualPrice = (data.childActualPrice != null && children > 0) ? conv(Number(data.childActualPrice) || 0) : null;
+    const childMarkup = (data.childMarkup != null && children > 0) ? conv(Number(data.childMarkup) || 0) : null;
+
     // ── Mehmonxonalar (2-5 ta variant, har biriga rasmlar) ──
     let hotels: any[] = Array.isArray(data.hotels)
       ? data.hotels
@@ -90,6 +100,12 @@ export class OffersService {
       departFlightTime: data.departFlightTime || null,
       returnFlightTime: data.returnFlightTime || null,
       pax,
+      adults,
+      children,
+      adultActualPrice,
+      adultMarkup,
+      childActualPrice,
+      childMarkup,
       actualPrice,
       markup,
       clientPrice: clientPriceTotal,
@@ -147,7 +163,13 @@ export class OffersService {
     if (dep || ret) lines.push(`📅 Sana: ${dep || '—'}${ret ? ` — ${ret}` : ''}`);
     if (offer.departFlightTime) lines.push(`✈️ Uchish: ${offer.departFlightTime}`);
 
-    lines.push(`👥 Kishilar soni: ${offer.pax || 1} kishi`);
+    const _adults = offer.adults ?? offer.pax ?? 1;
+    const _children = offer.children ?? 0;
+    if (_children > 0) {
+      lines.push(`👥 Kishilar: ${_adults} katta${_children ? ` + ${_children} bola` : ''}`);
+    } else {
+      lines.push(`👥 Kishilar soni: ${_adults} kishi`);
+    }
     lines.push('');
 
     const hotels = Array.isArray(offer.hotels) ? offer.hotels : [];
@@ -178,8 +200,17 @@ export class OffersService {
       lines.push('');
     }
 
-    lines.push(`💰 1 kishi uchun: ${money(offer.pricePerPerson)}`);
-    lines.push(`💵 Jami narx (${offer.pax || 1} kishi): ${money(offer.clientPrice)}`);
+    // v14: narx — bolalar bo'lsa kattalar/bolalar alohida ko'rsatiladi
+    const adultClientPer = (offer.adultActualPrice ?? 0) + (offer.adultMarkup ?? 0);
+    const childClientPer = (offer.childActualPrice ?? 0) + (offer.childMarkup ?? 0);
+    if (_children > 0 && offer.adultActualPrice != null) {
+      lines.push(`💰 Kattalar: ${_adults} × ${money(adultClientPer)} = ${money(_adults * adultClientPer)}`);
+      lines.push(`🧒 Bolalar: ${_children} × ${money(childClientPer)} = ${money(_children * childClientPer)}`);
+      lines.push(`💵 Jami narx: ${money(offer.clientPrice)}`);
+    } else {
+      lines.push(`💰 1 kishi uchun: ${money(offer.pricePerPerson)}`);
+      lines.push(`💵 Jami narx (${_adults} kishi): ${money(offer.clientPrice)}`);
+    }
 
     if (offer.notes) {
       lines.push('');
