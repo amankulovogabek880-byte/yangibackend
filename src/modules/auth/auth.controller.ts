@@ -28,11 +28,17 @@ const REFRESH_COOKIE = 'omon_rt';
 
 function refreshCookieOptions() {
   const isProd = process.env.NODE_ENV === 'production';
-  const sameSite = (process.env.COOKIE_SAMESITE || 'lax') as 'lax' | 'strict' | 'none';
+  // v14 FIX (refresh qilsa login'ga otib yuborardi): frontend (vercel.app) va
+  // backend BOSHQA domenda — bu CROSS-SITE. SameSite=lax bo'lsa brauzer refresh
+  // cookie'ni cross-site so'rovda YUBORMAYDI, natijada sahifa yangilanganda
+  // /auth/refresh cookie'siz ketib, sessiya tiklanmasdan login'ga otardi.
+  // Endi production'da default 'none' (+secure) — cross-domain'da ishlaydi.
+  // Agar frontend va backend BIR domenda bo'lsa, COOKIE_SAMESITE=lax qo'ying.
+  const sameSite = (process.env.COOKIE_SAMESITE || (isProd ? 'none' : 'lax')) as 'lax' | 'strict' | 'none';
   const days = parseInt((process.env.JWT_REFRESH_EXPIRES || '7d').replace('d', ''), 10) || 7;
   return {
     httpOnly: true,
-    secure: isProd || sameSite === 'none', // sameSite=none faqat secure bilan ishlaydi
+    secure: isProd || sameSite === 'none', // sameSite=none faqat secure (https) bilan ishlaydi
     sameSite,
     domain: process.env.COOKIE_DOMAIN || undefined,
     path: '/api/v1/auth', // cookie faqat auth endpointlariga yuboriladi

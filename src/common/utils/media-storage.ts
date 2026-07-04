@@ -1,4 +1,3 @@
-
 /**
  * v14: Umumiy media saqlash yordamchisi.
  *

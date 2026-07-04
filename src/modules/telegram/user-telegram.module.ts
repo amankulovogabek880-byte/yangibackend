@@ -30,6 +30,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { normalizeChatId, inferChatTypeFromGramjs } from './chat-id.util';
 import { uploadBufferToStorage } from '../../common/utils/media-storage';
+import { toOggOpus } from '../../common/utils/voice-convert';
 
 // Telegram API credentials - admin tomonidan sozlanadi (my.telegram.org dan olinadi)
 // Default: demo credentials (faqat test uchun)
@@ -863,19 +864,46 @@ export class UserTelegramService implements OnModuleInit {
     if (isImage && !/\.(jpg|jpeg|png|gif|webp)$/i.test(fileName)) fileName += '.jpg';
     if (isVoice && !/\.(ogg|oga|mp3|m4a|wav|webm|aac)$/i.test(fileName)) fileName += '.ogg';
 
+    // v14 FIX: Chrome mikrofonda webm/opus yozadi — Telegram voice note esa
+    // ogg/opus xohlaydi. webm bo'lsa Telegram uni HUJJAT qilib yuborardi
+    // ("unnamed.webm papka"). Shu sabab avval ogg/opus'ga o'giramiz — endi
+    // xuddi Telegramникidek yumaloq voice note bo'lib boradi.
+    let voiceBuf = buf;
+    let voiceOk = false;
+    if (isVoice) {
+      const inExt = (fileName.split('.').pop() || 'webm').toLowerCase();
+      if (inExt === 'ogg' || inExt === 'oga') {
+        voiceOk = true; // allaqachon ogg — o'girish shart emas
+      } else {
+        const converted = await toOggOpus(buf, inExt);
+        if (converted) { voiceBuf = converted; voiceOk = true; fileName = fileName.replace(/\.[^.]+$/, '') + '.ogg'; }
+      }
+    }
+
     // v14 FIX: Buffer to'g'ridan-to'g'ri berilsa GramJS uni HUJJAT deb yuboradi.
     // CustomFile (nom + kengaytma bilan) bersak — Telegram turini to'g'ri
     // aniqlaydi (rasm = <img>, ovoz = voice note).
     let CustomFile: any;
     try { ({ CustomFile } = require('telegram/client/uploads')); } catch {}
-    const toSend = CustomFile ? new CustomFile(fileName, buf.length, '', buf) : buf;
+    const sendBuf = isVoice ? voiceBuf : buf;
+    const toSend = CustomFile ? new CustomFile(fileName, sendBuf.length, '', sendBuf) : sendBuf;
 
     let sent: any;
     let finalType: 'VOICE' | 'PHOTO' | 'VIDEO' | 'DOCUMENT' =
       isVoice ? 'VOICE' : isImage ? 'PHOTO' : 'DOCUMENT';
 
     try {
-      if (isVoice) {
+      if (isVoice && voiceOk) {
+        // Haqiqiy ogg/opus voice note
+        sent = await client.sendFile(peer, {
+          file: toSend,
+          caption: caption || '',
+          voiceNote: true,
+          workers: 1,
+        } as any);
+      } else if (isVoice) {
+        // Konvertatsiya bo'lmadi (ffmpeg yo'q) — hech bo'lmasa eshitiladigan
+        // audio fayl sifatida yuboramiz (voice bubble bo'lmasligi mumkin).
         sent = await client.sendFile(peer, {
           file: toSend,
           caption: caption || '',
