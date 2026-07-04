@@ -15,6 +15,7 @@ import { Prisma } from '@prisma/client';
 import { MessageType, Language } from '../../prisma-types';;
 import { normalizeChatId } from './chat-id.util';
 import { uploadBufferToStorage } from '../../common/utils/media-storage';
+import { EncryptionService } from '../../common/encryption/encryption.service';
 
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
@@ -26,6 +27,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     private notifications: NotificationsService,
     private clients: ClientsService,
     private realtime: RealtimeGateway,
+    // v14 XAVFSIZLIK: session shifrini ochish uchun
+    private enc: EncryptionService,
   ) {}
 
   async onModuleInit() {
@@ -726,7 +729,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       try {
         const apiId = parseInt(acct.apiId || process.env.TELEGRAM_API_ID || '2040');
         const apiHash = acct.apiHash || process.env.TELEGRAM_API_HASH || '';
-        const session = acct.sessionData || '';
+        const session = this.enc.decrypt(acct.sessionData) || '';
         client2 = new TelegramClient(new StringSession(session), apiId, apiHash, {
           connectionRetries: 3, useWSS: false,
         });

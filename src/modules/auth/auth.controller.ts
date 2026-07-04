@@ -66,6 +66,9 @@ export class AuthController {
 
   // ─── PUBLIC ENDPOINTS ────────────────────────────────────
 
+  // v14 XAVFSIZLIK: login brute-force himoyasi — 1 daqiqada 5 urinish (IP bo'yicha).
+  // Global throttle (100/60s) parol tахmin qilishga juda bo'sh edi.
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
   @Post('login')
   @Public()
   @UseGuards(LoginRateLimitGuard)
@@ -206,6 +209,7 @@ export class AuthController {
     return this.auth.forgotPassword(body.email);
   }
 
+  @Throttle({ default: { limit: 5, ttl: 3600000 } })
   @Post('reset-password')
   @Public()
   @HttpCode(200)

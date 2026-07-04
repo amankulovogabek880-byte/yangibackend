@@ -23,6 +23,7 @@ import { StringSession } from 'telegram/sessions';
 import { Api } from 'telegram/tl';
 import { NewMessage, NewMessageEvent } from 'telegram/events';
 import { PrismaService } from '../../prisma/prisma.service';
+import { EncryptionService } from '../../common/encryption/encryption.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
@@ -49,6 +50,10 @@ export class UserTelegramService implements OnModuleInit {
   constructor(
     private prisma: PrismaService,
     private realtime: RealtimeGateway,
+    // v14 XAVFSIZLIK: MTProto session string = parol kuchida. Bazada AES-256-GCM
+    // bilan SHIFRLAB saqlaymiz. decrypt() eski shifrlanmagan sessiyalarni ham
+    // (backward-compat) o'qiy oladi, shu sabab migratsiya shart emas.
+    private enc: EncryptionService,
   ) {}
 
   async onModuleInit() {
@@ -73,7 +78,7 @@ export class UserTelegramService implements OnModuleInit {
     try {
       const apiId = parseInt(acc.apiId || String(DEFAULT_API_ID));
       const apiHash = acc.apiHash || DEFAULT_API_HASH;
-      const session = new StringSession(acc.sessionData);
+      const session = new StringSession(this.enc.decrypt(acc.sessionData) || '');
       const client = new TelegramClient(session, apiId, apiHash, {
         connectionRetries: 3,
         useWSS: false,
@@ -295,7 +300,7 @@ export class UserTelegramService implements OnModuleInit {
           isPersonal: true,
           isActive: true,
           phoneNumber: phone,
-          sessionData: sessionString,
+          sessionData: this.enc.encrypt(sessionString),
           apiId: String(apiId),
           apiHash,
           channel: 'TELEGRAM',
@@ -309,7 +314,7 @@ export class UserTelegramService implements OnModuleInit {
         update: {
           name: [me.firstName, me.lastName].filter(Boolean).join(' ') || me.username || phone,
           isActive: true,
-          sessionData: sessionString,
+          sessionData: this.enc.encrypt(sessionString),
           apiId: String(apiId),
           apiHash,
           config: {
@@ -376,12 +381,12 @@ export class UserTelegramService implements OnModuleInit {
           tenantId, userId,
           name: [me.firstName, me.lastName].filter(Boolean).join(' ') || phone,
           isPersonal: true, isActive: true, phoneNumber: phone,
-          sessionData: sessionString, apiId: String(apiId), apiHash,
+          sessionData: this.enc.encrypt(sessionString), apiId: String(apiId), apiHash,
           channel: 'TELEGRAM',
           config: { username: me.username, telegramId: String(me.id) },
         },
         update: {
-          isActive: true, sessionData: sessionString,
+          isActive: true, sessionData: this.enc.encrypt(sessionString),
           name: [me.firstName, me.lastName].filter(Boolean).join(' ') || phone,
           config: { username: me.username, telegramId: String(me.id) },
         },
