@@ -111,6 +111,12 @@ export class OffersService {
       includesTransfer: data.includesTransfer || false,
       includesInsurance: data.includesInsurance || false,
       notes: data.notes || null,
+      // v14: taklifga havola (Booking.com va h.k.) — mijozga yuborilganda Telegram
+      // avtomatik preview qiladi. URL to'g'ri formatda bo'lsagina saqlaymiz.
+      bookingLink: (() => {
+        const l = (data.bookingLink || '').toString().trim();
+        return /^https?:\/\//i.test(l) ? l : null;
+      })(),
     };
   }
 
@@ -178,6 +184,12 @@ export class OffersService {
     if (offer.notes) {
       lines.push('');
       lines.push(`📝 ${offer.notes}`);
+    }
+
+    // v14: havola — Telegram uni avtomatik preview (rasm+sarlavha) qilib ko'rsatadi
+    if (offer.bookingLink) {
+      lines.push('');
+      lines.push(`🔗 Batafsil: ${offer.bookingLink}`);
     }
 
     lines.push('');
