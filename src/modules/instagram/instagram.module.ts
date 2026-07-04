@@ -1,7 +1,7 @@
 import { RoundRobinService, RoundRobinModule } from '../v9/round-robin.module';
 import {
   Module, Injectable, Controller,
-  Get, Post, Body, Query, Param, Req,
+  Get, Post, Body, Query, Req,
   UseGuards, Logger, BadRequestException,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
@@ -93,21 +93,65 @@ export class InstagramService {
         },
       },
     });
+
+    // MUHIM: faqat Access Token/Page ID saqlash yetarli emas — Meta shu
+    // Page/Instagram akkauntini ilovamizga obuna qilishimizni talab qiladi.
+    // Shu chaqiruvsiz webhook hech qachon kelmaydi, token to'g'ri bo'lsa ham.
+    const accessToken = data.accessToken ?? cur.instagramAccessToken;
+    const pageId = data.pageId ?? cur.instagramPageId;
+    if (accessToken && pageId) {
+      await this.subscribeAppToPage(pageId, accessToken);
+    }
+
     return this.getConfig(tenantId);
   }
 
-  verifyWebhook(tenantId: string, mode: string, token: string, challenge: string, verifyToken: string) {
-    if (mode === 'subscribe' && token === (verifyToken || 'omoncrm_verify')) {
+  /** Page/Instagram akkauntini shu Meta ilovamizga webhook uchun obuna qiladi. */
+  private async subscribeAppToPage(pageId: string, accessToken: string) {
+    try {
+      const url = `https://graph.facebook.com/v18.0/${pageId}/subscribed_apps` +
+        `?subscribed_fields=messages,messaging_postbacks` +
+        `&access_token=${encodeURIComponent(accessToken)}`;
+      const res = await fetch(url, { method: 'POST' });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || json?.success === false) {
+        this.logger.error('Instagram subscribe_apps xato: ' + JSON.stringify(json));
+      } else {
+        this.logger.log('Instagram: Page ' + pageId + ' ilovaga obuna qilindi');
+      }
+    } catch (e: any) {
+      this.logger.error('Instagram subscribe_apps error: ' + e.message);
+    }
+  }
+
+  /**
+   * MUHIM: Meta bitta App uchun faqat BITTA webhook callback URL qabul qiladi.
+   * Shuning uchun manzil tenantId bilan emas — global bo'lishi kerak, va har bir
+   * kelgan xabar ichidagi Page/Instagram ID orqali tegishli tenant topiladi.
+   */
+  verifyWebhook(mode: string, token: string, challenge: string) {
+    const expected = process.env.INSTAGRAM_VERIFY_TOKEN || 'omoncrm_verify';
+    if (mode === 'subscribe' && token === expected) {
       return challenge;
     }
     throw new BadRequestException('Webhook verification failed');
   }
 
-  async processWebhook(tenantId: string, body: any, signature?: string, rawBody?: Buffer) {
+  /** entry.id (Page/Instagram Business Account ID) bo'yicha tenantni topadi. */
+  private async findTenantByPageId(pageId: string): Promise<string | null> {
+    if (!pageId) return null;
+    const tenants = await this.prisma.tenant.findMany({ select: { id: true, settings: true } });
+    for (const t of tenants) {
+      const s: any = t.settings || {};
+      if (s.instagramPageId === pageId) return t.id;
+    }
+    return null;
+  }
+
+  async processWebhook(body: any, signature?: string, rawBody?: Buffer) {
     if (body?.object !== 'instagram' && body?.object !== 'page') return { ok: true };
     // Meta signature verification (X-Hub-Signature-256 header).
-    // Meta imzoni App Secret bilan hisoblaydi (Page Access Token emas!),
-    // shuning uchun alohida INSTAGRAM_APP_SECRET env kerak.
+    // Meta imzoni App Secret bilan hisoblaydi (Page Access Token emas!).
     const appSecret = process.env.INSTAGRAM_APP_SECRET;
     if (signature && appSecret && rawBody) {
       try {
@@ -130,6 +174,13 @@ export class InstagramService {
     this.logger.log('Instagram webhook received: ' + JSON.stringify(body).slice(0, 300));
     const entries: any[] = body?.entry || [];
     for (const entry of entries) {
+      // entry.id — shu xabarni qabul qilgan Page/Instagram Business Account ID.
+      const pageId: string = entry?.id;
+      const tenantId = await this.findTenantByPageId(pageId);
+      if (!tenantId) {
+        this.logger.warn('Instagram webhook: pageId=' + pageId + ' uchun tenant topilmadi (Sozlamalarda Page ID ni tekshiring)');
+        continue;
+      }
       for (const event of (entry?.messaging || [])) {
         if (event?.message && !event.message.is_echo) {
           await this.handleMessage(tenantId, event).catch((e: any) =>
@@ -327,28 +378,48 @@ export class InstagramService {
 export class InstagramController {
   constructor(private svc: InstagramService) {}
 
-  @Get('webhook/:tenantId')
+  // ── YANGI: global webhook (BARCHA tenantlar uchun bitta manzil) ──────────
+  // Meta App darajasida faqat bitta callback URL bo'lishi mumkin, shuning
+  // uchun tenant POST body ichidagi Page ID orqali avtomatik aniqlanadi.
+  @Get('webhook')
   @Public()
-  async verifyWebhook(
-    @Param('tenantId') tenantId: string,
+  verifyWebhookGlobal(
     @Query('hub.mode') mode: string,
     @Query('hub.verify_token') token: string,
     @Query('hub.challenge') challenge: string,
   ) {
-    const config = await this.svc.getConfig(tenantId);
-    return this.svc.verifyWebhook(tenantId, mode, token, challenge, config.verifyToken);
+    return this.svc.verifyWebhook(mode, token, challenge);
+  }
+
+  @Post('webhook')
+  @Public()
+  webhookGlobal(@Body() body: any, @Req() req: any) {
+    const sig = req.headers['x-hub-signature-256'] as string | undefined;
+    const rawBody: Buffer | undefined = req.rawBody;
+    return this.svc.processWebhook(body, sig, rawBody);
+  }
+
+  // ── ESKI manzil (moslik uchun qoldirilgan) ────────────────────────────────
+  // Eski `/instagram/webhook/:tenantId` manzilini Meta'ga kiritgan bo'lsangiz
+  // ham ishlashda davom etadi — lekin :tenantId e'tiborga olinmaydi, tenant
+  // baribir Page ID orqali topiladi. Yangi o'rnatishlar uchun yuqoridagi
+  // global `/instagram/webhook` manzilidan foydalaning.
+  @Get('webhook/:tenantId')
+  @Public()
+  verifyWebhookLegacy(
+    @Query('hub.mode') mode: string,
+    @Query('hub.verify_token') token: string,
+    @Query('hub.challenge') challenge: string,
+  ) {
+    return this.svc.verifyWebhook(mode, token, challenge);
   }
 
   @Post('webhook/:tenantId')
   @Public()
-  webhook(
-    @Param('tenantId') tenantId: string,
-    @Body() body: any,
-    @Req() req: any,
-  ) {
+  webhookLegacy(@Body() body: any, @Req() req: any) {
     const sig = req.headers['x-hub-signature-256'] as string | undefined;
     const rawBody: Buffer | undefined = req.rawBody;
-    return this.svc.processWebhook(tenantId, body, sig, rawBody);
+    return this.svc.processWebhook(body, sig, rawBody);
   }
 
   @ApiOperation({ summary: 'Instagram bot sozlamalarini olish' })
