@@ -36,6 +36,9 @@ export class UsersService {
         totalBookings: true, totalRevenue: true, totalClients: true,
         conversionRate: true,
         lastLoginAt: true, lastSeenAt: true, createdAt: true,
+        // v14 FIX: pauza holati ro'yxatga qaytmasdi — shuning uchun "Agentlarni
+        // boshqarish"da pauza ko'rinmas va ochib bo'lmasdi (pauza qilib bo'lmayapti).
+        isPausedFromAssignment: true, dailyLeadLimit: true, pausedUntil: true,
         _count: { select: { assignedClients: true, bookings: true } },
       },
       orderBy: [{ status: 'asc' }, { name: 'asc' }],

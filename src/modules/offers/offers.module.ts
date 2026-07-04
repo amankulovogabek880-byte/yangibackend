@@ -360,55 +360,53 @@ export class OffersService {
 
     let deliveryInfo: { via: 'bot' | 'personal'; conversationId: string };
 
-    if (existingConv && !(existingConv as any).account?.isPersonal && existingConv.accountId) {
-      // Mavjud suhbat — umumiy (bot) akkaunt orqali borayapti, shu yerdan davom etamiz
-      await this.telegram.sendMessage(tenantId, existingConv.id, text, agentId, role, false);
-      deliveryInfo = { via: 'bot', conversationId: existingConv.id };
-    } else {
-      // Mavjud suhbat shaxsiy akkauntdan borayapti YOKI umuman suhbat yo'q (birinchi xabar)
-      // — ikkala holatda ham agentning shaxsiy Telegram akkaunti orqali yuboramiz.
-      const result = await this.userTelegram.sendPersonalMessage(tenantId, agentId, {
-        conversationId: existingConv?.id,
-        username: !existingConv ? (client.telegramUsername || undefined) : undefined,
-        phone: !existingConv ? (client.phone || undefined) : undefined,
-        userId: !existingConv ? (client.telegramId || undefined) : undefined,
-        text,
-        clientId,
-      });
-      deliveryInfo = { via: 'personal', conversationId: result.conversationId };
-    }
-
-    // v11: Taklif matni bilan birga mehmonxona rasmlari ham ketsin —
-    // avval faqat matn yuborilardi, rasmlar hech qachon klientga
-    // yetib bormasdi. Endi har bir mehmonxonaning rasmlari, nomi
-    // (va yulduzlari) caption sifatida, alohida xabar bo'lib ketadi.
+    // v14: taklif rasmlarini yig'amiz — endi bittalab EMAS, BITTA ALBOM bo'lib ketadi
     const hotelsForPhotos = Array.isArray(offer.hotels) ? offer.hotels : [];
-    let photosSent = 0;
-    let photosFailed = 0;
+    const allPhotos: string[] = [];
     for (const h of hotelsForPhotos) {
-      const photos: string[] = Array.isArray(h?.photos) ? h.photos.slice(0, 6) : [];
-      if (!photos.length) continue;
-      const stars = h.stars ? ' ' + '⭐'.repeat(Math.min(7, Number(h.stars))) : '';
-      for (const photoUrl of photos) {
+      if (Array.isArray(h?.photos)) for (const p of h.photos) if (p) allPhotos.push(p);
+    }
+    const photoList = allPhotos.slice(0, 10); // Telegram albom limiti 10
+
+    const isBotConv = !!(existingConv && !(existingConv as any).account?.isPersonal && existingConv.accountId);
+    // Bitta xabar: mavjud shaxsiy suhbat + rasm(lar) bor + matn caption'ga sig'adi
+    const oneMessageAlbum = !!existingConv && !isBotConv && photoList.length > 0 && text.length <= 1024;
+
+    if (oneMessageAlbum) {
+      // v14: HAMMASI BITTA XABARDA — matn caption, rasmlar flexible albom
+      await this.userTelegram.sendMediaGroup(tenantId, agentId, existingConv!.id, photoList, text);
+      deliveryInfo = { via: 'personal', conversationId: existingConv!.id };
+    } else {
+      // 1) Avval matn (link preview shu yerda saqlanadi)
+      if (isBotConv) {
+        await this.telegram.sendMessage(tenantId, existingConv!.id, text, agentId, role, false);
+        deliveryInfo = { via: 'bot', conversationId: existingConv!.id };
+      } else {
+        const result = await this.userTelegram.sendPersonalMessage(tenantId, agentId, {
+          conversationId: existingConv?.id,
+          username: !existingConv ? (client.telegramUsername || undefined) : undefined,
+          phone: !existingConv ? (client.phone || undefined) : undefined,
+          userId: !existingConv ? (client.telegramId || undefined) : undefined,
+          text,
+          clientId,
+        });
+        deliveryInfo = { via: 'personal', conversationId: result.conversationId };
+      }
+
+      // 2) Rasmlar — shaxsiy: BITTA ALBOM; bot: bittalab
+      if (photoList.length) {
         try {
-          if (deliveryInfo.via === 'bot') {
-            await this.telegram.sendMedia(tenantId, deliveryInfo.conversationId, agentId, role, {
-              fileUrl: photoUrl,
-              mediaType: 'photo',
-              caption: `🏨 ${h.name}${stars}`,
-            });
+          if (deliveryInfo.via === 'personal') {
+            await this.userTelegram.sendMediaGroup(tenantId, agentId, deliveryInfo.conversationId, photoList, '');
           } else {
-            await this.userTelegram.sendMedia(tenantId, agentId, deliveryInfo.conversationId, photoUrl, `🏨 ${h.name}${stars}`);
+            for (const photoUrl of photoList) {
+              await this.telegram.sendMedia(tenantId, deliveryInfo.conversationId, agentId, role, {
+                fileUrl: photoUrl, mediaType: 'photo', caption: '',
+              }).catch((e: any) => this.logger.warn(`Taklif rasmi (bot) yuborilmadi: ${e?.message || e}`));
+            }
           }
-          photosSent++;
         } catch (e: any) {
-          photosFailed++;
-          // Bitta rasm yuborilmasa ham qolganlari va matn allaqachon ketgan —
-          // butun taklifni bekor qilmaymiz, lekin sababini logga yozamiz —
-          // aks holda nima uchun rasm ketmaganini hech qachon bilib bo'lmaydi.
-          this.logger.warn(
-            `Taklif rasmi yuborilmadi (offerId=${offerId}, hotel=${h.name}, via=${deliveryInfo.via}, url=${photoUrl}): ${e?.message || e}`,
-          );
+          this.logger.warn(`Taklif albomi yuborilmadi (offerId=${offerId}): ${e?.message || e}`);
         }
       }
     }
@@ -440,7 +438,7 @@ export class OffersService {
       } as any,
     }).catch(() => {});
 
-    return { success: true, ...deliveryInfo, photosSent, photosFailed };
+    return { success: true, ...deliveryInfo, photosSent: photoList.length };
   }
 
   /**

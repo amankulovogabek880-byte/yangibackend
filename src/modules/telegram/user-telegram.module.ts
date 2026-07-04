@@ -992,6 +992,69 @@ export class UserTelegramService implements OnModuleInit {
     return this.sendPersonalMedia(tenantId, agentId, conversationId, fileUrl, caption, mediaType);
   }
 
+  // v14: TAKLIF uchun — bir nechta rasmni BITTA ALBOM (media group) qilib yuboramiz,
+  // caption (taklif matni) birinchi rasmга yoziladi. Shunda "hammasi bitta xabarda",
+  // rasmlar esa Telegram avtomatik flexible grid qilib joylashtiradi.
+  async sendMediaGroup(tenantId: string, agentId: string, conversationId: string, photoUrls: string[], caption?: string) {
+    const conv = await this.prisma.conversation.findFirst({ where: { id: conversationId, tenantId } });
+    if (!conv) throw new NotFoundException('Suhbat topilmadi');
+    const account = await this.getSharedAccount(tenantId);
+    if (!account) throw new BadRequestException('Kompaniya Telegram accounti ulanmagan');
+
+    let client = activeSessions.get(account.id);
+    if (!client || !(await client.isUserAuthorized().catch(() => false))) {
+      client = await this.restoreSession(account) || undefined;
+      if (!client) throw new BadRequestException('Session yaroqsiz');
+    }
+    const peer = await client.getInputEntity(conv.externalChatId);
+
+    const axios = require('axios');
+    let CustomFile: any;
+    try { ({ CustomFile } = require('telegram/client/uploads')); } catch {}
+
+    const files: any[] = [];
+    for (const url of photoUrls.slice(0, 10)) {
+      try {
+        const resp = await axios.get(url, { responseType: 'arraybuffer' });
+        const buf = Buffer.from(resp.data);
+        let name = url.split('/').pop()?.split('?')[0] || `p_${Date.now()}.jpg`;
+        if (!/\.(jpg|jpeg|png|gif|webp)$/i.test(name)) name += '.jpg';
+        files.push(CustomFile ? new CustomFile(name, buf.length, '', buf) : buf);
+      } catch (e: any) {
+        this.logger.warn(`Albom rasmi yuklab olinmadi (${url}): ${e?.message || e}`);
+      }
+    }
+    if (!files.length) return null;
+
+    const cap = (caption || '').slice(0, 1024); // Telegram caption limiti
+    // GramJS: file = massiv → ALBOM. caption birinchi elementга yoziladi.
+    const sent = await client.sendFile(peer, {
+      file: files,
+      caption: cap,
+      forceDocument: false,
+      workers: 1,
+    } as any);
+
+    const savedMsg = await this.prisma.message.create({
+      data: {
+        conversationId: conv.id, agentId,
+        direction: 'OUTBOUND', messageType: 'PHOTO' as any,
+        text: caption || '',
+        fileUrl: photoUrls[0],
+        externalMsgId: String(Date.now()),
+        isDelivered: true,
+      } as any,
+      include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
+    });
+    await this.prisma.conversation.update({
+      where: { id: conv.id },
+      data: { lastMessageAt: new Date(), lastMessageText: (caption || '📷 Rasmlar').slice(0, 200), lastMessageType: 'PHOTO' as any, accountId: account.id },
+    });
+    this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId || agentId, 'message:new', savedMsg);
+    this.realtime.emitToConversation(conv.id, 'message:new', savedMsg);
+    return savedMsg;
+  }
+
   // ─── v11 FIX: Shablon yuborish (shaxsiy akkaunt orqali) ──────────────────
   // Ilgari "Shablon" tugmasi shaxsiy (isPersonal) suhbatlarda ham har doim
   // BOT endpointiga (`/telegram/conversations/:id/template/:id`) yuborardi —
