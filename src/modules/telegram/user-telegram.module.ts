@@ -29,6 +29,7 @@ import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { normalizeChatId, inferChatTypeFromGramjs } from './chat-id.util';
+import { uploadBufferToStorage } from '../../common/utils/media-storage';
 
 // Telegram API credentials - admin tomonidan sozlanadi (my.telegram.org dan olinadi)
 // Default: demo credentials (faqat test uchun)
@@ -163,32 +164,34 @@ export class UserTelegramService implements OnModuleInit {
   ): Promise<{ messageType: string; fileUrl?: string; duration?: number }> {
     let messageType = 'TEXT';
     let ext = 'bin';
+    let contentType = 'application/octet-stream';
     let duration: number | undefined;
     try {
       if (msg.voice) {
-        messageType = 'VOICE'; ext = 'ogg';
+        messageType = 'VOICE'; ext = 'ogg'; contentType = 'audio/ogg';
         const attr = (msg.voice.attributes || []).find(
           (a: any) => a.className === 'DocumentAttributeAudio',
         );
         duration = attr?.duration;
       } else if (msg.videoNote) {
-        messageType = 'VIDEO'; ext = 'mp4';
+        messageType = 'VIDEO'; ext = 'mp4'; contentType = 'video/mp4';
       } else if (msg.video || msg.gif) {
-        messageType = 'VIDEO'; ext = 'mp4';
+        messageType = 'VIDEO'; ext = 'mp4'; contentType = 'video/mp4';
       } else if (msg.audio) {
-        messageType = 'VOICE'; ext = 'mp3';
+        messageType = 'VOICE'; ext = 'mp3'; contentType = 'audio/mpeg';
         const attr = (msg.audio.attributes || []).find(
           (a: any) => a.className === 'DocumentAttributeAudio',
         );
         duration = attr?.duration;
       } else if (msg.photo) {
-        messageType = 'PHOTO'; ext = 'jpg';
+        messageType = 'PHOTO'; ext = 'jpg'; contentType = 'image/jpeg';
       } else if (msg.document) {
         messageType = 'DOCUMENT';
         const nameAttr = (msg.document.attributes || []).find(
           (a: any) => a.className === 'DocumentAttributeFilename',
         );
         ext = nameAttr?.fileName?.split('.').pop() || 'bin';
+        contentType = (msg.document.mimeType) || 'application/octet-stream';
       } else {
         return { messageType: 'TEXT' };
       }
@@ -196,14 +199,9 @@ export class UserTelegramService implements OnModuleInit {
       const buf = (await client.downloadMedia(msg, {} as any)) as Buffer;
       if (!buf || !buf.length) return { messageType, duration };
 
-      const fs = require('fs');
-      const path = require('path');
-      const uploadDir = process.env.UPLOAD_DIR || './uploads';
-      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-      const fileName = `tg_p_in_${key}_${Date.now()}.${ext}`;
-      fs.writeFileSync(path.join(uploadDir, fileName), buf);
-      const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
-      return { messageType, fileUrl: `${baseUrl}/uploads/${fileName}`, duration };
+      // v14: kiruvchi media'ni ham Supabase'ga (doimiy, yetib boradigan URL)
+      const fileUrl = await uploadBufferToStorage(buf, `tg_p_in_${key}_${Date.now()}.${ext}`, contentType);
+      return { messageType, fileUrl, duration };
     } catch (e: any) {
       this.logger.warn(`downloadIncomingMedia xato (key=${key}): ${e?.message || e}`);
       return { messageType, duration };
@@ -852,12 +850,25 @@ export class UserTelegramService implements OnModuleInit {
     const axios = require('axios');
     const resp = await axios.get(fileUrl, { responseType: 'arraybuffer' });
     const buf = Buffer.from(resp.data);
-    const fileName = fileUrl.split('/').pop()?.split('?')[0] || `file_${Date.now()}`;
+    let fileName = fileUrl.split('/').pop()?.split('?')[0] || `file_${Date.now()}`;
     const isImage = mediaType === 'photo' || !!fileName.match(/\.(jpg|jpeg|png|gif|webp)$/i);
     // v14: OVOZLI XABAR — inboxda mikrofonda yozilgani (audio/webm|ogg). Telegramga
     // "voice note" sifatida yuborishga urinamiz; format qabul qilinmasa — oddiy
     // audio fayl sifatida yuboramiz (baribir eshitiladi).
     const isVoice = mediaType === 'voice' || !!fileName.match(/\.(ogg|oga|webm|mp3|m4a|wav|aac)$/i);
+
+    // v14 FIX: URL'da kengaytma bo'lmasa (Supabase path), Telegram rasm/ovozni
+    // TANIY OLMAY hujjat qilib yuborardi ("OPEN WITH" / "unnamed"). Endi mos
+    // kengaytmani majburan qo'shamiz — shunda rasm rasm, ovoz ovoz bo'ladi.
+    if (isImage && !/\.(jpg|jpeg|png|gif|webp)$/i.test(fileName)) fileName += '.jpg';
+    if (isVoice && !/\.(ogg|oga|mp3|m4a|wav|webm|aac)$/i.test(fileName)) fileName += '.ogg';
+
+    // v14 FIX: Buffer to'g'ridan-to'g'ri berilsa GramJS uni HUJJAT deb yuboradi.
+    // CustomFile (nom + kengaytma bilan) bersak — Telegram turini to'g'ri
+    // aniqlaydi (rasm = <img>, ovoz = voice note).
+    let CustomFile: any;
+    try { ({ CustomFile } = require('telegram/client/uploads')); } catch {}
+    const toSend = CustomFile ? new CustomFile(fileName, buf.length, '', buf) : buf;
 
     let sent: any;
     let finalType: 'VOICE' | 'PHOTO' | 'VIDEO' | 'DOCUMENT' =
@@ -866,16 +877,24 @@ export class UserTelegramService implements OnModuleInit {
     try {
       if (isVoice) {
         sent = await client.sendFile(peer, {
-          file: buf,
+          file: toSend,
           caption: caption || '',
           voiceNote: true,
           workers: 1,
         } as any);
+      } else if (isImage) {
+        // forceDocument: false + rasm kengaytmasi → Telegram RASM sifatida ko'rsatadi
+        sent = await client.sendFile(peer, {
+          file: toSend,
+          caption: caption || '',
+          forceDocument: false,
+          workers: 1,
+        } as any);
       } else {
         sent = await client.sendFile(peer, {
-          file: buf,
+          file: toSend,
           caption: caption || '',
-          forceDocument: !isImage,
+          forceDocument: true,
           workers: 1,
           attributes: [{ className: 'DocumentAttributeFilename', fileName }] as any,
         } as any);
@@ -885,7 +904,7 @@ export class UserTelegramService implements OnModuleInit {
       if (isVoice) {
         this.logger.warn('Voice note yuborilmadi, oddiy audio sifatida urinilyapti: ' + e?.message);
         sent = await client.sendFile(peer, {
-          file: buf,
+          file: toSend,
           caption: caption || '',
           forceDocument: false,
           workers: 1,

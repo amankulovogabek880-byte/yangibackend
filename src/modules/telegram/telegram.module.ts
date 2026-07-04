@@ -14,6 +14,7 @@ import { paginate, meta } from '../../common/utils/helpers';
 import { Prisma } from '@prisma/client';
 import { MessageType, Language } from '../../prisma-types';;
 import { normalizeChatId } from './chat-id.util';
+import { uploadBufferToStorage } from '../../common/utils/media-storage';
 
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
@@ -182,15 +183,14 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       const axios = require('axios');
       const resp = await axios.get(fileLink, { responseType: 'arraybuffer' });
 
-      const fs = require('fs');
-      const path = require('path');
-      const uploadDir = process.env.UPLOAD_DIR || './uploads';
-      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
-      const fileName = `tg_in_${key}_${Date.now()}.${ext}`;
-      fs.writeFileSync(path.join(uploadDir, fileName), Buffer.from(resp.data));
-      const baseUrl = process.env.API_BASE_URL || 'http://localhost:3000';
-      return `${baseUrl}/uploads/${fileName}`;
+      // v14 FIX: mahalliy disk o'rniga Supabase (doimiy, yetib boradigan URL) —
+      // aks holda kiruvchi ovoz/rasm Render restartida yo'qolar yoki umuman ochilmasdi.
+      const contentType =
+        ext === 'ogg' ? 'audio/ogg'
+        : ext === 'jpg' ? 'image/jpeg'
+        : ext === 'mp4' ? 'video/mp4'
+        : 'application/octet-stream';
+      return await uploadBufferToStorage(Buffer.from(resp.data), `tg_in_${key}_${Date.now()}.${ext}`, contentType);
     } catch (e: any) {
       this.logger.warn(`saveIncomingFile xato (fileId=${fileId}): ${e?.message || e}`);
       return undefined;
