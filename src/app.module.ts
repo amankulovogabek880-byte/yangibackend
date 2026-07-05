@@ -23,6 +23,7 @@ import { ClientsModule } from './modules/clients/clients.module';
 import { PipelineModule } from './modules/pipeline/pipeline.module';
 import { OffersModule } from './modules/offers/offers.module';
 import { InstagramModule } from './modules/instagram/instagram.module';
+import { FacebookLeadsModule } from './modules/facebook-leads/facebook-leads.module';   // ← YANGI
 import { BookingsModule } from './modules/bookings/bookings.module';
 import { PaymentsModule } from './modules/payments/payments.module';
 // v11 FIX: TelegramPersonalModule (eski) olib tashlandi — u UserTelegramModule
@@ -87,6 +88,7 @@ import { ExchangeRateModule } from './modules/exchange-rate/exchange-rate.module
     PipelineModule,
     OffersModule,
     InstagramModule,
+    FacebookLeadsModule,   // ← YANGI
     BookingsModule,
     PaymentsModule,
     TelegramModule,
