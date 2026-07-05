@@ -118,7 +118,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private async pickAgent(tenantId: string): Promise<string | null> {
     let agents = await this.prisma.user.findMany({
       where: {
-        tenantId, role: { in: ['AGENT', 'MANAGER'] }, status: 'ACTIVE',
+        tenantId, role: { in: ['AGENT', 'MANAGER', 'TENANT_ADMIN'] }, status: 'ACTIVE',
         // v14: pauza qilingan agent (ta'til/kasal) lead OLMAYDI
         isPausedFromAssignment: false,
       },
