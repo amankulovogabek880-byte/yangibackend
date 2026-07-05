@@ -16,6 +16,7 @@ import { MessageType, Language } from '../../prisma-types';;
 import { normalizeChatId } from './chat-id.util';
 import { uploadBufferToStorage } from '../../common/utils/media-storage';
 import { EncryptionService } from '../../common/encryption/encryption.service';
+import { UserTelegramModule, UserTelegramService } from './user-telegram.module';
 
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
@@ -29,6 +30,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     private realtime: RealtimeGateway,
     // v14 XAVFSIZLIK: session shifrini ochish uchun
     private enc: EncryptionService,
+    // v14: shaxsiy (MTProto) suhbatларга invoice/booking/xabar yuborish uchun
+    private userTelegram: UserTelegramService,
   ) {}
 
   async onModuleInit() {
@@ -441,6 +444,18 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           data: { assignedAgentId: agentId },
         });
       }
+    }
+
+    // v14 FIX: shaxsiy (MTProto) account orqali kelgan suhbatда BOT ishlamaydi
+    // ("Bot aktiv emas"). Bunday suhbatда (invoice/booking "Mijozga yuborish" ham)
+    // to'liq userTelegram (MTProto) orqali — mijoz qaysi accountда yozayotgan
+    // bo'lsa, o'sha (umumiy shaxsiy) account orqali javob ketadi.
+    if (!isInternal && conv.channel === 'TELEGRAM' && (conv as any).account?.isPersonal) {
+      return this.userTelegram.sendPersonalMessage(tenantId, agentId, {
+        conversationId,
+        text,
+        clientId: conv.clientId || undefined,
+      });
     }
 
     const msg = await this.prisma.message.create({
@@ -1575,6 +1590,7 @@ export class TelegramController {
 }
 
 @Module({
+  imports: [UserTelegramModule],
   controllers: [TelegramController],
   providers: [TelegramService, ClientsService],
   exports: [TelegramService],
