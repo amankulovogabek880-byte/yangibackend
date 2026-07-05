@@ -412,9 +412,6 @@ export class OffersService {
         }
       }
     }
-    if (photosFailed > 0) {
-      this.logger.warn(`Taklif ${offerId}: ${photosSent} ta rasm yuborildi, ${photosFailed} ta yuborilmadi`);
-    }
 
     prefs.offers = list.map((o: any) =>
       o.id === offerId ? { ...o, status: 'SENT', sentAt: new Date().toISOString(), sentVia: deliveryInfo.via } : o
