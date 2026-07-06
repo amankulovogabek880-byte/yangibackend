@@ -559,7 +559,7 @@ export class ReportsService {
     const agentIds = agents.map((a) => a.id);
 
     // N+1 o'rniga bitta groupBy query — optimallashtirish
-    const [bookingStats, leadsStats] = await Promise.all([
+    const [bookingStats, leadsStats, convertedStats] = await Promise.all([
       this.prisma.booking.groupBy({
         by: ['agentId'],
         where: { tenantId, agentId: { in: agentIds }, createdAt: { gte: fromDate, lte: toDate }, status: { not: 'CANCELLED' } },
@@ -572,15 +572,26 @@ export class ReportsService {
         where: { tenantId, assignedAgentId: { in: agentIds }, createdAt: { gte: fromDate, lte: toDate } },
         _count: { id: true },
       }),
+      // Konversiya uchun: booking QILGAN unikal mijozlar (jami davr) — agent kartasi bilan bir xil ta'rif
+      this.prisma.client.groupBy({
+        by: ['assignedAgentId'],
+        where: { tenantId, assignedAgentId: { in: agentIds }, bookings: { some: { status: { not: 'CANCELLED' } } } },
+        _count: { id: true },
+      }),
     ]);
 
     const bookingCountMap = new Map(bookingStats.map((b: any) => [b.agentId, b._count.id as number]));
     const leadCountMap = new Map(leadsStats.map((l: any) => [l.assignedAgentId, l._count.id as number]));
+    const convertedMap = new Map(convertedStats.map((c: any) => [c.assignedAgentId, c._count.id as number]));
 
     return agents.map((a) => {
       const bookingsInPeriod: number = (bookingCountMap.get(a.id) as number) || 0;
       const leadsInPeriod: number = (leadCountMap.get(a.id) as number) || 0;
-      const conversion = leadsInPeriod > 0 ? Math.round((bookingsInPeriod / leadsInPeriod) * 100) : 0;
+      // Konversiya = booking qilgan mijozlar / jami mijozlar (jami davr) — agent
+      // kartasidagi bilan AYNAN bir xil. 100% dan oshmaydi.
+      const convertedClients: number = (convertedMap.get(a.id) as number) || 0;
+      const totalClients: number = a._count.assignedClients || 0;
+      const conversion = totalClients > 0 ? Math.round((convertedClients / totalClients) * 100) : 0;
       // Agent booking stats
       const agentBookingStat = bookingStats.find((b: any) => b.agentId === a.id) as any;
       const agentRevenue = agentBookingStat?._sum?.totalPrice || 0;
@@ -780,6 +791,8 @@ export class ReportsService {
       // Active suhbatlar
       activeChats,
       kpiTenantFromPA, // BUG9: parallel so'rov
+      // Konversiya uchun: booking QILGAN mijozlar soni (unikal mijoz, jami)
+      convertedLeads,
     ] = await Promise.all([
       // Leadlar
       this.prisma.client.count({ where: { tenantId, assignedAgentId: userId } }),
@@ -811,10 +824,15 @@ export class ReportsService {
       this.prisma.conversation.count({ where: { tenantId, assignedAgentId: userId, isResolved: false } }),
       // BUG9 FIX: tenant so'rovini Promise.all ga qo'shamiz (alohida await emas)
       this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { agentCommissionPercent: true, kpiTiers: true } as any }).catch(() => null),
+      // Konversiya = booking qilgan UNIKAL mijozlar / jami mijozlar (jami davr)
+      this.prisma.client.count({
+        where: { tenantId, assignedAgentId: userId, bookings: { some: { status: { not: 'CANCELLED' } } } },
+      }),
     ]);
 
-    // Konversiya foizi: barcha aktiv bookinglar / jami leadlar
-    const myConversion = totalLeads > 0 ? Math.round((totalBookings / totalLeads) * 100) : 0;
+    // Konversiya foizi: booking qilgan mijozlar / jami mijozlar (100% dan oshmaydi).
+    // Bu ta'rif admin "Agentlar reytingi"dagi bilan BIR XIL — raqamlar mos keladi.
+    const myConversion = totalLeads > 0 ? Math.round((convertedLeads / totalLeads) * 100) : 0;
 
     const profitMonth = profitThisMonth._sum.profit || 0;
     const profitPrev = profitPrevMonth._sum.profit || 0;
@@ -869,8 +887,8 @@ export class ReportsService {
       leads: { total: totalLeads, thisMonth: leadsThisMonth, thisWeek: leadsThisWeek, today: leadsToday },
       // Bookinglar
       bookings: { total: totalBookings, thisMonth: bookingsThisMonth, today: bookingsToday, won: wonBookings },
-      // Konversiya
-      conversion: { rate: myConversion, won: wonBookings, total: totalLeads },
+      // Konversiya (booking qilgan mijozlar / jami mijozlar)
+      conversion: { rate: myConversion, won: convertedLeads, total: totalLeads },
       // Foyda
       profit: {
         thisMonth: profitMonth,
