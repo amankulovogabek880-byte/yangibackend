@@ -27,6 +27,55 @@ import { AutoReplyService, AutoReplyModule } from '../v9/auto-reply.module';
 
 const GRAPH_API_VERSION = 'v19.0';
 
+// ── FACEBOOK XATOLARINI TASNIFLASH ──────────────────────────────────
+// Graph API turli xil holatlarda turlicha xato qaytaradi (permission
+// yetishmasligi, Page topilmaslik, token yaroqsizligi va h.k.). Bu
+// funksiya xom Graph API javobini frontend uchun tushunarli, harakatga
+// undovchi "errorType" ga aylantiradi — shu orqali foydalanuvchiga xom
+// JSON o'rniga aniq nima qilish kerakligini ko'rsatish mumkin bo'ladi.
+export type FacebookErrorType =
+  | 'NO_ADMIN_ACCESS' // foydalanuvchida Page uchun yetarli vazifa (task) yo'q
+  | 'MISSING_PERMISSIONS' // OAuth paytida kerakli ruxsatlar berilmagan
+  | 'INVALID_TOKEN' // token muddati tugagan yoki yaroqsiz
+  | 'NO_PAGES' // akkaunt hech qanday Page'ni boshqarmaydi
+  | 'UNKNOWN';
+
+function classifyFacebookError(json: any): { type: FacebookErrorType; message: string } {
+  const err = json?.error || {};
+  const code = err.code;
+  const subcode = err.error_subcode;
+  const message: string = String(err.message || '');
+  const lower = message.toLowerCase();
+
+  // code 100 + subcode 33 → "Object does not exist... missing permissions"
+  // — odatda Page ID token bilan mos kelmagani yoki foydalanuvchida
+  // shu Page'ga umuman huquq yo'qligi sababli chiqadi.
+  if (code === 100 && subcode === 33) {
+    return { type: 'NO_ADMIN_ACCESS', message };
+  }
+  // OAuthException + "impersonating a user's page" — pages_* ruxsatlar
+  // berilmagan holatda chiqadigan klassik xato (birinchi log'dagi holat).
+  if (code === 190 || lower.includes('impersonating')) {
+    return { type: 'MISSING_PERMISSIONS', message };
+  }
+  if (
+    lower.includes('admin') ||
+    lower.includes('must have a role') ||
+    lower.includes('does not have sufficient')
+  ) {
+    return { type: 'NO_ADMIN_ACCESS', message };
+  }
+  if (
+    lower.includes('expired') ||
+    lower.includes('invalid oauth access token') ||
+    lower.includes('session has been invalidated')
+  ) {
+    return { type: 'INVALID_TOKEN', message };
+  }
+  if (!message) return { type: 'UNKNOWN', message: '' };
+  return { type: 'UNKNOWN', message };
+}
+
 // "state" parametrini imzolash uchun (CSRF himoyasi + qaysi tenant/user
 // OAuth boshlaganini bilish). JWT_ACCESS_SECRET bilan bir xil sirdan
 // foydalanamiz — alohida env qo'shishga hojat yo'q.
@@ -147,16 +196,37 @@ export class FacebookLeadsService {
     // MUHIM: faqat token/Page ID saqlash yetarli emas — Meta shu Page'ni
     // bizning ilovamizga "leadgen" hodisasiga aniq obuna qilishimizni
     // talab qiladi. Shu chaqiruvsiz webhook hech qachon kelmaydi.
+    let subscribeResult: { ok: boolean; errorType?: FacebookErrorType; rawMessage?: string } | null = null;
     if (newEncToken && newPageId) {
       const plainToken = this.encryption.decrypt(newEncToken);
-      if (plainToken) await this.subscribeAppToPage(newPageId, plainToken);
+      if (plainToken) subscribeResult = await this.subscribeAppToPage(newPageId, plainToken);
     }
 
-    return this.getConfig(tenantId);
+    const config = await this.getConfig(tenantId);
+    // Frontend uchun qo'shimcha: agar obuna muvaffaqiyatsiz bo'lsa, aniq
+    // sababni ham qaytaramiz — token/PageId saqlanadi, lekin admin darhol
+    // muammoni ko'radi (xom log kutib o'tirmasdan).
+    if (subscribeResult && !subscribeResult.ok) {
+      return {
+        ...config,
+        subscribeWarning: {
+          errorType: subscribeResult.errorType || 'UNKNOWN',
+          message: subscribeResult.rawMessage || '',
+        },
+      };
+    }
+    return config;
   }
 
-  /** Page'ni bizning Meta ilovamizga "leadgen" hodisasi uchun obuna qiladi. */
-  private async subscribeAppToPage(pageId: string, accessToken: string) {
+  /**
+   * Page'ni bizning Meta ilovamizga "leadgen" hodisasi uchun obuna qiladi.
+   * Muvaffaqiyatsiz bo'lsa, xom xato o'rniga tasniflangan errorType qaytaradi —
+   * shu orqali frontend foydalanuvchiga aniq nima qilish kerakligini ko'rsata oladi.
+   */
+  private async subscribeAppToPage(
+    pageId: string,
+    accessToken: string,
+  ): Promise<{ ok: boolean; errorType?: FacebookErrorType; rawMessage?: string }> {
     try {
       const url =
         `https://graph.facebook.com/${GRAPH_API_VERSION}/${pageId}/subscribed_apps` +
@@ -165,12 +235,17 @@ export class FacebookLeadsService {
       const res = await fetch(url, { method: 'POST' });
       const json: any = await res.json().catch(() => ({}));
       if (!res.ok || json?.success === false) {
-        this.logger.error('Facebook subscribe_apps xato: ' + JSON.stringify(json));
-      } else {
-        this.logger.log(`Facebook: Page ${pageId} "leadgen" hodisasiga obuna qilindi`);
+        const { type, message } = classifyFacebookError(json);
+        this.logger.error(
+          `Facebook subscribe_apps xato [${type}]: ` + JSON.stringify(json),
+        );
+        return { ok: false, errorType: type, rawMessage: message };
       }
+      this.logger.log(`Facebook: Page ${pageId} "leadgen" hodisasiga obuna qilindi`);
+      return { ok: true };
     } catch (e: any) {
       this.logger.error('Facebook subscribe_apps error: ' + e.message);
+      return { ok: false, errorType: 'UNKNOWN', rawMessage: e.message };
     }
   }
 
@@ -612,8 +687,20 @@ export class FacebookLeadsService {
       const pagesRes = await fetch(pagesUrl);
       const pagesJson: any = await pagesRes.json().catch(() => ({}));
       if (!pagesRes.ok) {
-        this.logger.error('Facebook OAuth /me/accounts xato: ' + JSON.stringify(pagesJson));
-        return `${redirectBase}&fb=error`;
+        const { type, message } = classifyFacebookError(pagesJson);
+        this.logger.error(`Facebook OAuth /me/accounts xato [${type}]: ` + JSON.stringify(pagesJson));
+        // fb=... — frontend qaysi tushunarli xabar/havolani ko'rsatishini
+        // shu qiymat bo'yicha tanlaydi. fbMsg — qo'shimcha, ixtiyoriy,
+        // xom Facebook xabari (loglash/diagnostika uchun foydali).
+        const fbCode =
+          type === 'NO_ADMIN_ACCESS'
+            ? 'no_admin_access'
+            : type === 'MISSING_PERMISSIONS'
+              ? 'missing_permissions'
+              : type === 'INVALID_TOKEN'
+                ? 'invalid_token'
+                : 'error';
+        return `${redirectBase}&fb=${fbCode}&fbMsg=${encodeURIComponent(message)}`;
       }
       const pages: Array<{ id: string; name: string; access_token: string }> =
         pagesJson?.data || [];
@@ -624,12 +711,21 @@ export class FacebookLeadsService {
       }
 
       if (pages.length === 1) {
-        await this.saveConfig(payload.tenantId, {
+        const saved: any = await this.saveConfig(payload.tenantId, {
           accessToken: pages[0].access_token,
           pageId: pages[0].id,
           pageName: pages[0].name,
         });
         this.logger.log(`Facebook OAuth: tenant ${payload.tenantId} uchun Page "${pages[0].name}" avtomatik ulandi`);
+        // Page ulandi, lekin "leadgen" obunasi muvaffaqiyatsiz bo'lishi
+        // mumkin (masalan shu Page'da yetarli vazifa yo'q) — buni ham
+        // frontendga aniq ko'rsatamiz, "success" deb yolg'on aytmasdan.
+        if (saved?.subscribeWarning) {
+          const w = saved.subscribeWarning;
+          const fbCode =
+            w.errorType === 'NO_ADMIN_ACCESS' ? 'connected_no_admin_access' : 'connected_subscribe_failed';
+          return `${redirectBase}&fb=${fbCode}&fbMsg=${encodeURIComponent(w.message || '')}`;
+        }
         return `${redirectBase}&fb=success`;
       }
 
@@ -746,16 +842,21 @@ export class FacebookLeadsService {
     if (!token) return { connected: false, leadgenSubscribed: false, forms: [] };
 
     // Self-heal: "leadgen" obunasini qayta ta'minlaymiz (agar uzilgan bo'lsa).
-    await this.subscribeAppToPage(pageId, token);
+    const subscribeResult = await this.subscribeAppToPage(pageId, token);
 
     // Obuna holatini o'qiymiz
     let leadgenSubscribed = false;
+    let subError: { errorType: FacebookErrorType; message: string } | null = null;
     try {
       const subRes = await fetch(
         `https://graph.facebook.com/${GRAPH_API_VERSION}/${pageId}/subscribed_apps` +
           `?access_token=${encodeURIComponent(token)}`,
       );
       const subJson: any = await subRes.json().catch(() => ({}));
+      if (subJson?.error) {
+        const { type, message } = classifyFacebookError(subJson);
+        subError = { errorType: type, message };
+      }
       const apps = subJson?.data || [];
       leadgenSubscribed = apps.some(
         (a: any) => Array.isArray(a.subscribed_fields)
@@ -766,6 +867,7 @@ export class FacebookLeadsService {
 
     // Page'даги lead formalar ro'yxati
     let forms: any[] = [];
+    let formsError: { errorType: FacebookErrorType; message: string } | null = null;
     try {
       const formRes = await fetch(
         `https://graph.facebook.com/${GRAPH_API_VERSION}/${pageId}/leadgen_forms` +
@@ -773,7 +875,9 @@ export class FacebookLeadsService {
       );
       const formJson: any = await formRes.json().catch(() => ({}));
       if (formJson?.error) {
-        this.logger.warn('Facebook leadgen_forms xato: ' + JSON.stringify(formJson.error));
+        const { type, message } = classifyFacebookError(formJson);
+        formsError = { errorType: type, message };
+        this.logger.warn(`Facebook leadgen_forms xato [${type}]: ` + JSON.stringify(formJson.error));
       }
       forms = (formJson?.data || []).map((f: any) => ({
         id: f.id, name: f.name, status: f.status, leadsCount: f.leads_count ?? null,
@@ -782,12 +886,128 @@ export class FacebookLeadsService {
       this.logger.warn('Facebook leadgen_forms error: ' + e.message);
     }
 
+    // Frontend uchun bitta, aniq "nima uchun ishlamayapti" xulosasi.
+    // Ustuvorlik: subscribe_apps xatosi > forms xatosi (chunki subscribe
+    // muvaffaqiyatsiz bo'lsa forms ham odatda bo'sh/xato bo'ladi).
+    const primaryError =
+      (subscribeResult && !subscribeResult.ok
+        ? { errorType: subscribeResult.errorType || 'UNKNOWN', message: subscribeResult.rawMessage || '' }
+        : null) || subError || formsError || null;
+
     return {
       connected: true,
       pageId,
       pageName: s.facebookPageName || null,
       leadgenSubscribed,
       forms,
+      error: primaryError, // null bo'lsa — hammasi joyida
+    };
+  }
+
+  /**
+   * "Nega ishlamayapti?" tugmasi uchun tashxis: saqlangan token bilan
+   * Page'dagi aniq vazifalarni (tasks) so'rab, foydalanuvchiga tushunarli
+   * tavsiya (Page egasidan so'rash yoki System User) qaytaradi.
+   */
+  async diagnose(tenantId: string) {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const s: any = tenant?.settings || {};
+    const pageId: string | undefined = s.facebookPageId;
+    const encToken: string | undefined = s.facebookPageAccessToken;
+
+    if (!pageId || !encToken) {
+      return {
+        tokenValid: false,
+        pageTasks: [],
+        hasRequiredTasks: false,
+        missingTasks: [],
+        recommendation: 'CONNECT_FIRST',
+        message: "Hali hech qanday Page ulanmagan. Avval 'Tezkor ulanish' yoki 'Qo'lda ulash'ni bajaring.",
+      };
+    }
+    const token = this.encryption.decrypt(encToken);
+    if (!token) {
+      return {
+        tokenValid: false,
+        pageTasks: [],
+        hasRequiredTasks: false,
+        missingTasks: [],
+        recommendation: 'CONNECT_FIRST',
+        message: 'Saqlangan tokenni ochib bo\'lmadi, qaytadan ulang.',
+      };
+    }
+
+    // 1) Token umuman yaroqlimi?
+    let tokenValid = true;
+    try {
+      const meRes = await fetch(
+        `https://graph.facebook.com/${GRAPH_API_VERSION}/me?access_token=${encodeURIComponent(token)}`,
+      );
+      const meJson: any = await meRes.json().catch(() => ({}));
+      if (meJson?.error) tokenValid = false;
+    } catch {
+      tokenValid = false;
+    }
+
+    if (!tokenValid) {
+      return {
+        tokenValid: false,
+        pageTasks: [],
+        hasRequiredTasks: false,
+        missingTasks: [],
+        recommendation: 'RECONNECT',
+        message: "Token muddati tugagan yoki bekor qilingan. 'Tezkor ulanish'ni qaytadan bosing.",
+      };
+    }
+
+    // 2) Page'dagi aniq vazifalarni (tasks) so'raymiz
+    const REQUIRED_TASKS = ['MANAGE', 'ADVERTISE'];
+    let pageTasks: string[] = [];
+    try {
+      const pageRes = await fetch(
+        `https://graph.facebook.com/${GRAPH_API_VERSION}/${pageId}` +
+          `?fields=id,name,tasks&access_token=${encodeURIComponent(token)}`,
+      );
+      const pageJson: any = await pageRes.json().catch(() => ({}));
+      if (pageJson?.error) {
+        const { type, message } = classifyFacebookError(pageJson);
+        return {
+          tokenValid: true,
+          pageTasks: [],
+          hasRequiredTasks: false,
+          missingTasks: REQUIRED_TASKS,
+          recommendation: type === 'NO_ADMIN_ACCESS' ? 'ASK_ADMIN' : 'SYSTEM_USER',
+          errorType: type,
+          message,
+        };
+      }
+      pageTasks = pageJson?.tasks || [];
+    } catch (e: any) {
+      return {
+        tokenValid: true,
+        pageTasks: [],
+        hasRequiredTasks: false,
+        missingTasks: REQUIRED_TASKS,
+        recommendation: 'SYSTEM_USER',
+        message: e.message,
+      };
+    }
+
+    const hasRequiredTasks = REQUIRED_TASKS.some((t) => pageTasks.includes(t));
+    const missingTasks = REQUIRED_TASKS.filter((t) => !pageTasks.includes(t));
+
+    return {
+      tokenValid: true,
+      pageTasks,
+      hasRequiredTasks,
+      missingTasks: hasRequiredTasks ? [] : missingTasks,
+      recommendation: hasRequiredTasks ? 'OK' : 'ASK_ADMIN',
+      message: hasRequiredTasks
+        ? 'Hammasi joyida — kerakli huquqlar mavjud.'
+        : `Bu akkauntda Page uchun yetarli vazifa yo'q (mavjud: ${pageTasks.join(', ') || 'yo\'q'}). Page egasidan Business Manager orqali "Manage Page" yoki "Advertise" vazifasini so'rang, yoki System User orqali doimiy token oling.`,
     };
   }
 
@@ -869,6 +1089,15 @@ export class FacebookLeadsController {
   @Roles('TENANT_ADMIN')
   listForms(@CurrentUser() u: any) {
     return this.svc.verifyAndListForms(u.tenantId);
+  }
+
+  @ApiOperation({ summary: "Tashxis: token yaroqliligi va Page'dagi vazifalarni tekshirish ('Nega ishlamayapti?' tugmasi)" })
+  @ApiBearerAuth('JWT')
+  @Get('diagnose')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  diagnose(@CurrentUser() u: any) {
+    return this.svc.diagnose(u.tenantId);
   }
 
   // ── FACEBOOK LOGIN (OAuth) — "Facebook orqali ulash" tugmasi ──────
