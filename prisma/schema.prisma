@@ -615,6 +615,8 @@ model Client {
   @@unique([tenantId, phone])
   @@index([email])
   @@index([telegramId])
+  // Perf: dashboard/lead-analytics "yangi klientlar (createdAt oralig'i)" hisoblari uchun
+  @@index([tenantId, createdAt])
   @@map("clients")
 }
 
@@ -819,6 +821,8 @@ model Booking {
   @@index([tenantId, clientId])
   @@index([tenantId, departureDate])
   @@index([tenantId, createdAt])
+  // Perf: dashboard/revenue aggregate'lari (tenantId + status IN + createdAt oralig'i)
+  @@index([tenantId, status, createdAt])
   @@map("bookings")
 }
 
@@ -918,6 +922,9 @@ model Payment {
   @@index([tenantId, status])
   @@index([bookingId])
   @@index([tenantId, paidAt])
+  // Perf: eng ko'p takrorlanadigan daromad aggregate'i
+  // (tenantId + status=COMPLETED + paidAt oralig'i) — dashboard/KPI/maosh
+  @@index([tenantId, status, paidAt])
   @@map("payments")
 }
 

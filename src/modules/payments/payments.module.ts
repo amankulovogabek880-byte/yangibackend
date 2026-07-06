@@ -11,6 +11,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { AuditService } from '../audit/audit.module';
 import { CacheService } from '../../common/cache/cache.service';
+import { CACHE_TTL, paymentsKey } from '../../common/cache/cache.constants';
 import { Prisma } from '@prisma/client';
 import { PaymentMethod, PaymentStatus, Currency } from '../../prisma-types';;
 
@@ -201,7 +202,10 @@ export class PaymentsService {
 @Controller('payments')
 @UseGuards(JwtAuthGuard)
 export class PaymentsController {
-  constructor(private svc: PaymentsService) {}
+  constructor(
+    private svc: PaymentsService,
+    private cache: CacheService,
+  ) {}
 
   @Get()
   list(
@@ -217,7 +221,12 @@ export class PaymentsController {
 
   @Get('stats')
   stats(@CurrentUser() u: any) {
-    return this.svc.stats(u.tenantId, u.sub, u.role);
+    // Og'ir aggregate + groupBy → SHORT (60s). To'lov o'zgarganda invalidatsiya bo'ladi.
+    return this.cache.getOrSet(
+      paymentsKey(u.tenantId, 'stats', u.role, u.sub),
+      CACHE_TTL.SHORT,
+      () => this.svc.stats(u.tenantId, u.sub, u.role),
+    );
   }
 
   @Post('manual')

@@ -43,6 +43,13 @@ export const kpiKey = (
   ...params: unknown[]
 ): string => `kpi:${tenantId}:${name}:${params.map(norm).join(':')}`;
 
+/** To'lov (payments) cache kaliti: `payments:<tenantId>:<name>:<...params>` */
+export const paymentsKey = (
+  tenantId: string,
+  name: string,
+  ...params: unknown[]
+): string => `payments:${tenantId}:${name}:${params.map(norm).join(':')}`;
+
 /** Bitta tenant'ning BARCHA hisobot kalitlarini qamrab oluvchi pattern. */
 export const reportsTenantPattern = (tenantId: string): string =>
   `reports:${tenantId}:*`;
@@ -50,3 +57,7 @@ export const reportsTenantPattern = (tenantId: string): string =>
 /** Bitta tenant'ning BARCHA KPI kalitlarini qamrab oluvchi pattern. */
 export const kpiTenantPattern = (tenantId: string): string =>
   `kpi:${tenantId}:*`;
+
+/** Bitta tenant'ning BARCHA to'lov kalitlarini qamrab oluvchi pattern. */
+export const paymentsTenantPattern = (tenantId: string): string =>
+  `payments:${tenantId}:*`;

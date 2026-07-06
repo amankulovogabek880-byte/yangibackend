@@ -1,6 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import type { Redis } from 'ioredis';
-import { REDIS_CLIENT, reportsTenantPattern, kpiTenantPattern } from './cache.constants';
+import { REDIS_CLIENT, reportsTenantPattern, kpiTenantPattern, paymentsTenantPattern } from './cache.constants';
 import { scanKeys } from './redis-store';
 
 /**
@@ -103,7 +103,7 @@ export class CacheService {
   }
 
   /**
-   * Bitta tenant'ning barcha hisobot va KPI cache'ini tozalaydi.
+   * Bitta tenant'ning barcha hisobot, KPI va to'lov (stats) cache'ini tozalaydi.
    * Booking/payment/client/KPI o'zgarganda chaqiriladi — eskirgan raqamlar
    * ko'rsatilib qolmasligi uchun.
    */
@@ -112,6 +112,7 @@ export class CacheService {
     await Promise.all([
       this.delByPattern(reportsTenantPattern(tenantId)),
       this.delByPattern(kpiTenantPattern(tenantId)),
+      this.delByPattern(paymentsTenantPattern(tenantId)),
     ]);
   }
 }
