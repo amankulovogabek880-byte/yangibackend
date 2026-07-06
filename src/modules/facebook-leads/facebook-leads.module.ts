@@ -726,6 +726,71 @@ export class FacebookLeadsService {
     return result;
   }
 
+  /**
+   * Page'даги lead formalarni ro'yxatlaydi va "leadgen" webhook obunasini
+   * tekshiradi (kerak bo'lsa qayta obuna qiladi — self-heal). Frontend shu orqali
+   * "CRM Page'ni ko'ryapti va formalar ulangan" degan ko'rinadigan tasdiq beradi.
+   */
+  async verifyAndListForms(tenantId: string) {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const s: any = tenant?.settings || {};
+    const pageId: string | undefined = s.facebookPageId;
+    const encToken: string | undefined = s.facebookPageAccessToken;
+    if (!pageId || !encToken) {
+      return { connected: false, leadgenSubscribed: false, forms: [] };
+    }
+    const token = this.encryption.decrypt(encToken);
+    if (!token) return { connected: false, leadgenSubscribed: false, forms: [] };
+
+    // Self-heal: "leadgen" obunasini qayta ta'minlaymiz (agar uzilgan bo'lsa).
+    await this.subscribeAppToPage(pageId, token);
+
+    // Obuna holatini o'qiymiz
+    let leadgenSubscribed = false;
+    try {
+      const subRes = await fetch(
+        `https://graph.facebook.com/${GRAPH_API_VERSION}/${pageId}/subscribed_apps` +
+          `?access_token=${encodeURIComponent(token)}`,
+      );
+      const subJson: any = await subRes.json().catch(() => ({}));
+      const apps = subJson?.data || [];
+      leadgenSubscribed = apps.some(
+        (a: any) => Array.isArray(a.subscribed_fields)
+          ? a.subscribed_fields.includes('leadgen')
+          : (a.subscribed_fields?.data || []).some((x: any) => x === 'leadgen' || x?.name === 'leadgen'),
+      );
+    } catch { /* jim */ }
+
+    // Page'даги lead formalar ro'yxati
+    let forms: any[] = [];
+    try {
+      const formRes = await fetch(
+        `https://graph.facebook.com/${GRAPH_API_VERSION}/${pageId}/leadgen_forms` +
+          `?fields=id,name,status,leads_count&limit=100&access_token=${encodeURIComponent(token)}`,
+      );
+      const formJson: any = await formRes.json().catch(() => ({}));
+      if (formJson?.error) {
+        this.logger.warn('Facebook leadgen_forms xato: ' + JSON.stringify(formJson.error));
+      }
+      forms = (formJson?.data || []).map((f: any) => ({
+        id: f.id, name: f.name, status: f.status, leadsCount: f.leads_count ?? null,
+      }));
+    } catch (e: any) {
+      this.logger.warn('Facebook leadgen_forms error: ' + e.message);
+    }
+
+    return {
+      connected: true,
+      pageId,
+      pageName: s.facebookPageName || null,
+      leadgenSubscribed,
+      forms,
+    };
+  }
+
   async getStats(tenantId: string) {
     const [total, thisMonth] = await Promise.all([
       this.prisma.client.count({ where: { tenantId, source: 'FACEBOOK' as any } }),
@@ -795,6 +860,15 @@ export class FacebookLeadsController {
   @Get('stats')
   stats(@CurrentUser() u: any) {
     return this.svc.getStats(u.tenantId);
+  }
+
+  @ApiOperation({ summary: "Page lead formalari + webhook obuna holati (tekshirish/qayta ulash)" })
+  @ApiBearerAuth('JWT')
+  @Get('forms')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  listForms(@CurrentUser() u: any) {
+    return this.svc.verifyAndListForms(u.tenantId);
   }
 
   // ── FACEBOOK LOGIN (OAuth) — "Facebook orqali ulash" tugmasi ──────
