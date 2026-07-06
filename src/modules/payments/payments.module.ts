@@ -10,6 +10,7 @@ import { ClientsService } from '../clients/clients.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { AuditService } from '../audit/audit.module';
+import { CacheService } from '../../common/cache/cache.service';
 import { Prisma } from '@prisma/client';
 import { PaymentMethod, PaymentStatus, Currency } from '../../prisma-types';;
 
@@ -25,6 +26,7 @@ export class PaymentsService {
     private notifications: NotificationsService,
     private realtime: RealtimeGateway,
     private audit: AuditService,
+    private cache: CacheService,
   ) {}
 
   async findAll(tenantId: string, userId: string, role: string, params: any) {
@@ -160,6 +162,9 @@ export class PaymentsService {
       metadata: { amount, bookingId: booking.id, method: payment.method },
     });
 
+    // To'lov daromad/qoldiq raqamlariga ta'sir qiladi → hisobot cache tozalanadi.
+    void this.cache.invalidateReports(tenantId);
+
     return payment;
   }
 
@@ -185,6 +190,10 @@ export class PaymentsService {
       });
       await this.clients.recalcStats(booking.clientId);
     }
+
+    // Refund daromad/qoldiqni o'zgartiradi → hisobot cache tozalanadi.
+    void this.cache.invalidateReports(tenantId);
+
     return updated;
   }
 }

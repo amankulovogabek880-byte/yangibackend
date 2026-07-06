@@ -20,6 +20,7 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import { NotificationsService } from '../notifications/notifications.service';
 import { RoundRobinService } from '../v9/round-robin.module';
 import { EncryptionService } from '../../common/encryption/encryption.service';
+import { CacheService } from '../../common/cache/cache.service';
 
 const CLIENT_STATUSES: ClientStatus[] = ['ACTIVE', 'INACTIVE', 'BLACKLISTED'];
 const TIERS: ClientTier[] = ['REGULAR', 'SILVER', 'GOLD', 'VIP'];
@@ -37,6 +38,7 @@ export class ClientsService {
     private eventEmitter: EventEmitter2,
     private notifications: NotificationsService,
     private encryption: EncryptionService,
+    private cache: CacheService,
     @Optional() private roundRobin: RoundRobinService,
   ) {}
 
@@ -350,6 +352,9 @@ export class ClientsService {
       });
     }
 
+    // Yangi klient lead/konversiya hisobotlariga ta'sir qiladi → cache tozalanadi.
+    void this.cache.invalidateReports(tenantId);
+
     return client;
   }
 
@@ -378,10 +383,15 @@ export class ClientsService {
     if (safe.passportNo) safe.passportNo = this.encryption.encrypt(safe.passportNo);
     if (safe.address) safe.address = this.encryption.encrypt(safe.address);
 
-    return this.prisma.client.update({
+    const updated = await this.prisma.client.update({
       where: { id },
       data: clean(safe),
     });
+
+    // Klient ma'lumoti (manba/tier/status...) hisobotlarga ta'sir qilishi mumkin.
+    void this.cache.invalidateReports(tenantId);
+
+    return updated;
   }
 
   // v14: mijozga ixtiyoriy "key = value" ma'lumotlar. preferences.customFields
@@ -432,6 +442,10 @@ export class ClientsService {
       this.prisma.call.deleteMany({ where: { clientId: id } }),
       this.prisma.client.delete({ where: { id } }),
     ]);
+
+    // Klient o'chirildi → hisobot cache tozalanadi.
+    void this.cache.invalidateReports(tenantId);
+
     return { ok: true };
   }
 

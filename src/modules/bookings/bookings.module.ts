@@ -10,6 +10,7 @@ import { ClientsService } from '../clients/clients.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { AuditService } from '../audit/audit.module';
+import { CacheService } from '../../common/cache/cache.service';
 import { Prisma } from '@prisma/client';
 import { BookingStatus, TourType, Currency } from '../../prisma-types';;
 
@@ -27,6 +28,7 @@ export class BookingsService {
     private notifications: NotificationsService,
     private realtime: RealtimeGateway,
     private audit: AuditService,
+    private cache: CacheService,
   ) {}
 
   private where(tenantId: string, userId: string, role: string, extra: any = {}): any {
@@ -288,6 +290,9 @@ export class BookingsService {
       metadata: { bookingRef: booking.bookingRef, totalPrice: booking.totalPrice, clientId: client.id },
     });
 
+    // Yangi booking dashboard/hisobot raqamlarini o'zgartiradi → cache tozalanadi.
+    void this.cache.invalidateReports(tenantId);
+
     return booking;
   }
 
@@ -445,6 +450,9 @@ export class BookingsService {
       });
     } catch {}
 
+    // Narx/status o'zgardi → eskirgan hisobot ko'rsatilmasligi uchun cache tozalanadi.
+    void this.cache.invalidateReports(tenantId);
+
     return updated;
   }
 
@@ -497,6 +505,9 @@ export class BookingsService {
         agentId: b.agentId,
       });
     } catch {}
+
+    // Booking o'chirildi → hisobot cache tozalanadi.
+    void this.cache.invalidateReports(tenantId);
 
     return { ok: true };
   }

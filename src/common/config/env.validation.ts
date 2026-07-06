@@ -20,6 +20,8 @@ const config: EnvConfig = {
     JWT_REFRESH_EXPIRES: '7d',
     THROTTLE_TTL: '60',
     THROTTLE_LIMIT: '100',
+    // Cache: Redis ulanishi (ixtiyoriy). Bo'lmasa cache o'chadi (in-memory fallback).
+    REDIS_URL: '(ixtiyoriy, masalan: redis://localhost:6379)',
     MIN_PASSWORD_LENGTH: '8',
     MAX_LOGIN_ATTEMPTS: '5',
     LOGIN_LOCK_MINUTES: '15',

@@ -3,10 +3,10 @@ import { ConfigModule } from '@nestjs/config';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
-import { CacheModule } from '@nestjs/cache-manager';
 import { APP_GUARD } from '@nestjs/core';
 
 import { PrismaModule } from './prisma/prisma.module';
+import { AppCacheModule } from './common/cache/cache.module';
 
 // ─── GLOBAL (v4) ─────────────────────────────────────────────
 import { EncryptionModule } from './common/encryption/encryption.module';
@@ -70,7 +70,9 @@ import { ExchangeRateModule } from './modules/exchange-rate/exchange-rate.module
         limit: parseInt(process.env.THROTTLE_LIMIT || '100'),
       },
     ]),
-    CacheModule.register({ isGlobal: true, ttl: 60000, max: 1000 }),
+    // Cache: Redis (ioredis) bilan ishlaydigan global cache — REDIS_URL bo'lsa
+    // Redis'ga, bo'lmasa in-memory'ga tushadi. CacheService ni butun ilovaga beradi.
+    AppCacheModule,
     PrismaModule,
 
     // Global - tartib muhim (Encryption -> Email -> Realtime -> Notifications)

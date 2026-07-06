@@ -5,6 +5,8 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser, Roles } from '../../common/decorators';
+import { CacheService } from '../../common/cache/cache.service';
+import { CACHE_TTL, reportsKey } from '../../common/cache/cache.constants';
 
 @Injectable()
 export class ReportsService {
@@ -1647,56 +1649,97 @@ export class ReportsService {
 @Controller('reports')
 @UseGuards(JwtAuthGuard)
 export class ReportsController {
-  constructor(private svc: ReportsService) {}
+  constructor(
+    private svc: ReportsService,
+    private cache: CacheService,
+  ) {}
 
   @Get('dashboard')
   dashboard(@CurrentUser() u: any, @Query('from') from?: string, @Query('to') to?: string) {
-    return this.svc.dashboard(u.tenantId, u.sub, u.role, from, to);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'dashboard', u.role, u.sub, from, to),
+      CACHE_TTL.SHORT,
+      () => this.svc.dashboard(u.tenantId, u.sub, u.role, from, to),
+    );
   }
 
   @Get('revenue')
   revenue(@CurrentUser() u: any, @Query('from') from?: string, @Query('to') to?: string) {
-    return this.svc.revenue(u.tenantId, u.role, u.sub, from, to);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'revenue', u.role, u.sub, from, to),
+      CACHE_TTL.SHORT,
+      () => this.svc.revenue(u.tenantId, u.role, u.sub, from, to),
+    );
   }
 
   @Get('agents')
   agents(@CurrentUser() u: any, @Query('from') from?: string, @Query('to') to?: string) {
-    return this.svc.agents(u.tenantId, from, to);
+    // tenant-wide (role/user'ga bog'liq emas)
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'agents', from, to),
+      CACHE_TTL.SHORT,
+      () => this.svc.agents(u.tenantId, from, to),
+    );
   }
 
   @Get('bookings')
   bookings(@CurrentUser() u: any) {
-    return this.svc.bookings(u.tenantId, u.role, u.sub);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'bookings', u.role, u.sub),
+      CACHE_TTL.SHORT,
+      () => this.svc.bookings(u.tenantId, u.role, u.sub),
+    );
   }
 
   /** v6: Manba (Telegram/Instagram/WhatsApp) bo'yicha */
   @Get('by-source')
   bySource(@CurrentUser() u: any) {
-    return this.svc.bySource(u.tenantId, u.role, u.sub);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'by-source', u.role, u.sub),
+      CACHE_TTL.SHORT,
+      () => this.svc.bySource(u.tenantId, u.role, u.sub),
+    );
   }
 
   /** v6: Destinatsiya bo'yicha */
   @Get('by-destination')
   byDestination(@CurrentUser() u: any, @Query('from') from?: string, @Query('to') to?: string) {
-    return this.svc.byDestination(u.tenantId, u.role, u.sub, from, to);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'by-destination', u.role, u.sub, from, to),
+      CACHE_TTL.SHORT,
+      () => this.svc.byDestination(u.tenantId, u.role, u.sub, from, to),
+    );
   }
 
   /** v6: Konversiya voronkasi */
   @Get('conversion-funnel')
   conversionFunnel(@CurrentUser() u: any) {
-    return this.svc.conversionFunnel(u.tenantId, u.role, u.sub);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'conversion-funnel', u.role, u.sub),
+      CACHE_TTL.SHORT,
+      () => this.svc.conversionFunnel(u.tenantId, u.role, u.sub),
+    );
   }
 
   /** v6: Daromad grafigi (kunlik/oylik) */
   @Get('revenue-chart')
   revenueChart(@CurrentUser() u: any, @Query('period') period?: 'day' | 'month') {
-    return this.svc.revenueChart(u.tenantId, u.role, u.sub, period || 'month');
+    const p = period || 'month';
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'revenue-chart', u.role, u.sub, p),
+      CACHE_TTL.SHORT,
+      () => this.svc.revenueChart(u.tenantId, u.role, u.sub, p),
+    );
   }
 
   /** v6: To'lov usullari bo'yicha */
   @Get('by-payment-method')
   byPaymentMethod(@CurrentUser() u: any) {
-    return this.svc.byPaymentMethod(u.tenantId, u.role, u.sub);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'by-payment-method', u.role, u.sub),
+      CACHE_TTL.SHORT,
+      () => this.svc.byPaymentMethod(u.tenantId, u.role, u.sub),
+    );
   }
 
   /**
@@ -1706,7 +1749,11 @@ export class ReportsController {
    */
   @Get('my-stats')
   myStats(@CurrentUser() u: any, @Query('from') from?: string, @Query('to') to?: string) {
-    return this.svc.myStats(u.tenantId, u.sub, 0, from, to);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'my-stats', u.sub, from, to),
+      CACHE_TTL.SHORT,
+      () => this.svc.myStats(u.tenantId, u.sub, 0, from, to),
+    );
   }
 
   /**
@@ -1733,7 +1780,12 @@ export class ReportsController {
       if (!agent) throw new Error('Agent topilmadi');
       targetId = agentId;
     }
-    return this.svc.mySalary(u.tenantId, targetId, offset);
+    // Maosh — oylik/og'ir hisob, sekinroq o'zgaradi → MEDIUM (300s).
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'my-salary', targetId, offset),
+      CACHE_TTL.MEDIUM,
+      () => this.svc.mySalary(u.tenantId, targetId, offset),
+    );
   }
 
   /**
@@ -1745,7 +1797,11 @@ export class ReportsController {
   @Roles('TENANT_ADMIN', 'MANAGER')
   agentSalaries(@CurrentUser() u: any, @Query('month') month?: string) {
     const offset = month ? parseInt(month) : 0;
-    return this.svc.agentSalaries(u.tenantId, offset);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'agent-salaries', offset),
+      CACHE_TTL.MEDIUM,
+      () => this.svc.agentSalaries(u.tenantId, offset),
+    );
   }
 
   /**
@@ -1763,7 +1819,11 @@ export class ReportsController {
    */
   @Get('client/:id/financial')
   clientFinancial(@Param('id') id: string, @CurrentUser() u: any) {
-    return this.svc.getClientFinancial(u.tenantId, id, u.sub, u.role);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'client-financial', id, u.role, u.sub),
+      CACHE_TTL.SHORT,
+      () => this.svc.getClientFinancial(u.tenantId, id, u.sub, u.role),
+    );
   }
 
   /**
@@ -1782,7 +1842,11 @@ export class ReportsController {
     @Query('days') days?: string,
   ) {
     const period = Math.min(Number(days) || 30, 365);
-    return this.svc.getLeadAnalytics(u.tenantId, period);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'lead-analytics', period),
+      CACHE_TTL.MEDIUM,
+      () => this.svc.getLeadAnalytics(u.tenantId, period),
+    );
   }
 
   @Get('calendar')
@@ -1792,7 +1856,11 @@ export class ReportsController {
     @Query('from') from?: string,
     @Query('to') to?: string,
   ) {
-    return this.svc.calendarReport(u.tenantId, u.sub, u.role, date, from, to);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'calendar', u.role, u.sub, date, from, to),
+      CACHE_TTL.SHORT,
+      () => this.svc.calendarReport(u.tenantId, u.sub, u.role, date, from, to),
+    );
   }
 
   // v10.2: Oylik kalendar (parvoz/viza/to'lov/vazifa eventlari)
@@ -1805,7 +1873,11 @@ export class ReportsController {
     const now = new Date();
     const y = Math.min(Math.max(Number(year) || now.getFullYear(), 2020), 2100);
     const m = Math.min(Math.max(Number(month) || (now.getMonth() + 1), 1), 12);
-    return this.svc.calendarMonth(u.tenantId, u.sub, u.role, y, m);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'calendar-month', u.role, u.sub, y, m),
+      CACHE_TTL.SHORT,
+      () => this.svc.calendarMonth(u.tenantId, u.sub, u.role, y, m),
+    );
   }
 
   // v10.3: Agentlar oyma-oy tarixi (admin — hammasi, agent — faqat o'ziniki)
@@ -1815,14 +1887,23 @@ export class ReportsController {
     @Query('months') months?: string,
     @Query('agentId') agentId?: string,
   ) {
-    return this.svc.agentsMonthly(u.tenantId, u.sub, u.role, Number(months) || 6, agentId);
+    const m = Number(months) || 6;
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'agents-monthly', u.role, u.sub, m, agentId),
+      CACHE_TTL.MEDIUM,
+      () => this.svc.agentsMonthly(u.tenantId, u.sub, u.role, m, agentId),
+    );
   }
 
   @Get('call-analytics')
   callAnalytics(@CurrentUser() u: any, @Query('days') days?: string, @Query('agentId') aid?: string) {
     const d = Math.min(Number(days) || 30, 365);
     const agentId = u.role === 'AGENT' ? (u.id || u.sub) : (aid || undefined);
-    return this.svc.getCallAnalytics(u.tenantId, d, agentId);
+    return this.cache.getOrSet(
+      reportsKey(u.tenantId, 'call-analytics', d, agentId),
+      CACHE_TTL.SHORT,
+      () => this.svc.getCallAnalytics(u.tenantId, d, agentId),
+    );
   }
 
   @Get('export')

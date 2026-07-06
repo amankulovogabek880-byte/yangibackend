@@ -8,6 +8,8 @@ import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser, Roles } from '../../common/decorators';
 import { safeEnum } from '../../common/utils/helpers';
 import { KpiMetric, KpiPeriod } from '../../prisma-types';;
+import { CacheService } from '../../common/cache/cache.service';
+import { CACHE_TTL, kpiKey } from '../../common/cache/cache.constants';
 
 const METRICS: KpiMetric[] = ['REVENUE', 'BOOKINGS', 'NEW_CLIENTS', 'CONVERSIONS', 'CALLS', 'MESSAGES', 'TASKS_COMPLETED'];
 const PERIODS: KpiPeriod[] = ['DAILY', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'YEARLY'];
@@ -225,46 +227,73 @@ export class KpiService {
 @Controller('kpi')
 @UseGuards(JwtAuthGuard)
 export class KpiController {
-  constructor(private svc: KpiService) {}
+  constructor(
+    private svc: KpiService,
+    private cache: CacheService,
+  ) {}
 
   // ── COMMISSION TIERS ──
   @Get('tiers')
   getTiers(@CurrentUser() u: any) {
-    return this.svc.getTiers(u.tenantId);
+    // Tier'lar deyarli o'zgarmaydi (konfiguratsiya) → LONG (900s).
+    return this.cache.getOrSet(
+      kpiKey(u.tenantId, 'tiers'),
+      CACHE_TTL.LONG,
+      () => this.svc.getTiers(u.tenantId),
+    );
   }
 
   @Put('tiers')
-  saveTiers(@CurrentUser() u: any, @Body() body: { tiers: any[] }) {
+  async saveTiers(@CurrentUser() u: any, @Body() body: { tiers: any[] }) {
     if (!['TENANT_ADMIN', 'OWNER'].includes(u.role)) {
       throw new BadRequestException('Ruxsat yo\'q');
     }
-    return this.svc.saveTiers(u.tenantId, body.tiers);
+    const result = await this.svc.saveTiers(u.tenantId, body.tiers);
+    // Tier'lar maosh/komissiya hisobotlariga ham ta'sir qiladi → reports + kpi tozalanadi.
+    void this.cache.invalidateReports(u.tenantId);
+    return result;
   }
 
   // ── KPI TARGETS ──
   @Get()
   list(@CurrentUser() u: any, @Query('userId') userId?: string) {
-    return this.svc.list(u.tenantId, userId || u.sub, u.role);
+    const scope = userId || u.sub;
+    return this.cache.getOrSet(
+      kpiKey(u.tenantId, 'list', u.role, scope),
+      CACHE_TTL.SHORT,
+      () => this.svc.list(u.tenantId, scope, u.role),
+    );
   }
 
   @Get(':id/progress')
   progress(@Param('id') id: string, @CurrentUser() u: any) {
-    return this.svc.progress(u.tenantId, id);
+    // Progress og'ir aggregate (payment/booking/client...) → SHORT (60s).
+    return this.cache.getOrSet(
+      kpiKey(u.tenantId, 'progress', id),
+      CACHE_TTL.SHORT,
+      () => this.svc.progress(u.tenantId, id),
+    );
   }
 
   @Post()
-  create(@Body() body: any, @CurrentUser() u: any) {
-    return this.svc.create(u.tenantId, u.role, body);
+  async create(@Body() body: any, @CurrentUser() u: any) {
+    const result = await this.svc.create(u.tenantId, u.role, body);
+    void this.cache.invalidateReports(u.tenantId);
+    return result;
   }
 
   @Put(':id')
-  update(@Param('id') id: string, @Body() body: any, @CurrentUser() u: any) {
-    return this.svc.update(u.tenantId, u.role, id, body);
+  async update(@Param('id') id: string, @Body() body: any, @CurrentUser() u: any) {
+    const result = await this.svc.update(u.tenantId, u.role, id, body);
+    void this.cache.invalidateReports(u.tenantId);
+    return result;
   }
 
   @Delete(':id')
-  delete(@Param('id') id: string, @CurrentUser() u: any) {
-    return this.svc.delete(u.tenantId, u.role, id);
+  async delete(@Param('id') id: string, @CurrentUser() u: any) {
+    const result = await this.svc.delete(u.tenantId, u.role, id);
+    void this.cache.invalidateReports(u.tenantId);
+    return result;
   }
 }
 
