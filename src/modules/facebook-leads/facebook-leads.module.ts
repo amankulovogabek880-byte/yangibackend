@@ -58,6 +58,14 @@ function classifyFacebookError(json: any): { type: FacebookErrorType; message: s
   if (code === 190 || lower.includes('impersonating')) {
     return { type: 'MISSING_PERMISSIONS', message };
   }
+  // code 200 → "Requires <permission> permission to manage the object"
+  // — leadgen_forms/subscribed_apps kabi edge'larга token'da kerakli
+  // ruxsat (masalan pages_manage_ads) yo'qligida chiqadi. Buni ham
+  // MISSING_PERMISSIONS deb tasniflaymiz — aks holda "Noma'lum xato"
+  // ko'rinib, foydalanuvchi nima qilishni bilmay qoladi.
+  if (code === 200 || (lower.includes('requires') && lower.includes('permission'))) {
+    return { type: 'MISSING_PERMISSIONS', message };
+  }
   if (
     lower.includes('admin') ||
     lower.includes('must have a role') ||
@@ -604,9 +612,11 @@ export class FacebookLeadsService {
       'pages_show_list',
       'pages_read_engagement',
       'pages_manage_metadata',
-      'pages_manage_ads',
       'leads_retrieval',
-      'ads_management',
+      // leadgen_forms edge'ini o'qish uchun aynan shu ruxsat kerak.
+      // (ilgari 'ads_management' so'ralardi — bu edge uni qabul qilmaydi
+      //  va "(#200) Requires pages_manage_ads permission" xatosini beradi.)
+      'pages_manage_ads',
     ].join(',');
     const url =
       `https://www.facebook.com/${GRAPH_API_VERSION}/dialog/oauth` +
