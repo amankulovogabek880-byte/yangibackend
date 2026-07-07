@@ -13,6 +13,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { Cron } from '@nestjs/schedule';
 import type { Response } from 'express';
 import * as crypto from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -145,6 +146,9 @@ export class FacebookLeadsService {
       assignToAgentId: s.facebookAssignAgentId || null,
       isEnabled: !!decrypted && !!s.facebookPageId,
       connectedAt: s.facebookConnectedAt || null,
+      // Fon jarayoni (yoki oxirgi qo'lda tekshirish) natijasi — frontend
+      // sahifani ochganda tugma bosmasdan darhol shu holatni ko'rsata oladi.
+      lastCheck: s.facebookLastCheck || null,
     };
   }
 
@@ -894,7 +898,7 @@ export class FacebookLeadsService {
         ? { errorType: subscribeResult.errorType || 'UNKNOWN', message: subscribeResult.rawMessage || '' }
         : null) || subError || formsError || null;
 
-    return {
+    const result = {
       connected: true,
       pageId,
       pageName: s.facebookPageName || null,
@@ -902,6 +906,74 @@ export class FacebookLeadsService {
       forms,
       error: primaryError, // null bo'lsa — hammasi joyida
     };
+
+    // Natijani tenant.settings ichida saqlaymiz — shunda frontend sahifani
+    // ochganda (tugma bosmasdan) ham oxirgi holatni darhol ko'rsata oladi,
+    // va fon jarayoni (Cron) ham shu natijani yozib qo'yadi.
+    await this.saveLastCheck(tenantId, {
+      checkedAt: new Date().toISOString(),
+      connected: true,
+      leadgenSubscribed,
+      formsCount: forms.length,
+      error: primaryError,
+    }).catch(() => {});
+
+    return result;
+  }
+
+  /** Oxirgi tekshiruv natijasini tenant.settings ichiga yozadi (xato bo'lsa ham jim o'tadi). */
+  private async saveLastCheck(tenantId: string, lastCheck: Record<string, any>) {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const cur: any = tenant?.settings || {};
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: { settings: { ...cur, facebookLastCheck: lastCheck } },
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // AVTOMATIK FON TEKSHIRUVI (background polling)
+  //
+  // Nega kerak: admin har safar qo'lda "Tekshirish/Yangilash" tugmasini
+  // bosishi shart bo'lmasin. Har 10 daqiqada barcha ulangan tenantlar
+  // uchun Facebook'dan formalar ro'yxati va webhook obuna holati
+  // avtomatik so'raladi, natija (va xato bo'lsa — aniq sababi) tenant
+  // sozlamalarida saqlanadi. Frontend Sozlamalar sahifasini ochganda
+  // shu saqlangan natijani darhol ko'rsatadi — foydalanuvchi hech
+  // narsa bosmasa ham "nega ko'rinmayapti" degan savolga javob tayyor.
+  // ═══════════════════════════════════════════════════════════════
+
+  @Cron('0 */10 * * * *') // har 10 daqiqada
+  async pollAllTenants() {
+    let tenants: Array<{ id: string; settings: any }> = [];
+    try {
+      tenants = await this.prisma.tenant.findMany({
+        where: { status: 'ACTIVE' as any },
+        select: { id: true, settings: true },
+      });
+    } catch (e: any) {
+      this.logger.error('Facebook poll: tenantlarni olishda xato: ' + e.message);
+      return;
+    }
+
+    const withFacebook = tenants.filter((t) => {
+      const s: any = t.settings || {};
+      return !!s.facebookPageId && !!s.facebookPageAccessToken;
+    });
+
+    if (withFacebook.length === 0) return;
+
+    this.logger.log(`Facebook poll: ${withFacebook.length} ta tenant tekshirilmoqda...`);
+    for (const t of withFacebook) {
+      try {
+        await this.verifyAndListForms(t.id);
+      } catch (e: any) {
+        this.logger.error(`Facebook poll xato (tenant ${t.id}): ` + e.message);
+      }
+    }
   }
 
   /**
