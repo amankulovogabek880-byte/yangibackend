@@ -25,7 +25,7 @@ import { RoundRobinService, RoundRobinModule } from '../v9/round-robin.module';
 import { LeadScoringService, LeadScoringModule } from '../v9/lead-scoring.module';
 import { AutoReplyService, AutoReplyModule } from '../v9/auto-reply.module';
 
-const GRAPH_API_VERSION = 'v19.0';
+const GRAPH_API_VERSION = 'v23.0';
 
 // ── FACEBOOK XATOLARINI TASNIFLASH ──────────────────────────────────
 // Graph API turli xil holatlarda turlicha xato qaytaradi (permission
