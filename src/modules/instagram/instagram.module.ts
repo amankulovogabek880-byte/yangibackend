@@ -10,6 +10,10 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser, Public } from '../../common/decorators';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 
+// Meta Graph API versiyasi — bitta joyda turadi.
+// Eskirsa (masalan v23 -> v25) faqat shu qatorni o'zgartiring.
+const GRAPH_API_VERSION = 'v23.0';
+
 type BotStep = 'ASK_NAME' | 'ASK_DESTINATION' | 'ASK_PHONE' | 'ASK_DATE' | 'DONE';
 
 interface BotSession {
@@ -109,7 +113,7 @@ export class InstagramService {
   /** Page/Instagram akkauntini shu Meta ilovamizga webhook uchun obuna qiladi. */
   private async subscribeAppToPage(pageId: string, accessToken: string) {
     try {
-      const url = `https://graph.facebook.com/v18.0/${pageId}/subscribed_apps` +
+      const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${pageId}/subscribed_apps` +
         `?subscribed_fields=messages,messaging_postbacks` +
         `&access_token=${encodeURIComponent(accessToken)}`;
       const res = await fetch(url, { method: 'POST' });
@@ -312,7 +316,7 @@ export class InstagramService {
   private async reply(accessToken: string, recipientId: string, text: string) {
     if (!accessToken) { this.logger.warn('Instagram: no accessToken'); return; }
     try {
-      const res = await fetch('https://graph.facebook.com/v18.0/me/messages', {
+      const res = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/me/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + accessToken },
         body: JSON.stringify({ recipient: { id: recipientId }, message: { text }, messaging_type: 'RESPONSE' }),
