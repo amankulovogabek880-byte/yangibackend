@@ -1730,3 +1730,186 @@ model TelegramPendingAuth {
   @@index([userId])
   @@map("telegram_pending_auth")
 }
+
+// ═══════════════════════════════════════════════════════════════
+// TURLAR BOZORI (MARKETPLACE) — v12
+// ═══════════════════════════════════════════════════════════════
+//
+// Maqsad: O'zbekistondagi tur operatorlarning turlarini bitta joyga
+// yig'ib, BARCHA agentliklar (tenantlar) ko'rishi va bron so'rovi
+// yuborishi.
+//
+// MUHIM ARXITEKTURA QARORI:
+//   TourOperator va MarketplaceTour — tenantga BOG'LANMAGAN (global).
+//   Ya'ni bitta operator turi hamma agentlikka ko'rinadi.
+//   TourBookingRequest esa tenantga tegishli — kim so'rov yuborganini
+//   biladi va faqat o'z so'rovlarini ko'radi.
+//
+// XAVFSIZLIK: credLogin/credPassword/apiKey maydonlari
+// EncryptionService orqali SHIFRLANGAN holda saqlanadi.
+// Hech qachon API javobida ochiq qaytarilmaydi.
+// ═══════════════════════════════════════════════════════════════
+
+enum IntegrationType {
+  MANUAL // Admin qo'lda kiritadi
+  EXCEL  // Excel/CSV import
+  API    // Operator API'si orqali avtomatik
+}
+
+enum TourOperatorStatus {
+  ACTIVE
+  INACTIVE
+  ERROR // Oxirgi sinxronizatsiya xato bilan tugadi
+}
+
+enum MarketplaceTourStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum TourRequestStatus {
+  PENDING   // Agent so'rov yubordi, operator hali javob bermadi
+  SENT      // Operatorga yuborildi
+  CONFIRMED // Operator tasdiqladi
+  REJECTED  // Operator rad etdi
+  CANCELLED // Agent bekor qildi
+}
+
+model TourOperator {
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  description String?
+  logoUrl     String?
+
+  contactPhone String?
+  contactEmail String?
+  website      String?
+
+  integrationType IntegrationType @default(MANUAL)
+
+  // ── Maxfiy ma'lumotlar (SHIFRLANGAN saqlanadi) ──
+  apiBaseUrl   String?
+  credLogin    String? // encrypted
+  credPassword String? // encrypted
+  apiKey       String? // encrypted
+
+  status        TourOperatorStatus @default(ACTIVE)
+  lastSyncAt    DateTime?
+  lastSyncError String?
+  toursCount    Int                @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tours    MarketplaceTour[]
+  requests TourBookingRequest[]
+
+  @@index([status])
+  @@index([slug])
+  @@map("tour_operators")
+}
+
+model MarketplaceTour {
+  id         String       @id @default(cuid())
+  operatorId String
+  operator   TourOperator @relation(fields: [operatorId], references: [id], onDelete: Cascade)
+
+  // Operatorning o'z tizimidagi ID — takror import bo'lmasligi uchun
+  externalId String?
+
+  title       String
+  destination String
+  country     String?
+  city        String?
+  tourType    TourType @default(PACKAGE)
+  description String?
+
+  // ── Narx ──
+  price       Float
+  currency    Currency @default(USD)
+  priceNote   String? // "1 kishi uchun", "2 kishilik xonada" va h.k.
+
+  // ── Sana / davomiylik ──
+  departureDate DateTime?
+  returnDate    DateTime?
+  duration      Int? // kun
+
+  // ── Joylar ──
+  seatsTotal     Int?
+  seatsAvailable Int?
+
+  // ── Mehmonxona ──
+  hotelName  String?
+  hotelStars Int?
+  mealPlan   String? // BB, HB, FB, AI, UAI
+
+  // ── Nima kiradi ──
+  includesVisa      Boolean @default(false)
+  includesFlights   Boolean @default(false)
+  includesHotel     Boolean @default(false)
+  includesMeals     Boolean @default(false)
+  includesTransfer  Boolean @default(false)
+  includesInsurance Boolean @default(false)
+
+  images Json  @default("[]") // string[] — rasm URL'lari
+  raw    Json? // Operatordan kelgan asl ma'lumot (debug uchun)
+
+  status   MarketplaceTourStatus @default(PUBLISHED)
+  syncedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  requests TourBookingRequest[]
+
+  @@unique([operatorId, externalId])
+  @@index([status])
+  @@index([destination])
+  @@index([country])
+  @@index([departureDate])
+  @@index([operatorId])
+  @@map("marketplace_tours")
+}
+
+model TourBookingRequest {
+  id         String @id @default(cuid())
+  requestRef String @unique
+
+  // Tenantga bog'liq — lekin relation EMAS (mavjud modellarni
+  // o'zgartirmaslik uchun). Faqat ID + index.
+  tenantId String
+  agentId  String?
+  clientId String?
+
+  // Tasdiqlangach yaratilgan haqiqiy Booking ID'si
+  bookingId String?
+
+  tourId String
+  tour   MarketplaceTour @relation(fields: [tourId], references: [id], onDelete: Cascade)
+
+  operatorId String
+  operator   TourOperator @relation(fields: [operatorId], references: [id], onDelete: Cascade)
+
+  adults   Int @default(1)
+  children Int @default(0)
+  infants  Int @default(0)
+
+  contactName  String?
+  contactPhone String?
+  note         String?
+
+  status           TourRequestStatus @default(PENDING)
+  operatorResponse String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([tourId])
+  @@index([operatorId])
+  @@index([agentId])
+  @@map("tour_booking_requests")
+}

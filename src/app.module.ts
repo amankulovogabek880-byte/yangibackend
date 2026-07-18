@@ -58,6 +58,8 @@ import { PhoneProvidersModule } from './modules/phone-providers/phone-providers.
 import { WhatsAppModule } from './modules/whatsapp/whatsapp.module';
 import { HealthModule } from './modules/health/health.module';
 import { ExchangeRateModule } from './modules/exchange-rate/exchange-rate.module';
+// v12: Turlar bozori (marketplace) — tur operatorlar + umumiy turlar + bron so'rovlari
+import { MarketplaceModule } from './modules/marketplace/marketplace.module';
 
 @Module({
   imports: [
@@ -120,6 +122,7 @@ import { ExchangeRateModule } from './modules/exchange-rate/exchange-rate.module
     HealthModule,
     WhatsAppModule, // BUG1 FIX
     ExchangeRateModule, // v10: CBU.uz valyuta kursi (offer/booking currency konvertatsiyasi)
+    MarketplaceModule,  // v12: Turlar bozori
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
