@@ -77,10 +77,17 @@ export interface PhoneConfig {
   // OnlinePBX
   onlinepbx?: {
     domain?: string;        // sizning_kompaniya.onpbx.ru
-    apiKey?: string;
-    apiId?: string;
+    apiKey?: string;        // Kabinet → Интеграция → API
     callerId?: string;      // sizning_raqamingiz: 71-XXX-XX-XX
     recordingEnabled?: boolean;
+    /**
+     * Qo'ng'iroq boshlash endpointi.
+     * OnlinePBX hujjatida aniq nomi o'zgarishi mumkin, shuning uchun
+     * qattiq yozilmagan. Standart: command/reverse.json
+     */
+    originatePath?: string;
+    /** Eski API 1.0 sozlamasi — endi ishlatilmaydi (moslik uchun) */
+    apiId?: string;
   };
 
   // Twilio

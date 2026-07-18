@@ -754,14 +754,18 @@ export class MarketplaceService {
     const children = Math.max(0, Number(data?.children) || 0);
     const infants = Math.max(0, Number(data?.infants) || 0);
 
-    // Bo'sh joy tekshiruvi (chaqaloqlar joy egallamaydi deb hisoblaymiz)
+    // Bo'sh joy (chaqaloqlar joy egallamaydi deb hisoblaymiz).
+    // Bu yerda faqat ERTA xabar beramiz; haqiqiy kafolat quyida —
+    // atomik rezervatsiyada (poygadan himoya).
     const needSeats = adults + children;
-    if (tour.seatsAvailable !== null && tour.seatsAvailable !== undefined) {
-      if (tour.seatsAvailable < needSeats) {
-        throw new BadRequestException(
-          `Bo'sh joy yetarli emas. Mavjud: ${tour.seatsAvailable}, kerak: ${needSeats}`,
-        );
-      }
+    if (
+      tour.seatsAvailable !== null &&
+      tour.seatsAvailable !== undefined &&
+      tour.seatsAvailable < needSeats
+    ) {
+      throw new BadRequestException(
+        `Bo'sh joy yetarli emas. Mavjud: ${tour.seatsAvailable}, kerak: ${needSeats}`,
+      );
     }
 
     // ── Narx: tur valyutasida, keyin USD'ga o'giriladi ──
@@ -796,6 +800,26 @@ export class MarketplaceService {
     // Foyda = sotuv narxi - tannarx (bookings moduli bilan bir xil mantiq)
     const profit = Math.max(0, Math.round((totalPrice - supplierCost) * 100) / 100);
 
+    // ═══ ATOMIK REZERVATSIYA (poygadan himoya) ═══
+    // Ikki agent bir vaqtda oxirgi joyni bron qilsa, oddiy "o'qi-keyin-yoz"
+    // usulida IKKALASI ham o'tib ketardi. Bu yerda shart bitta SQL
+    // UPDATE ichida tekshiriladi: joy yetmasa count = 0 qaytadi va
+    // hech narsa o'zgarmaydi.
+    let seatsReserved = false;
+    if (tour.seatsAvailable !== null && tour.seatsAvailable !== undefined) {
+      const reserve = await this.prisma.marketplaceTour.updateMany({
+        where: { id: tour.id, seatsAvailable: { gte: needSeats } },
+        data: { seatsAvailable: { decrement: needSeats } },
+      });
+      if (!reserve?.count) {
+        throw new BadRequestException(
+          "Kechirasiz, bu turdagi joylar hozirgina band bo'lib ketdi. " +
+          'Sahifani yangilab, qayta urinib ko\'ring.',
+        );
+      }
+      seatsReserved = true;
+    }
+
     // ── Booking raqami ──
     const count = await this._prisma.booking.count({ where: { tenantId } });
     let bookingRef = generateRef('TRV', count);
@@ -808,7 +832,9 @@ export class MarketplaceService {
       data?.note ? `Izoh: ${data.note}` : '',
     ].filter(Boolean).join('\n\n');
 
-    const booking = await this._prisma.booking.create({
+    let booking: any;
+    try {
+      booking = await this._prisma.booking.create({
       data: {
         bookingRef,
         tenantId,
@@ -845,14 +871,17 @@ export class MarketplaceService {
         includesInsurance: tour.includesInsurance,
         status: safeEnum(data?.status, BOOKING_STATUSES, 'DRAFT'),
       },
-    });
-
-    // Bo'sh joylar sonini kamaytiramiz (agar hisoblanayotgan bo'lsa)
-    if (tour.seatsAvailable !== null && tour.seatsAvailable !== undefined) {
-      await this.prisma.marketplaceTour.update({
-        where: { id: tour.id },
-        data: { seatsAvailable: Math.max(0, tour.seatsAvailable - needSeats) },
       });
+    } catch (e) {
+      // Booking yaratilmadi — band qilingan joylarni QAYTARAMIZ,
+      // aks holda joylar "yo'qolib" qolardi.
+      if (seatsReserved) {
+        await this.prisma.marketplaceTour.updateMany({
+          where: { id: tour.id },
+          data: { seatsAvailable: { increment: needSeats } },
+        }).catch(() => {});
+      }
+      throw e;
     }
 
     // ── Mijoz tarixiga yozamiz + statistikani qayta hisoblaymiz ──

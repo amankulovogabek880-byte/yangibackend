@@ -9,6 +9,7 @@ import { CurrentUser, Roles } from '../../common/decorators';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ClientsService } from '../clients/clients.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { InstagramService, InstagramModule } from '../instagram/instagram.module';
 import TelegramBot from 'node-telegram-bot-api';
 import { paginate, meta } from '../../common/utils/helpers';
 import { Prisma } from '@prisma/client';
@@ -32,6 +33,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     private enc: EncryptionService,
     // v14: shaxsiy (MTProto) suhbatларга invoice/booking/xabar yuborish uchun
     private userTelegram: UserTelegramService,
+    // v12.2: Instagram suhbatiga Chat'dan javob yuborish uchun
+    private instagram: InstagramService,
   ) {}
 
   async onModuleInit() {
@@ -444,6 +447,18 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           data: { assignedAgentId: agentId },
         });
       }
+    }
+
+    // ── v12.2: INSTAGRAM suhbati ──
+    // Instagram'da Telegram bot yo'q — xabar Graph API orqali ketadi.
+    // Xabarni bazaga InstagramService o'zi yozadi (24 soatlik oynani
+    // tekshirgach), shuning uchun bu yerda erta return qilamiz.
+    if (!isInternal && conv.channel === 'INSTAGRAM') {
+      const igMsg = await this.instagram.sendAgentMessage(
+        tenantId, conversationId, text, agentId,
+      );
+      this.realtime.emitToUser(agentId, 'message:new', igMsg);
+      return igMsg;
     }
 
     // v14 FIX: shaxsiy (MTProto) account orqali kelgan suhbatда BOT ishlamaydi
@@ -1590,7 +1605,8 @@ export class TelegramController {
 }
 
 @Module({
-  imports: [UserTelegramModule],
+  // v12.2: Instagram suhbatlariga Chat'dan javob berish uchun
+  imports: [UserTelegramModule, InstagramModule],
   controllers: [TelegramController],
   providers: [TelegramService, ClientsService],
   exports: [TelegramService],

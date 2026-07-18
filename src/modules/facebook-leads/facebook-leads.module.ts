@@ -22,6 +22,7 @@ import { CurrentUser, Public, Roles } from '../../common/decorators';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { EncryptionService } from '../../common/encryption/encryption.service';
 import { RoundRobinService, RoundRobinModule } from '../v9/round-robin.module';
+import { InstagramService, InstagramModule } from '../instagram/instagram.module';
 import { LeadScoringService, LeadScoringModule } from '../v9/lead-scoring.module';
 import { AutoReplyService, AutoReplyModule } from '../v9/auto-reply.module';
 
@@ -130,6 +131,8 @@ export class FacebookLeadsService {
     private roundRobin: RoundRobinService,
     private scoring: LeadScoringService,
     private autoReply: AutoReplyService,
+    // v12.2: bitta OAuth tugmasi Instagram'ni ham ulaydi
+    private instagram: InstagramService,
   ) {}
 
   // ── SOZLAMALAR ────────────────────────────────────────────────────
@@ -617,6 +620,15 @@ export class FacebookLeadsService {
       // (ilgari 'ads_management' so'ralardi — bu edge uni qabul qilmaydi
       //  va "(#200) Requires pages_manage_ads permission" xatosini beradi.)
       'pages_manage_ads',
+      // ── v12.2: Instagram DM ham SHU BITTA tugma orqali ulanadi ──
+      // Instagram Business akkaunt Facebook Page'ga bog'langani uchun
+      // bir xil Page Access Token ikkalasiga ham yaraydi.
+      // DIQQAT: bu ruxsatlar ham App Review talab qiladi.
+      'instagram_basic',
+      'instagram_manage_messages',
+      // Meta hujjatiga ko'ra pages_messaging va instagram_manage_messages
+      // uchun business_management bog'liqlik hisoblanadi.
+      'pages_messaging',
     ].join(',');
     const url =
       `https://www.facebook.com/${GRAPH_API_VERSION}/dialog/oauth` +
@@ -818,6 +830,22 @@ export class FacebookLeadsService {
       pageName: found.name,
     });
 
+    // ── v12.2: SHU BITTA tugma Instagram DM'ni ham ulaydi ──
+    // Instagram Business akkaunt Facebook Page'ga bog'langani uchun
+    // bir xil Page Access Token ikkalasi uchun ham yaraydi.
+    // Xato bo'lsa Facebook ulanishini buzmaymiz — jimgina log qilamiz.
+    let instagramConnected = false;
+    try {
+      await this.instagram.saveConfig(tenantId, {
+        accessToken: plainToken,
+        pageId: found.id,
+      });
+      instagramConnected = true;
+      this.logger.log(`Instagram ham ulandi: Page ${found.name}`);
+    } catch (e: any) {
+      this.logger.warn(`Instagram ulanmadi (Facebook ishlayapti): ${e?.message}`);
+    }
+
     // vaqtinchalik ro'yxatni tozalab qo'yamiz
     const fresh = await this.prisma.tenant.findUnique({
       where: { id: tenantId },
@@ -830,7 +858,7 @@ export class FacebookLeadsService {
       data: { settings: freshSettings },
     });
 
-    return result;
+    return { ...(result as any), instagramConnected };
   }
 
   /**
@@ -1157,7 +1185,7 @@ export class FacebookLeadsController {
 }
 
 @Module({
-  imports: [RoundRobinModule, LeadScoringModule, AutoReplyModule],
+  imports: [RoundRobinModule, LeadScoringModule, AutoReplyModule, InstagramModule],
   controllers: [FacebookLeadsController],
   providers: [FacebookLeadsService],
   exports: [FacebookLeadsService],

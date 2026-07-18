@@ -158,6 +158,29 @@ export class CallsService {
     return updated;
   }
 
+  /**
+   * Telefoniya ulanishini tekshiradi.
+   *
+   * OnlinePBX uchun bu FAQAT auth.json'ni chaqiradi — u rasmiy hujjatda
+   * tasdiqlangan endpoint, shuning uchun natijaga ishonish mumkin:
+   * muvaffaqiyatli bo'lsa domen va API kalit to'g'ri degani.
+   */
+  async testConnection(tenantId: string) {
+    const provider: any = await this.providerFactory.getProvider(tenantId);
+    if (!provider) {
+      return { success: false, message: 'Telefoniya provayderi sozlanmagan' };
+    }
+    if (typeof provider.testConnection !== 'function') {
+      return {
+        success: provider.isConfigured?.() ?? false,
+        message: provider.isConfigured?.()
+          ? `${provider.name}: sozlangan (bu provayder alohida tekshiruvni qo'llab-quvvatlamaydi)`
+          : `${provider.name}: sozlanmagan`,
+      };
+    }
+    return provider.testConnection();
+  }
+
   async handleWebhook(body: any) {
     const providerName = this.providerFactory.identifyProvider(body);
     if (!providerName) {
@@ -309,6 +332,13 @@ export class CallsService {
 @Controller('calls')
 export class CallsController {
   constructor(private svc: CallsService) {}
+
+  @ApiOperation({ summary: 'Telefoniya ulanishini tekshirish' })
+  @Post('test-connection')
+  @UseGuards(JwtAuthGuard)
+  testConnection(@CurrentUser() u: any) {
+    return this.svc.testConnection(u.tenantId);
+  }
 
   @ApiOperation({ summary: "Qo'ng'iroqlar tarixi" })
   @Get()
