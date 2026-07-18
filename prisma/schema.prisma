@@ -384,6 +384,9 @@ model Tenant {
   auditLogs     AuditLog[]
   tags          Tag[]
   customStages  CustomStage[]
+  // v12.1: Turlar bozori — har bir tenant o'z operatorlarini boshqaradi
+  tourOperators    TourOperator[]
+  marketplaceTours MarketplaceTour[]
 
   @@index([status])
   @@map("tenants")
@@ -693,6 +696,9 @@ model CustomStage {
 model Booking {
   id            String        @id @default(cuid())
   bookingRef    String        @unique
+  // v12.1: Turlar bozoridan yaratilgan bo'lsa — qaysi turdan.
+  // Booking bekor qilinsa/o'chirilsa shu tur joylari qaytariladi.
+  marketplaceTourId String?
   tenantId      String
   tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   clientId      String
@@ -823,6 +829,7 @@ model Booking {
   @@index([tenantId, createdAt])
   // Perf: dashboard/revenue aggregate'lari (tenantId + status IN + createdAt oralig'i)
   @@index([tenantId, status, createdAt])
+  @@index([marketplaceTourId])
   @@map("bookings")
 }
 
@@ -1732,26 +1739,26 @@ model TelegramPendingAuth {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// TURLAR BOZORI (MARKETPLACE) — v12
+// TURLAR BOZORI (MARKETPLACE) — v12.1
 // ═══════════════════════════════════════════════════════════════
 //
-// Maqsad: O'zbekistondagi tur operatorlarning turlarini bitta joyga
-// yig'ib, BARCHA agentliklar (tenantlar) ko'rishi va bron so'rovi
-// yuborishi.
+// Maqsad: har bir agentlik (tenant) O'ZI ishlaydigan tur operatorlarni
+// qo'shadi, ularning turlari CRM ichida ko'rinadi va agent shu yerdan
+// to'g'ridan-to'g'ri BOOKING qiladi.
 //
-// MUHIM ARXITEKTURA QARORI:
-//   TourOperator va MarketplaceTour — tenantga BOG'LANMAGAN (global).
-//   Ya'ni bitta operator turi hamma agentlikka ko'rinadi.
-//   TourBookingRequest esa tenantga tegishli — kim so'rov yuborganini
-//   biladi va faqat o'z so'rovlarini ko'radi.
+// ARXITEKTURA (v12 dan farqi):
+//   - TourOperator va MarketplaceTour endi TENANTGA BOG'LANGAN.
+//     A kompaniyaning operatori B kompaniyaga KO'RINMAYDI.
+//   - Operator soni cheklanmagan.
+//   - "Bron so'rovi" (TourBookingRequest) bosqichi OLIB TASHLANDI —
+//     agent turni bosib to'g'ridan-to'g'ri Booking yaratadi.
 //
-// XAVFSIZLIK: credLogin/credPassword/apiKey maydonlari
-// EncryptionService orqali SHIFRLANGAN holda saqlanadi.
-// Hech qachon API javobida ochiq qaytarilmaydi.
+// XAVFSIZLIK: credLogin/credPassword/apiKey — EncryptionService orqali
+// SHIFRLANGAN saqlanadi va API javobida hech qachon ochiq qaytmaydi.
 // ═══════════════════════════════════════════════════════════════
 
 enum IntegrationType {
-  MANUAL // Admin qo'lda kiritadi
+  MANUAL // Qo'lda kiritish
   EXCEL  // Excel/CSV import
   API    // Operator API'si orqali avtomatik
 }
@@ -1768,18 +1775,13 @@ enum MarketplaceTourStatus {
   ARCHIVED
 }
 
-enum TourRequestStatus {
-  PENDING   // Agent so'rov yubordi, operator hali javob bermadi
-  SENT      // Operatorga yuborildi
-  CONFIRMED // Operator tasdiqladi
-  REJECTED  // Operator rad etdi
-  CANCELLED // Agent bekor qildi
-}
-
 model TourOperator {
-  id          String  @id @default(cuid())
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
   name        String
-  slug        String  @unique
+  slug        String
   description String?
   logoUrl     String?
 
@@ -1789,11 +1791,11 @@ model TourOperator {
 
   integrationType IntegrationType @default(MANUAL)
 
-  // ── Maxfiy ma'lumotlar (SHIFRLANGAN saqlanadi) ──
+  // ── Maxfiy ma'lumotlar (SHIFRLANGAN) ──
   apiBaseUrl   String?
-  credLogin    String? // encrypted
-  credPassword String? // encrypted
-  apiKey       String? // encrypted
+  credLogin    String?
+  credPassword String?
+  apiKey       String?
 
   status        TourOperatorStatus @default(ACTIVE)
   lastSyncAt    DateTime?
@@ -1803,16 +1805,21 @@ model TourOperator {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  tours    MarketplaceTour[]
-  requests TourBookingRequest[]
+  tours MarketplaceTour[]
 
+  // Slug faqat tenant ichida takrorlanmas — turli kompaniyalar bir xil
+  // nomdagi operatorni qo'shishi mumkin.
+  @@unique([tenantId, slug])
+  @@index([tenantId])
   @@index([status])
-  @@index([slug])
   @@map("tour_operators")
 }
 
 model MarketplaceTour {
-  id         String       @id @default(cuid())
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
   operatorId String
   operator   TourOperator @relation(fields: [operatorId], references: [id], onDelete: Cascade)
 
@@ -1826,26 +1833,27 @@ model MarketplaceTour {
   tourType    TourType @default(PACKAGE)
   description String?
 
-  // ── Narx ──
-  price       Float
-  currency    Currency @default(USD)
-  priceNote   String? // "1 kishi uchun", "2 kishilik xonada" va h.k.
+  // BRUTTO — mijoz to'laydigan narx (1 kishi uchun)
+  price     Float
+  // NETTO — operatordan sotib olish narxi (1 kishi uchun).
+  // Booking yaratilganda supplierCost shundan hisoblanadi va
+  // foyda = totalPrice - supplierCost bo'ladi. Bo'sh bo'lsa foyda
+  // hisoblanmaydi (0), lekin hisobot buzilmaydi.
+  netPrice  Float?
+  currency  Currency @default(USD)
+  priceNote String?
 
-  // ── Sana / davomiylik ──
   departureDate DateTime?
   returnDate    DateTime?
-  duration      Int? // kun
+  duration      Int?
 
-  // ── Joylar ──
   seatsTotal     Int?
   seatsAvailable Int?
 
-  // ── Mehmonxona ──
   hotelName  String?
   hotelStars Int?
-  mealPlan   String? // BB, HB, FB, AI, UAI
+  mealPlan   String?
 
-  // ── Nima kiradi ──
   includesVisa      Boolean @default(false)
   includesFlights   Boolean @default(false)
   includesHotel     Boolean @default(false)
@@ -1853,8 +1861,8 @@ model MarketplaceTour {
   includesTransfer  Boolean @default(false)
   includesInsurance Boolean @default(false)
 
-  images Json  @default("[]") // string[] — rasm URL'lari
-  raw    Json? // Operatordan kelgan asl ma'lumot (debug uchun)
+  images Json  @default("[]")
+  raw    Json?
 
   status   MarketplaceTourStatus @default(PUBLISHED)
   syncedAt DateTime?
@@ -1862,54 +1870,12 @@ model MarketplaceTour {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  requests TourBookingRequest[]
-
   @@unique([operatorId, externalId])
+  @@index([tenantId])
   @@index([status])
   @@index([destination])
   @@index([country])
   @@index([departureDate])
   @@index([operatorId])
   @@map("marketplace_tours")
-}
-
-model TourBookingRequest {
-  id         String @id @default(cuid())
-  requestRef String @unique
-
-  // Tenantga bog'liq — lekin relation EMAS (mavjud modellarni
-  // o'zgartirmaslik uchun). Faqat ID + index.
-  tenantId String
-  agentId  String?
-  clientId String?
-
-  // Tasdiqlangach yaratilgan haqiqiy Booking ID'si
-  bookingId String?
-
-  tourId String
-  tour   MarketplaceTour @relation(fields: [tourId], references: [id], onDelete: Cascade)
-
-  operatorId String
-  operator   TourOperator @relation(fields: [operatorId], references: [id], onDelete: Cascade)
-
-  adults   Int @default(1)
-  children Int @default(0)
-  infants  Int @default(0)
-
-  contactName  String?
-  contactPhone String?
-  note         String?
-
-  status           TourRequestStatus @default(PENDING)
-  operatorResponse String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([tenantId])
-  @@index([status])
-  @@index([tourId])
-  @@index([operatorId])
-  @@index([agentId])
-  @@map("tour_booking_requests")
 }

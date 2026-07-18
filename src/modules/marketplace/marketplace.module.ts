@@ -27,6 +27,11 @@ import {
   safeEnum,
   convertToUSD,
 } from '../../common/utils/helpers';
+import { AuditService } from '../audit/audit.module';
+import { NotificationsService } from '../notifications/notifications.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { ClientsService } from '../clients/clients.service';
+import { CacheService } from '../../common/cache/cache.service';
 
 /**
  * ═══════════════════════════════════════════════════════════════
@@ -70,8 +75,10 @@ const TOUR_TYPES = [
   'HOTEL_ONLY', 'FLIGHT_ONLY', 'CRUISE',
 ] as const;
 const CURRENCIES = ['USD', 'UZS', 'EUR', 'RUB'] as const;
+// DIQQAT: bu ro'yxat prisma'dagi BookingStatus enum bilan AYNAN mos
+// bo'lishi shart (PENDING/PAID kabi mavjud bo'lmagan status yozilmasin).
 const BOOKING_STATUSES = [
-  'DRAFT', 'PENDING', 'CONFIRMED', 'PAID', 'COMPLETED', 'CANCELLED',
+  'DRAFT', 'CONFIRMED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED',
 ] as const;
 
 /** Bitta import/sinxronizatsiyada maksimal tur soni (himoya) */
@@ -88,6 +95,11 @@ export class MarketplaceService {
   constructor(
     private _prisma: PrismaService,
     private encryption: EncryptionService,
+    private audit: AuditService,
+    private notifications: NotificationsService,
+    private realtime: RealtimeGateway,
+    private clients: ClientsService,
+    private cache: CacheService,
   ) {}
 
   /**
@@ -216,6 +228,12 @@ export class MarketplaceService {
         ? String(pick('description', 'desc', 'tavsif', 'описание')).slice(0, 5000) : null,
 
       price,
+      // NETTO — operatordan sotib olish narxi. Bo'lsa foyda to'g'ri
+      // hisoblanadi; bo'lmasa null qoladi va supplierCost 0 bo'ladi.
+      netPrice: this.toNum(
+        pick('netPrice', 'net_price', 'netto', 'supplierCost', 'supplier_cost',
+             'tannarx', 'нетто', 'себестоимость'),
+      ),
       currency: safeEnum(pick('currency', 'valyuta', 'валюта'), CURRENCIES, 'USD'),
       priceNote: pick('priceNote', 'price_note')
         ? String(pick('priceNote', 'price_note')).slice(0, 200) : null,
@@ -275,7 +293,7 @@ export class MarketplaceService {
     return this.maskOperator(op);
   }
 
-  async createOperator(tenantId: string, data: any) {
+  async createOperator(tenantId: string, userId: string, data: any) {
     if (!data?.name) throw new BadRequestException('Operator nomi (name) kerak');
 
     const slug = this.makeSlug(data.slug || data.name);
@@ -306,11 +324,17 @@ export class MarketplaceService {
       },
     });
 
+    this.audit.log({
+      tenantId, userId,
+      action: 'CREATE', entity: 'tour_operator', entityId: created.id,
+      metadata: { name: created.name, integrationType: created.integrationType },
+    });
+
     this.logger.log(`Operator yaratildi [${tenantId}]: ${created.name}`);
     return this.maskOperator(created);
   }
 
-  async updateOperator(tenantId: string, id: string, data: any) {
+  async updateOperator(tenantId: string, userId: string, id: string, data: any) {
     const op = await this.prisma.tourOperator.findFirst({ where: { id, tenantId } });
     if (!op) throw new NotFoundException('Operator topilmadi');
 
@@ -348,16 +372,40 @@ export class MarketplaceService {
       patch.slug = slug;
     }
 
+    // DIQQAT: audit'ga parol/kalit QIYMATI yozilmaydi — faqat
+    // o'zgartirilgan-o'zgartirilmagani qayd etiladi.
+    const credsTouched = ['credLogin', 'credPassword', 'apiKey'].filter(
+      (k) => patch[k] !== undefined,
+    );
+
     const updated = await this.prisma.tourOperator.update({ where: { id }, data: patch });
+
+    this.audit.log({
+      tenantId, userId,
+      action: 'UPDATE', entity: 'tour_operator', entityId: id,
+      metadata: {
+        name: updated.name,
+        fieldsChanged: Object.keys(patch),
+        credentialsChanged: credsTouched.length > 0 ? credsTouched : undefined,
+      },
+    });
+
     return this.maskOperator(updated);
   }
 
-  async deleteOperator(tenantId: string, id: string) {
+  async deleteOperator(tenantId: string, userId: string, id: string) {
     const op = await this.prisma.tourOperator.findFirst({ where: { id, tenantId } });
     if (!op) throw new NotFoundException('Operator topilmadi');
 
     // Cascade: turlari ham o'chadi (schema'da onDelete: Cascade)
     await this.prisma.tourOperator.delete({ where: { id } });
+
+    this.audit.log({
+      tenantId, userId,
+      action: 'DELETE', entity: 'tour_operator', entityId: id,
+      metadata: { name: op.name, toursDeleted: op.toursCount },
+    });
+
     this.logger.warn(`Operator o'chirildi [${tenantId}]: ${op.name}`);
     return { success: true, message: `"${op.name}" operatori o'chirildi` };
   }
@@ -366,7 +414,7 @@ export class MarketplaceService {
   // IMPORT / SINXRONIZATSIYA
   // ═══════════════════════════════════════════════════════════
 
-  async importTours(tenantId: string, operatorId: string, tours: any[], replaceAll = false) {
+  async importTours(tenantId: string, userId: string, operatorId: string, tours: any[], replaceAll = false) {
     const op = await this.prisma.tourOperator.findFirst({ where: { id: operatorId, tenantId } });
     if (!op) throw new NotFoundException('Operator topilmadi');
 
@@ -443,6 +491,12 @@ export class MarketplaceService {
       data: { toursCount: total, lastSyncAt: new Date(), lastSyncError: null, status: 'ACTIVE' },
     });
 
+    this.audit.log({
+      tenantId, userId,
+      action: 'IMPORT', entity: 'marketplace_tour', entityId: operatorId,
+      metadata: { operator: op.name, created, updated, archived, skipped: skipped.length },
+    });
+
     this.logger.log(
       `Import [${op.name}]: +${created} yangi, ~${updated} yangilandi, ${skipped.length} o'tkazildi`,
     );
@@ -466,7 +520,7 @@ export class MarketplaceService {
    * apiBaseUrl'ga GET yuboradi va JSON massiv (yoki {data|tours|result: [...]})
    * kutadi. Operator boshqacha format bersa — shu joyni moslash kerak.
    */
-  async syncOperator(tenantId: string, operatorId: string) {
+  async syncOperator(tenantId: string, userId: string, operatorId: string) {
     const op = await this.prisma.tourOperator.findFirst({ where: { id: operatorId, tenantId } });
     if (!op) throw new NotFoundException('Operator topilmadi');
 
@@ -517,7 +571,7 @@ export class MarketplaceService {
         );
       }
 
-      return await this.importTours(tenantId, operatorId, list, true);
+      return await this.importTours(tenantId, userId, operatorId, list, true);
     } catch (e: any) {
       const message = e?.name === 'AbortError'
         ? "So'rov vaqti tugadi (30s)"
@@ -721,12 +775,26 @@ export class MarketplaceService {
       throw new BadRequestException("totalPrice musbat bo'lishi kerak");
     }
 
+    // NETTO (operatorga to'lanadigan) — supplierCost
+    const rawSupplier =
+      data?.supplierCost !== undefined && data?.supplierCost !== null && data?.supplierCost !== ''
+        ? Number(data.supplierCost)
+        : (tour.netPrice != null ? Number(tour.netPrice) * Math.max(1, needSeats) : 0);
+
     let totalPrice = rawTotal;
+    let supplierCost = Number.isFinite(rawSupplier) && rawSupplier > 0 ? rawSupplier : 0;
     let fxRate: number | null = null;
+
     if (enteredCurrency !== 'USD') {
+      // Kursni bir marta olamiz va IKKALA summaga ham qo'llaymiz —
+      // aks holda foyda noto'g'ri chiqadi.
       fxRate = (await convertToUSD(1, enteredCurrency)).rate;
       totalPrice = Math.round((rawTotal / fxRate) * 100) / 100;
+      supplierCost = Math.round((supplierCost / fxRate) * 100) / 100;
     }
+
+    // Foyda = sotuv narxi - tannarx (bookings moduli bilan bir xil mantiq)
+    const profit = Math.max(0, Math.round((totalPrice - supplierCost) * 100) / 100);
 
     // ── Booking raqami ──
     const count = await this._prisma.booking.count({ where: { tenantId } });
@@ -758,6 +826,9 @@ export class MarketplaceService {
         children,
         infants,
         totalPrice,
+        supplierCost,
+        profit,
+        marketplaceTourId: tour.id,
         currency: 'USD',
         originalCurrency: enteredCurrency !== 'USD' ? enteredCurrency : undefined,
         originalAmount: enteredCurrency !== 'USD' ? rawTotal : undefined,
@@ -783,6 +854,57 @@ export class MarketplaceService {
         data: { seatsAvailable: Math.max(0, tour.seatsAvailable - needSeats) },
       });
     }
+
+    // ── Mijoz tarixiga yozamiz + statistikani qayta hisoblaymiz ──
+    await this.clients.addTimeline(
+      client.id, 'booking_created',
+      `Booking yaratildi: ${booking.bookingRef}`,
+      `${booking.tourName} • $${booking.totalPrice}`,
+      { userId, bookingId: booking.id, source: 'marketplace' },
+    ).catch(() => {});
+    await this.clients.recalcStats(client.id).catch(() => {});
+
+    // ── Agentga bildirishnoma (agar boshqa odam biriktirgan bo'lsa) ──
+    const agentId = booking.agentId;
+    if (agentId && agentId !== userId) {
+      await this.notifications.create({
+        tenantId,
+        userId: agentId,
+        type: 'BOOKING_CREATED',
+        title: '✈️ Sizga yangi booking',
+        body: `${client.fullName} — ${booking.tourName} • $${booking.totalPrice}`,
+        link: `/bookings/${booking.id}`,
+        metadata: { bookingId: booking.id, clientId: client.id, source: 'marketplace' },
+      }).catch(() => {});
+    }
+
+    // ── Dashboardni real-time yangilash ──
+    try {
+      this.realtime.emitToTenant(tenantId, 'dashboard:update', {
+        type: 'booking_created',
+        bookingId: booking.id,
+        agentId,
+        totalPrice: booking.totalPrice,
+        profit: booking.profit,
+      });
+    } catch {}
+
+    // ── Audit log ──
+    this.audit.log({
+      tenantId, userId,
+      action: 'CREATE', entity: 'booking', entityId: booking.id,
+      metadata: {
+        bookingRef: booking.bookingRef,
+        source: 'marketplace',
+        tourId: tour.id,
+        operator: tour.operator?.name,
+        totalPrice: booking.totalPrice,
+        supplierCost: booking.supplierCost,
+      },
+    });
+
+    // Hisobot raqamlari o'zgardi → cache tozalanadi
+    void this.cache.invalidateReports(tenantId);
 
     this.logger.log(
       `Booking yaratildi [${tenantId}]: ${bookingRef} — ${tour.title} (${client.fullName})`,
@@ -815,32 +937,34 @@ export class MarketplaceOperatorsController {
   @Post()
   @Roles('TENANT_ADMIN')
   create(@CurrentUser() user: any, @Body() body: any) {
-    return this.service.createOperator(user.tenantId, body);
+    return this.service.createOperator(user.tenantId, user.sub || user.id, body);
   }
 
   @Patch(':id')
   @Roles('TENANT_ADMIN')
   update(@CurrentUser() user: any, @Param('id') id: string, @Body() body: any) {
-    return this.service.updateOperator(user.tenantId, id, body);
+    return this.service.updateOperator(user.tenantId, user.sub || user.id, id, body);
   }
 
   @Delete(':id')
   @Roles('TENANT_ADMIN')
   remove(@CurrentUser() user: any, @Param('id') id: string) {
-    return this.service.deleteOperator(user.tenantId, id);
+    return this.service.deleteOperator(user.tenantId, user.sub || user.id, id);
   }
 
   /** body: { tours: [...], replaceAll?: boolean } */
   @Post(':id/import')
   @Roles('TENANT_ADMIN')
   import(@CurrentUser() user: any, @Param('id') id: string, @Body() body: any) {
-    return this.service.importTours(user.tenantId, id, body?.tours, Boolean(body?.replaceAll));
+    return this.service.importTours(
+      user.tenantId, user.sub || user.id, id, body?.tours, Boolean(body?.replaceAll),
+    );
   }
 
   @Post(':id/sync')
   @Roles('TENANT_ADMIN')
   sync(@CurrentUser() user: any, @Param('id') id: string) {
-    return this.service.syncOperator(user.tenantId, id);
+    return this.service.syncOperator(user.tenantId, user.sub || user.id, id);
   }
 }
 

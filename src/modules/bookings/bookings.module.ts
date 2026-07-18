@@ -384,6 +384,22 @@ export class BookingsService {
 
     const updated = await this.prisma.booking.update({ where: { id }, data: clean(safe) });
 
+    // ── v12.1: Turlar bozoridan kelgan booking BEKOR qilinsa, o'sha
+    // turning bo'sh joylari QAYTARILADI. Aks holda tur noto'g'ri
+    // "joy tugadi" holatiga tushib qolardi.
+    // Faqat status HAQIQATAN o'zgarganda ishlaydi (safe.status mavjud
+    // va eskisidan farqli) — shuning uchun ikki marta qaytarilmaydi.
+    if (
+      safe.status === 'CANCELLED' &&
+      existing.status !== 'CANCELLED' &&
+      (existing as any).marketplaceTourId
+    ) {
+      await this.restoreMarketplaceSeats(
+        (existing as any).marketplaceTourId,
+        (existing.adults || 0) + (existing.children || 0),
+      );
+    }
+
     // ── Recalc client stats if financial fields changed ──
     if (safe.totalPrice !== undefined || safe.supplierCost !== undefined || safe.discount !== undefined) {
       await this.clients.recalcStats(existing.clientId).catch(() => {});
@@ -456,6 +472,35 @@ export class BookingsService {
     return updated;
   }
 
+  /**
+   * v12.1: Turlar bozoridagi turga bo'sh joylarni qaytaradi.
+   *
+   * seatsAvailable null bo'lsa — joy hisoblanmaydi, tegmaymiz.
+   * seatsTotal bo'lsa — undan oshib ketmasligini ta'minlaymiz.
+   * Xato bo'lsa booking amaliyoti buzilmasin — jimgina o'tkazamiz.
+   */
+  private async restoreMarketplaceSeats(tourId: string, seats: number) {
+    if (!tourId || !seats || seats <= 0) return;
+    try {
+      const tour = await (this.prisma as any).marketplaceTour.findUnique({
+        where: { id: tourId },
+        select: { id: true, seatsAvailable: true, seatsTotal: true },
+      });
+      if (!tour || tour.seatsAvailable === null || tour.seatsAvailable === undefined) return;
+
+      const restored = tour.seatsTotal
+        ? Math.min(tour.seatsTotal, tour.seatsAvailable + seats)
+        : tour.seatsAvailable + seats;
+
+      await (this.prisma as any).marketplaceTour.update({
+        where: { id: tourId },
+        data: { seatsAvailable: restored },
+      });
+    } catch {
+      // Tur o'chirilgan bo'lishi mumkin — bu xato emas
+    }
+  }
+
   async delete(tenantId: string, id: string, userId: string, role: string) {
     // BUG FIX: avval agentlar hech qanday bookingni o'chira olmasdi —
     // hatto o'zlari yaratgan/o'ziga biriktirilgan bookingni ham.
@@ -466,6 +511,15 @@ export class BookingsService {
     const b = await this.findOne(tenantId, id, userId, role);
     if (role === 'AGENT' && b.agentId !== userId) {
       throw new BadRequestException("Faqat o'zingizga biriktirilgan bookingni o'chira olasiz");
+    }
+
+    // v12.1: marketplace turidan bo'lsa va hali bekor qilinmagan bo'lsa —
+    // joylarni qaytaramiz (bekor qilingan bo'lsa allaqachon qaytarilgan).
+    if ((b as any).marketplaceTourId && b.status !== 'CANCELLED') {
+      await this.restoreMarketplaceSeats(
+        (b as any).marketplaceTourId,
+        (b.adults || 0) + (b.children || 0),
+      );
     }
 
     await this.prisma.booking.delete({ where: { id } });
