@@ -393,3 +393,46 @@ export function phoneVariants(input: any): string[] {
   }
   return [...set].filter(Boolean);
 }
+
+// ─── v12.6: Hisobot sana oralig'ini cheklash ────────────────────────────────
+
+/** Hisobot uchun ruxsat etilgan eng uzun oraliq (kun) */
+export const MAX_REPORT_RANGE_DAYS = parseInt(
+  process.env.MAX_REPORT_RANGE_DAYS || '366', 10,
+);
+
+/**
+ * Hisobot sana oralig'ini xavfsiz chegaraga keltiradi.
+ *
+ * NEGA KERAK: `from` va `to` foydalanuvchidan keladi va cheklanmagan edi.
+ * Kimdir `from=2000-01-01&to=2030-01-01` yuborsa, so'rov butun bazani
+ * tortib olardi — bu server xotirasini yeydi va javob sekinlashadi.
+ * (Tasodifan ham bo'lishi mumkin: sana tanlagichda yil noto'g'ri tanlansa.)
+ *
+ * Endi oraliq MAX_REPORT_RANGE_DAYS dan oshsa, BOSHLANISH sanasi
+ * oxiridan orqaga hisoblanib qisqartiriladi — foydalanuvchi eng
+ * yangi ma'lumotni ko'radi, so'rov esa chegarada qoladi.
+ *
+ * @returns { start, end, clamped } — clamped=true bo'lsa qisqartirilgan
+ */
+export function clampDateRange(
+  start: Date,
+  end: Date,
+  maxDays: number = MAX_REPORT_RANGE_DAYS,
+): { start: Date; end: Date; clamped: boolean } {
+  if (!(start instanceof Date) || !(end instanceof Date)) {
+    return { start, end, clamped: false };
+  }
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+    return { start, end, clamped: false };
+  }
+
+  // Teskari tartibda kelsa almashtiramiz
+  if (start > end) [start, end] = [end, start];
+
+  const spanDays = (end.getTime() - start.getTime()) / 86400000;
+  if (spanDays <= maxDays) return { start, end, clamped: false };
+
+  const newStart = new Date(end.getTime() - maxDays * 86400000);
+  return { start: newStart, end, clamped: true };
+}

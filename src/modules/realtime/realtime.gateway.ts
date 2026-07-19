@@ -1,10 +1,14 @@
 import {
-  WebSocketGateway, WebSocketServer, OnGatewayConnection, OnGatewayDisconnect,
+  WebSocketGateway, WebSocketServer, OnGatewayInit,
+  OnGatewayConnection, OnGatewayDisconnect,
   SubscribeMessage, MessageBody, ConnectedSocket,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { isOriginAllowed } from '../../common/config/cors.config';
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import type Redis from 'ioredis';
+import { createAdapter } from '@socket.io/redis-adapter';
+import { REDIS_CLIENT } from '../../common/cache/cache.constants';
 import { JwtService } from '@nestjs/jwt';
 
 /**
@@ -24,14 +28,86 @@ import { JwtService } from '@nestjs/jwt';
   transports: ['websocket', 'polling'],
 })
 @Injectable()
-export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect {
+export class RealtimeGateway
+  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
+{
   @WebSocketServer() server!: Server;
   private readonly logger = new Logger('Realtime');
 
   // userId → Set<socketId>
   private userSockets = new Map<string, Set<string>>();
 
-  constructor(private jwt: JwtService) {}
+  constructor(
+    private jwt: JwtService,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis | null,
+  ) {}
+
+  /**
+   * ═══════════════════════════════════════════════════════════
+   * REDIS ADAPTER — bir nechta instansda ishlash uchun (v12.5)
+   * ═══════════════════════════════════════════════════════════
+   *
+   * MUAMMO: ulanishlar `userSockets` Map'ida, ya'ni O'SHA jarayonning
+   * xotirasida saqlanadi. Bitta server bo'lsa muammo yo'q. Lekin
+   * ikkita instans ishlab tursa:
+   *
+   *   Agent A → instans-1 ga ulangan
+   *   Yangi lead → instans-2 da yaratildi
+   *   instans-2 `emitToUser(A)` chaqiradi → o'z xotirasida A yo'q
+   *   → xabar YETIB BORMAYDI (jimgina yo'qoladi)
+   *
+   * Redis adapter barcha instanslarni bitta pub/sub kanali orqali
+   * bog'laydi — emit qaysi instansdan chiqsa ham hammaga yetadi.
+   *
+   * REDIS_URL yo'q bo'lsa: adapter ulanmaydi, tizim eski holatda
+   * (in-memory) ishlashda davom etadi. Bu bitta instans uchun
+   * mutlaqo to'g'ri — shuning uchun majburiy qilmaymiz.
+   */
+  async afterInit(server: Server) {
+    if (!this.redis) {
+      this.logger.warn(
+        "REDIS_URL yo'q — WebSocket in-memory rejimda. " +
+        "Bu BITTA instans uchun normal, lekin 2+ instans bo'lsa " +
+        "xabarlar instanslar orasida yetib bormaydi.",
+      );
+      return;
+    }
+
+    try {
+      // Adapter IKKITA alohida ulanish talab qiladi: biri e'lon qilish,
+      // ikkinchisi tinglash uchun (subscriber rejimidagi ulanishda
+      // boshqa buyruq bajarib bo'lmaydi).
+      // DIQQAT: asosiy mijoz CACHE uchun sozlangan —
+      // `enableOfflineQueue: false` va `maxRetriesPerRequest: 1`.
+      // Bu cache uchun to'g'ri (so'rov osilib qolmasin), lekin pub/sub
+      // uchun NOTO'G'RI: adapter ulanish tiklanayotganda buyruq yuborsa
+      // "Stream isn't writeable" xatosi chiqadi va jarayon yiqiladi.
+      //
+      // Shuning uchun dublikatlarda bu sozlamalarni ATAYLAB bekor qilamiz:
+      // pub/sub ulanishi doimiy bo'lishi va buyruqlarni navbatga qo'yishi kerak.
+      const pubSubOptions = {
+        enableOfflineQueue: true,
+        maxRetriesPerRequest: null as any,
+      };
+      const pubClient = this.redis.duplicate(pubSubOptions);
+      const subClient = this.redis.duplicate(pubSubOptions);
+
+      pubClient.on('error', (e) =>
+        this.logger.error(`Redis pub xatosi: ${e?.message}`));
+      subClient.on('error', (e) =>
+        this.logger.error(`Redis sub xatosi: ${e?.message}`));
+
+      server.adapter(createAdapter(pubClient, subClient));
+      this.logger.log('WebSocket Redis adapter ulandi ✓ (ko\'p instans qo\'llab-quvvatlanadi)');
+    } catch (e: any) {
+      // Adapter ulanmasa ham WebSocket ishlashda davom etsin —
+      // faqat ko'p instansli rejim ishlamaydi.
+      this.logger.error(
+        `WebSocket Redis adapter ulanmadi: ${e?.message}. ` +
+        'In-memory rejimda davom etilmoqda.',
+      );
+    }
+  }
 
   async handleConnection(client: Socket) {
     try {

@@ -3,6 +3,9 @@ import { ConfigModule } from '@nestjs/config';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { RedisClientModule } from './common/cache/redis-client.module';
+import { REDIS_CLIENT } from './common/cache/cache.constants';
+import { RedisThrottlerStorage } from './common/guards/redis-throttler.storage';
 import { APP_GUARD } from '@nestjs/core';
 
 import { PrismaModule } from './prisma/prisma.module';
@@ -66,12 +69,21 @@ import { MarketplaceModule } from './modules/marketplace/marketplace.module';
     ConfigModule.forRoot({ isGlobal: true }),
     EventEmitterModule.forRoot({ maxListeners: 50 }),
     ScheduleModule.forRoot(),
-    ThrottlerModule.forRoot([
-      {
-        ttl: parseInt(process.env.THROTTLE_TTL || '60') * 1000,
-        limit: parseInt(process.env.THROTTLE_LIMIT || '100'),
-      },
-    ]),
+    // v12.5: hisoblagich Redis'da — bir nechta instansda limit UMUMIY
+    // bo'ladi. Redis yo'q bo'lsa avtomatik xotira rejimiga tushadi.
+    ThrottlerModule.forRootAsync({
+      imports: [RedisClientModule],
+      inject: [REDIS_CLIENT],
+      useFactory: (redis: any) => ({
+        throttlers: [
+          {
+            ttl: parseInt(process.env.THROTTLE_TTL || '60') * 1000,
+            limit: parseInt(process.env.THROTTLE_LIMIT || '100'),
+          },
+        ],
+        storage: new RedisThrottlerStorage(redis),
+      }),
+    }),
     // Cache: Redis (ioredis) bilan ishlaydigan global cache — REDIS_URL bo'lsa
     // Redis'ga, bo'lmasa in-memory'ga tushadi. CacheService ni butun ilovaga beradi.
     AppCacheModule,

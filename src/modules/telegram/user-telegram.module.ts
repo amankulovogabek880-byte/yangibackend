@@ -32,6 +32,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { normalizeChatId, inferChatTypeFromGramjs } from './chat-id.util';
 import { uploadBufferToStorage } from '../../common/utils/media-storage';
 import { toOggOpus } from '../../common/utils/voice-convert';
+import { swallow } from '../../common/utils/swallow';
 
 // Telegram API credentials - admin tomonidan sozlanadi (my.telegram.org dan olinadi)
 // Default: demo credentials (faqat test uchun)
@@ -1072,7 +1073,7 @@ export class UserTelegramService implements OnModuleInit {
     await this.prisma.messageTemplate.update({
       where: { id: templateId },
       data: { useCount: { increment: 1 } } as any,
-    }).catch(() => {});
+    }).catch(swallow('yangilash'));
 
     const sent: any[] = [];
 
@@ -1127,7 +1128,7 @@ export class UserTelegramService implements OnModuleInit {
 
     const client = activeSessions.get(account.id);
     if (client) {
-      await client.disconnect().catch(() => {});
+      await client.disconnect().catch(swallow('yon amal'));
       activeSessions.delete(account.id);
     }
 
@@ -1224,7 +1225,13 @@ export class UserTelegramController {
     }),
   ],
   controllers: [UserTelegramController],
-  providers: [UserTelegramService, RealtimeGateway],
+  // v12.5 TUZATISH: RealtimeGateway bu yerdan OLIB TASHLANDI.
+  //
+  // U RealtimeModule'da @Global sifatida taqdim etilgan. Bu yerda qayta
+  // e'lon qilinsa, Nest IKKINCHI, ALOHIDA nusxa yaratardi — o'zining
+  // bo'sh `userSockets` ro'yxati bilan. Natijada shu moduldan yuborilgan
+  // `emitToUser()` xabarlari hech kimga yetmasdi (jimgina yo'qolardi).
+  providers: [UserTelegramService],
   exports: [UserTelegramService],
 })
 export class UserTelegramModule {}

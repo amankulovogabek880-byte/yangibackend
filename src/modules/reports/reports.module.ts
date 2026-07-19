@@ -7,6 +7,7 @@ import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser, Roles } from '../../common/decorators';
 import { CacheService } from '../../common/cache/cache.service';
 import { CACHE_TTL, reportsKey } from '../../common/cache/cache.constants';
+import { clampDateRange, MAX_REPORT_RANGE_DAYS } from '../../common/utils/helpers';
 
 @Injectable()
 export class ReportsService {
@@ -143,39 +144,99 @@ export class ReportsService {
       end   = new Date(n.getFullYear(), n.getMonth(), n.getDate(), 23, 59, 59);
       isSingleDay = true;
     }
+
+    // v12.6: oraliqni xavfsiz chegaraga keltiramiz.
+    // `from`/`to` foydalanuvchidan keladi va cheklanmagan edi — juda
+    // uzun oraliq butun bazani tortib, serverni sekinlashtirardi.
+    const clampedRange = clampDateRange(start, end);
+    if (clampedRange.clamped) {
+      this.logger.warn(
+        `Hisobot oralig'i qisqartirildi (maks. ${MAX_REPORT_RANGE_DAYS} kun): ` +
+        `${start.toISOString().slice(0, 10)} → ${clampedRange.start.toISOString().slice(0, 10)}`,
+      );
+    }
+    start = clampedRange.start;
+    end = clampedRange.end;
     const df = { gte: start, lte: end };
 
-    const [leads, bookings, payments] = await Promise.all([
+    // ═══════════════════════════════════════════════════════════
+    // v12.6 OPTIMALLASHTIRISH
+    // ═══════════════════════════════════════════════════════════
+    // ILGARI: barcha mijoz, booking va to'lov TO'LIQ tortilardi, keyin
+    // JavaScript'da .reduce() bilan yig'ilardi. Bandroq agentlikda bu
+    // o'n minglab qator degani — server xotirasi va sekinlik.
+    //
+    // ENDI: yig'indilar BAZADA hisoblanadi (aggregate/count), ro'yxatlar
+    // esa faqat ko'rsatish uchun va CHEKLANGAN holda olinadi.
+    //
+    // MUHIM: statistikaga limit QO'YILMAYDI — aks holda daromad/foyda
+    // jimgina noto'g'ri chiqardi. Limit faqat ko'rinadigan ro'yxatlarda.
+    const TIMELINE_LIMIT = 300;
+
+    const [
+      leads, bookings, payments,
+      bookingAgg, paymentAgg, leadsCount, bookingsCount,
+    ] = await Promise.all([
+      // ── Ko'rsatish uchun ro'yxatlar (cheklangan) ──
       (this.prisma as any).client.findMany({
         where: { tenantId, ...clientAgentFilter, createdAt: df },
         select: { id: true, fullName: true, phone: true, source: true, pipelineStage: true, createdAt: true, assignedAgent: { select: { name: true } } },
         orderBy: { createdAt: 'asc' },
+        take: TIMELINE_LIMIT,
       }),
       (this.prisma as any).booking.findMany({
         where: { tenantId, ...agentFilter, createdAt: df },
         include: { client: { select: { fullName: true } }, agent: { select: { name: true } } },
         orderBy: { createdAt: 'desc' },
+        take: TIMELINE_LIMIT,
       }),
       (this.prisma as any).payment.findMany({
         where: { tenantId, paidAt: df },
         select: { amount: true, currency: true, method: true, paidAt: true },
+        orderBy: { paidAt: 'desc' },
+        take: TIMELINE_LIMIT,
+      }),
+
+      // ── Statistika: BAZADA hisoblanadi, LIMITSIZ (to'g'ri bo'lishi shart) ──
+      (this.prisma as any).booking.aggregate({
+        where: { tenantId, ...agentFilter, createdAt: df, status: { in: ['CONFIRMED', 'COMPLETED'] } },
+        _sum: { totalPrice: true, profit: true },
+        _count: { _all: true },
+      }),
+      (this.prisma as any).payment.aggregate({
+        where: { tenantId, paidAt: df },
+        _sum: { amount: true },
+      }),
+      (this.prisma as any).client.count({
+        where: { tenantId, ...clientAgentFilter, createdAt: df },
+      }),
+      (this.prisma as any).booking.count({
+        where: { tenantId, ...agentFilter, createdAt: df },
       }),
     ]);
 
-    const confirmed = bookings.filter((b: any) => ['CONFIRMED','COMPLETED'].includes(b.status));
     const stats = {
-      revenue: confirmed.reduce((s: number, b: any) => s + (b.totalPrice || 0), 0),
-      profit:  confirmed.reduce((s: number, b: any) => s + (b.profit || 0), 0),
-      paid:    payments.reduce((s: number, p: any) => s + (p.amount || 0), 0),
-      newLeads: leads.length,
-      newClients: leads.length,
-      bookingsCount: bookings.length,
-      confirmedBookings: confirmed.length,
+      revenue: bookingAgg?._sum?.totalPrice || 0,
+      profit:  bookingAgg?._sum?.profit || 0,
+      paid:    paymentAgg?._sum?.amount || 0,
+      newLeads: leadsCount,
+      newClients: leadsCount,
+      bookingsCount,
+      confirmedBookings: bookingAgg?._count?._all || 0,
     };
+
 
     // Timeline
     const [tlRows] = await Promise.all([
-      (this.prisma as any).clientTimeline.findMany({ where: { createdAt: df }, orderBy: { createdAt: 'asc' }, take: 200 }).catch(() => []),
+      // XAVFSIZLIK (v12.6): bu yerda tenantId FILTRI YO'Q edi —
+      // ya'ni hisobotga BOSHQA agentliklarning mijoz faoliyati ham
+      // tushardi (cross-tenant sizish). ClientTimeline'da tenantId
+      // ustuni yo'q, shuning uchun bog'langan Client orqali filtrlaymiz.
+      (this.prisma as any).clientTimeline.findMany({
+        where: { createdAt: df, client: { tenantId } },
+        orderBy: { createdAt: 'asc' },
+        take: 200,
+      }).catch(() => []),
     ]);
     const payEvents = payments.map((p: any) => ({ type: 'payment', title: `💰 To\'lov: ${p.currency} ${p.amount}`, createdAt: p.paidAt, metadata: { method: p.method } }));
     const bkEvents  = bookings.map((b: any) => ({ type: 'booking', title: `✈️ Booking: ${b.client?.fullName || ''} — ${b.tourName}`, createdAt: b.createdAt, metadata: { status: b.status, amount: b.totalPrice } }));

@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { RedisClientModule } from '../../common/cache/redis-client.module';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import { AuthService } from './auth.service';
@@ -7,6 +8,9 @@ import { JwtStrategy } from './jwt.strategy';
 
 @Module({
   imports: [
+    // v12.5: LoginRateLimitGuard hisoblagichni Redis'da saqlaydi
+    // (ko'p instansda umumiy limit). Redis yo'q bo'lsa xotiraga tushadi.
+    RedisClientModule,
     PassportModule,
     JwtModule.register({
       secret: (() => {

@@ -11,6 +11,7 @@ import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser, Roles } from '../../common/decorators';
 import { PipelineStage } from '../../prisma-types';;
 import { Prisma } from '@prisma/client';
+import { swallow } from '../../common/utils/swallow';
 
 // ─── Stage config (no DB changes needed) ─────────────────────────────────────
 const STAGE_LABELS_UZ: Record<string, string> = {
@@ -349,7 +350,7 @@ export class PipelineService {
         description: data.note || null,
         metadata: { from: client.pipelineStage, to: toStage, lostReasonDetail: data.lostReasonDetail },
       } as any,
-    }).catch(() => {});
+    }).catch(swallow('mijoz tarixi'));
 
     // Auto-transition: 'TRAVELING' (Kelmadi) → NEGOTIATION (Qayta aloqa)
     if (toStage === ('TRAVELING' as any)) {
@@ -400,7 +401,7 @@ export class PipelineService {
           title: `${(client as any).fullName}ga qo'ng'iroq (${attempts}/6)`,
           priority: 'HIGH', status: 'TODO', dueAt: new Date(nextCallAt),
         } as any,
-      }).catch(() => {});
+      }).catch(swallow('yozuv yaratish'));
       // Notification
       await this.prisma.notification.create({
         data: {
@@ -409,7 +410,7 @@ export class PipelineService {
           body: `Keyingi: ${new Date(nextCallAt).toLocaleDateString('uz-UZ')}`,
           link: `/clients/${clientId}`, metadata: {},
         } as any,
-      }).catch(() => {});
+      }).catch(swallow('bildirishnoma'));
     }
 
     return { attempts, nextCallAt, outcome: data.outcome };
@@ -468,8 +469,15 @@ export class PipelineService {
   }
 
   async getHistory(tenantId: string, clientId: string) {
+    // XAVFSIZLIK (v12.6): ilgari `tenantId` qabul qilinardi, lekin
+    // ISHLATILMAS edi — so'rov faqat clientId bo'yicha ketardi.
+    // Ya'ni boshqa agentlikning clientId'si yuborilsa, uning pipeline
+    // tarixi ko'rinardi (cross-tenant sizish).
+    //
+    // StageHistory'da tenantId ustuni yo'q, shuning uchun bog'langan
+    // Client orqali filtrlaymiz — bu bitta so'rovda hal bo'ladi.
     return this.prisma.stageHistory.findMany({
-      where: { clientId },
+      where: { clientId, client: { tenantId } },
       include: { user: { select: { id: true, name: true } } },
       orderBy: { createdAt: 'desc' },
       take: 50,
@@ -523,7 +531,7 @@ export class PipelineService {
             title: `${(c as any).fullName} ertaga sayohatga ketadi!`,
             body: 'Omadli yo\'l tiling.', link: `/clients/${c.id}`, metadata: {},
           } as any,
-        }).catch(() => {});
+        }).catch(swallow('bildirishnoma'));
         await this.prisma.task.create({
           data: {
             tenantId: c.tenantId, creatorId: (c as any).assignedAgentId,
@@ -531,12 +539,12 @@ export class PipelineService {
             title: `${(c as any).fullName}ga omadli yo'l tiling`,
             priority: 'HIGH', status: 'TODO', dueAt: depart,
           } as any,
-        }).catch(() => {});
+        }).catch(swallow('yozuv yaratish'));
         // Mark notified
         await this.prisma.client.update({
           where: { id: c.id },
           data: { preferences: { ...prefs, departureNotified: true } } as any,
-        }).catch(() => {});
+        }).catch(swallow('yangilash'));
       }
     }
 
@@ -558,7 +566,7 @@ export class PipelineService {
             body: `${(prefs.noContactAttempts || 0) + 1}/6 urinish`,
             link: `/clients/${c.id}`, metadata: {},
           } as any,
-        }).catch(() => {});
+        }).catch(swallow('bildirishnoma'));
       }
     }
   }
@@ -581,7 +589,7 @@ export class PipelineService {
           body: t.client ? `Klient: ${t.client.fullName}` : '15 daqiqa qoldi',
           link: t.clientId ? `/clients/${t.clientId}` : '/tasks', metadata: {},
         } as any,
-      }).catch(() => {});
+      }).catch(swallow('bildirishnoma'));
     }
   }
 }
