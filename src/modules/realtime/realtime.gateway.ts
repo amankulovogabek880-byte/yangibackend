@@ -3,11 +3,24 @@ import {
   SubscribeMessage, MessageBody, ConnectedSocket,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
+import { isOriginAllowed } from '../../common/config/cors.config';
 import { Injectable, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 
+/**
+ * XAVFSIZLIK (v12.5): ilgari bu yerda `origin: '*'` turardi — ya'ni
+ * istalgan sayt CRM'ning WebSocket kanaliga ulana olardi, HTTP CORS
+ * qat'iy yopiq bo'lsa ham. Endi ikkalasi ham bitta ro'yxatdan
+ * (CORS_ORIGINS env) foydalanadi.
+ */
 @WebSocketGateway({
-  cors: { origin: '*', credentials: false },
+  cors: {
+    origin: (origin: string | undefined, cb: (err: Error | null, ok?: boolean) => void) => {
+      if (isOriginAllowed(origin)) return cb(null, true);
+      cb(new Error(`WebSocket CORS: ${origin} ga ruxsat yo'q`));
+    },
+    credentials: true,
+  },
   transports: ['websocket', 'polling'],
 })
 @Injectable()

@@ -1,6 +1,7 @@
 import { NestFactory } from '@nestjs/core';
 import { validateEnv } from './common/config/env.validation';
 import { winstonLogger } from './common/logger/winston.logger';
+import { getAllowedOrigins } from './common/config/cors.config';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { IoAdapter } from '@nestjs/platform-socket.io';
@@ -62,9 +63,9 @@ async function bootstrap() {
     );
   }
 
-  const allowedOrigins = rawOrigins && rawOrigins !== '*'
-    ? rawOrigins.split(',').map((s) => s.trim()).filter(Boolean)
-    : ['http://localhost:3001', 'http://127.0.0.1:3001']; // dev fallback
+  // Yagona manba — WebSocket gateway ham SHU ro'yxatdan foydalanadi
+  // (cors.config.ts). Ikki joyda alohida yozilsa, biri unutilib qoladi.
+  const allowedOrigins = getAllowedOrigins();
 
   app.enableCors({
     origin: (origin: string | undefined, cb: any) => {
@@ -169,11 +170,32 @@ Webhook: \`POST /api/v1/calls/webhook\`
     .addServer(`http://localhost:${port}`, 'Local')
     .build();
 
-  const document = SwaggerModule.createDocument(app, swaggerConfig);
-  SwaggerModule.setup('api/docs', app, document, {
-    swaggerOptions: { persistAuthorization: true },
-    customSiteTitle: 'Omon CRM API Docs',
-  });
+  // ── XAVFSIZLIK (v12.5): Swagger production'da YOPIQ ──
+  //
+  // Ilgari /api/docs har doim ochiq edi — ya'ni istalgan odam butun API
+  // strukturasini, barcha endpointlar va DTO'larni ko'ra olardi. Bu
+  // hujumchiga tayyor xarita berish demakdir.
+  //
+  // Endi: development'da har doim ochiq, production'da faqat
+  // SWAGGER_ENABLED=true bo'lsa. Standart holat — yopiq.
+  const swaggerEnabled = isProd
+    ? process.env.SWAGGER_ENABLED === 'true'
+    : true;
+
+  if (swaggerEnabled) {
+    const document = SwaggerModule.createDocument(app, swaggerConfig);
+    SwaggerModule.setup('api/docs', app, document, {
+      swaggerOptions: { persistAuthorization: true },
+      customSiteTitle: 'Omon CRM API Docs',
+    });
+    if (isProd) {
+      winstonLogger.warn(
+        "DIQQAT: Swagger production'da OCHIQ (SWAGGER_ENABLED=true). Kerak bo'lmasa o'chiring.",
+      );
+    }
+  } else {
+    winstonLogger.info("Swagger production'da o'chirilgan (SWAGGER_ENABLED=true bilan yoqiladi)");
+  }
 
   // v11 FIX: Eski TelegramPersonalService orqali sessiya tiklash olib
   // tashlandi. UserTelegramService o'zining onModuleInit()'ida BARCHA
@@ -185,7 +207,11 @@ Webhook: \`POST /api/v1/calls/webhook\`
   await app.listen(port);
 
   Logger.log(`🚀 Omon CRM API: http://localhost:${port}/api/v1`, 'Bootstrap');
-  Logger.log(`📚 Swagger Docs: http://localhost:${port}/api/docs`, 'Bootstrap');
+  // Swagger manzilini FAQAT u haqiqatan yoqilgan bo'lsa chop etamiz —
+  // aks holda log yolg'on ma'lumot berardi.
+  if (swaggerEnabled) {
+    Logger.log(`📚 Swagger Docs: http://localhost:${port}/api/docs`, 'Bootstrap');
+  }
   Logger.log(`📡 WebSocket: ws://localhost:${port}`, 'Bootstrap');
   Logger.log(`🌡 Health: http://localhost:${port}/health`, 'Bootstrap');
 }

@@ -6,6 +6,7 @@ import { Throttle } from '@nestjs/throttler';
 import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { CsrfGuard } from '../../common/guards/csrf.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser, Public, Roles } from '../../common/decorators';
 import { LoginRateLimitGuard } from '../../common/guards/rate-limit.guard';
@@ -92,8 +93,11 @@ export class AuthController {
     return { ...rest, refreshToken };
   }
 
+  // XAVFSIZLIK (v12.5): faqat cookie'ga tayanadigan endpoint —
+  // CSRF himoyasi uchun Origin tekshiriladi (csrf.guard.ts)
   @Post('refresh')
   @Public()
+  @UseGuards(CsrfGuard)
   @HttpCode(200)
   async refresh(
     @Body() body: { refreshToken?: string },
@@ -112,7 +116,7 @@ export class AuthController {
   // ─── AUTHENTICATED ENDPOINTS ─────────────────────────────
 
   @Post('logout')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, CsrfGuard)
   @HttpCode(200)
   async logout(
     @Body() body: { refreshToken?: string },

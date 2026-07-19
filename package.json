@@ -1,6 +1,10 @@
 {
   "name": "omoncrm-backend",
   "version": "4.0.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
   "description": "TourCRM v4 - Production-grade Multi-Tenant SaaS CRM for Travel Agencies",
   "scripts": {
     "build": "npx nest build",
@@ -50,7 +54,7 @@
     "helmet": "^7.1.0",
     "input": "^1.0.1",
     "ioredis": "^5.4.1",
-    "multer": "^1.4.5-lts.1",
+    "multer": "^2.2.0",
     "node-telegram-bot-api": "^0.66.0",
     "otplib": "^12.0.1",
     "passport": "^0.7.0",
