@@ -1,40 +1,25 @@
-/**
- * CORS uchun ruxsat etilgan manbalar (origins) — YAGONA manba.
- *
- * NEGA ALOHIDA FAYL: ilgari HTTP CORS qat'iy sozlangan edi (production'da
- * CORS_ORIGINS majburiy), lekin Socket.IO gateway'da `origin: '*'` turardi.
- * Ya'ni HTTP eshigi qulflangan, WebSocket eshigi ochiq qolgan edi —
- * hujumchi istalgan saytdan WebSocket ulanishi mumkin edi.
- *
- * Endi ikkalasi ham SHU funksiyadan foydalanadi, demak siyosat bitta.
- */
-
-/** Production'da CORS_ORIGINS majburiy; development'da localhost'ga ruxsat */
-export function getAllowedOrigins(): string[] {
-  const isProd = process.env.NODE_ENV === 'production';
-  const raw = (process.env.CORS_ORIGINS || '').trim();
-
-  if (raw && raw !== '*') {
-    return raw.split(',').map((s) => s.trim()).filter(Boolean);
-  }
-
-  if (isProd) {
-    // main.ts bootstrap'da bu holat allaqachon xato tashlaydi.
-    // Bu yerda bo'sh ro'yxat qaytaramiz — ya'ni hech kimga ruxsat yo'q
-    // (xavfsiz standart holat, "hammaga ruxsat" emas).
-    return [];
-  }
-
-  return ['http://localhost:3001', 'http://127.0.0.1:3001'];
-}
+import {
+  CanActivate, ExecutionContext, ForbiddenException, Injectable,
+} from '@nestjs/common';
+import { isOriginAllowed } from '../config/cors.config';
 
 /**
- * Origin ruxsat etilganmi.
- *
- * Origin bo'lmasa (server-server so'rovlari, Postman, mobil ilovalar)
- * ruxsat beramiz — brauzer xavfsizlik siyosati bu holatlarga taalluqli emas.
+ * Faqat cookie'ga tayanadigan endpointlar (refresh, logout) uchun CSRF himoyasi.
+ * SameSite=None cookie cross-site so'rovlarda ham avtomatik yuboriladi,
+ * shuning uchun Origin header ruxsat etilgan ro'yxatda ekanini tekshiramiz.
  */
-export function isOriginAllowed(origin: string | undefined): boolean {
-  if (!origin) return true;
-  return getAllowedOrigins().includes(origin);
+@Injectable()
+export class CsrfGuard implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    const req = context.switchToHttp().getRequest();
+    const origin = req.headers.origin as string | undefined;
+
+    // Origin yo'q (server-to-server, mobil ilova) — ruxsat beramiz.
+    if (!origin) return true;
+
+    if (!isOriginAllowed(origin)) {
+      throw new ForbiddenException("CSRF himoyasi: ruxsat etilmagan manba");
+    }
+    return true;
+  }
 }
