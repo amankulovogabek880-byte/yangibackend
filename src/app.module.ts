@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -6,7 +6,10 @@ import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { RedisClientModule } from './common/cache/redis-client.module';
 import { REDIS_CLIENT } from './common/cache/cache.constants';
 import { RedisThrottlerStorage } from './common/guards/redis-throttler.storage';
-import { APP_GUARD } from '@nestjs/core';
+import { CronLockModule } from './common/utils/cron-lock.module';
+import { TenantContextMiddleware } from './common/tenant/tenant-context.middleware';
+import { TenantContextInterceptor } from './common/tenant/tenant-context.interceptor';
+import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 
 import { PrismaModule } from './prisma/prisma.module';
 import { AppCacheModule } from './common/cache/cache.module';
@@ -89,6 +92,9 @@ import { MarketplaceModule } from './modules/marketplace/marketplace.module';
     AppCacheModule,
     PrismaModule,
 
+    // v12.7: cron ishlarini bir nechta instansda takrorlanmasligi uchun
+    CronLockModule,
+
     // Global - tartib muhim (Encryption -> Email -> Realtime -> Notifications)
     EncryptionModule,
     EmailModule,
@@ -136,6 +142,22 @@ import { MarketplaceModule } from './modules/marketplace/marketplace.module';
     ExchangeRateModule, // v10: CBU.uz valyuta kursi (offer/booking currency konvertatsiyasi)
     MarketplaceModule,  // v12: Turlar bozori
   ],
-  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
+  providers: [
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
+    // v12.7: har bir so'rovga tenant kontekstini yozadi
+    // (guard'lardan KEYIN ishlaydi, ya'ni req.user tayyor bo'ladi)
+    { provide: APP_INTERCEPTOR, useClass: TenantContextInterceptor },
+  ],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  /**
+   * TenantContextMiddleware BARCHA marshrutlarga qo'llanadi.
+   *
+   * U so'rov boshida bo'sh AsyncLocalStorage konteksti ochadi;
+   * TenantContextInterceptor esa guard'lardan keyin uni to'ldiradi.
+   * Shu ikkisi birgalikda Prisma tenant-guard'ini ta'minlaydi.
+   */
+  configure(consumer: MiddlewareConsumer) {
+    consumer.apply(TenantContextMiddleware).forRoutes('*');
+  }
+}
