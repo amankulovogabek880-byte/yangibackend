@@ -101,16 +101,34 @@ export class OnlinePbxProvider implements IPhoneProvider {
       return this.auth.header;
     }
 
-    const res = await this.request(this.url('auth.json'), {
+    const key = String(this.config!.apiKey).trim();
+
+    // Kalit maydonining nomi o'rnatmaga qarab farq qilishi mumkin,
+    // shuning uchun keng tarqalgan variantlarni BIRGA yuboramiz —
+    // ortiqcha maydonlar odatda e'tiborsiz qoldiriladi.
+    const payload = { auth_key: key, key, api_key: key, apiKey: key };
+
+    // 1-urinish: JSON
+    let res = await this.request(this.url('auth.json'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ auth_key: this.config!.apiKey }),
+      body: JSON.stringify(payload),
     });
+
+    // 2-urinish: ba'zi Rossiya ATS API'lari form-encoded kutadi
+    if (!res.ok && (res.status === 400 || res.status === 415 || res.status === 422)) {
+      const form = new URLSearchParams(payload as any).toString();
+      res = await this.request(this.url('auth.json'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: form,
+      });
+    }
 
     if (!res.ok) {
       throw new Error(
         `OnlinePBX autentifikatsiya xatosi (HTTP ${res.status}). ` +
-        `Domen va API kalitni tekshiring: ${res.text.slice(0, 200)}`,
+        `Domen: ${this.domain}. Javob: ${res.text.slice(0, 250)}`,
       );
     }
 
@@ -118,15 +136,15 @@ export class OnlinePbxProvider implements IPhoneProvider {
     const j: any = res.json || {};
     const data = j.data || j.result || j;
     const keyId = data.key_id || data.keyId;
-    const key = data.key;
+    const authKey = data.key || data.auth_key;
 
-    if (!keyId || !key) {
+    if (!keyId || !authKey) {
       throw new Error(
         `OnlinePBX auth.json kutilgan key_id/key qaytarmadi. Javob: ${JSON.stringify(j).slice(0, 200)}`,
       );
     }
 
-    this.auth = { header: `${keyId}:${key}`, at: Date.now() };
+    this.auth = { header: `${keyId}:${authKey}`, at: Date.now() };
     return this.auth.header;
   }
 
@@ -182,14 +200,39 @@ export class OnlinePbxProvider implements IPhoneProvider {
    * shuning uchun natijaga ishonish mumkin.
    */
   async testConnection(): Promise<{ success: boolean; message: string }> {
+    if (!this.config?.domain) {
+      return { success: false, message: 'Domen kiritilmagan (masalan: kompaniya.onpbx.ru)' };
+    }
+    if (!this.config?.apiKey) {
+      return { success: false, message: 'API kalit kiritilmagan' };
+    }
+
     try {
       await this.getAuthHeader(true);
-      return {
-        success: true,
-        message: `OnlinePBX ulanishi muvaffaqiyatli (${this.domain})`,
-      };
     } catch (e: any) {
       return { success: false, message: e?.message || "Noma'lum xato" };
+    }
+
+    // Autentifikatsiya o'tdi. Endi tarixni ham sinab ko'ramiz —
+    // shunda kiruvchi qo'ng'iroqlar ishlashini ham bilamiz.
+    try {
+      const rows = await this.fetchHistory(new Date(Date.now() - 24 * 3600 * 1000), 5);
+      return {
+        success: true,
+        message:
+          `Ulanish muvaffaqiyatli (${this.domain}). ` +
+          `Tarix o'qildi: oxirgi 24 soatda ${rows.length} ta qo'ng'iroq. ` +
+          `Kiruvchi qo'ng'iroqlar avtomatik tushadi.`,
+      };
+    } catch (e: any) {
+      // Auth ishladi, tarix ishlamadi — bu ham foydali ma'lumot
+      return {
+        success: true,
+        message:
+          `Ulanish muvaffaqiyatli (${this.domain}), lekin qo'ng'iroqlar tarixini ` +
+          `o'qib bo'lmadi: ${e?.message}. Chiquvchi qo'ng'iroq ishlashi mumkin, ` +
+          `kiruvchilar avtomatik tushmasligi mumkin.`,
+      };
     }
   }
 
