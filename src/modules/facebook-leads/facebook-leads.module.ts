@@ -20,7 +20,9 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser, Public, Roles } from '../../common/decorators';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { NotificationsService } from '../notifications/notifications.service';
 import { EncryptionService } from '../../common/encryption/encryption.service';
+import { normalizePhone, phoneVariants } from '../../common/utils/helpers';
 import { RoundRobinService, RoundRobinModule } from '../v9/round-robin.module';
 import { InstagramService, InstagramModule } from '../instagram/instagram.module';
 import { LeadScoringService, LeadScoringModule } from '../v9/lead-scoring.module';
@@ -133,6 +135,8 @@ export class FacebookLeadsService {
     private autoReply: AutoReplyService,
     // v12.2: bitta OAuth tugmasi Instagram'ni ham ulaydi
     private instagram: InstagramService,
+    // v12.3: qaytgan mijoz haqida agentga xabar berish uchun
+    private notifications: NotificationsService,
   ) {}
 
   // ── SOZLAMALAR ────────────────────────────────────────────────────
@@ -420,10 +424,23 @@ export class FacebookLeadsService {
       return;
     }
 
-    // Dublikat CLIENT tekshiruvi (telefon yoki email bo'yicha)
+    // Telefonni yagona formatga keltiramiz (+998901234567).
+    // Ilgari "901234567" va "+998901234567" TURLI mijoz deb qabul
+    // qilinardi va bazada dublikatlar yig'ilardi.
+    const normalizedPhone = normalizePhone(phone);
+
+    // Dublikat CLIENT tekshiruvi.
+    // Eski yozuvlar turli formatda saqlangan bo'lishi mumkin, shuning
+    // uchun raqamning barcha ko'rinishlarini tekshiramiz.
     let existing: any = null;
-    if (phone) existing = await this.prisma.client.findFirst({ where: { tenantId, phone } });
-    if (!existing && email) existing = await this.prisma.client.findFirst({ where: { tenantId, email } });
+    if (phone) {
+      existing = await this.prisma.client.findFirst({
+        where: { tenantId, phone: { in: phoneVariants(phone) } },
+      });
+    }
+    if (!existing && email) {
+      existing = await this.prisma.client.findFirst({ where: { tenantId, email } });
+    }
 
     if (existing) {
       await this.prisma.clientTimeline
@@ -443,7 +460,46 @@ export class FacebookLeadsService {
           },
         })
         .catch(() => {});
-      this.logger.log(`Facebook: mavjud clientga qayta murojaat qo'shildi: ${existing.id}`);
+
+      // ── v12.3: QAYTGAN MIJOZ e'tibordan chetda qolmasin ──
+      // Ilgari faqat tarixga yozilardi va agent bilmasdan qolardi —
+      // bu to'g'ridan-to'g'ri yo'qotilgan sotuv edi.
+
+      // "Yo'qotilgan" bosqichda bo'lsa qayta tiklaymiz
+      if (existing.pipelineStage === 'LOST') {
+        await this.prisma.client.update({
+          where: { id: existing.id },
+          data: { pipelineStage: 'NEW_LEAD', pipelineStageAt: new Date() },
+        }).catch(() => {});
+      }
+
+      if (existing.assignedAgentId) {
+        await this.notifications.create({
+          tenantId,
+          userId: existing.assignedAgentId,
+          type: 'LEAD_NEW',
+          title: '🔁 Mijoz qayta murojaat qildi',
+          body: `${existing.fullName} — Facebook forma${formName ? ': ' + formName : ''}`,
+          link: `/clients/${existing.id}`,
+          metadata: { clientId: existing.id, leadgenId, isReturning: true },
+        }).catch(() => {});
+
+        this.realtime.emitToUser(existing.assignedAgentId, 'lead:returning', {
+          clientId: existing.id,
+          fullName: existing.fullName,
+          phone: existing.phone,
+          source: 'FACEBOOK',
+        });
+      } else {
+        // Agent biriktirilmagan bo'lsa — butun jamoaga ko'rsatamiz
+        this.realtime.emitToTenant(tenantId, 'lead:returning', {
+          clientId: existing.id,
+          fullName: existing.fullName,
+          source: 'FACEBOOK',
+        });
+      }
+
+      this.logger.log(`Facebook: qayta murojaat — ${existing.fullName} (${existing.id})`);
       return existing;
     }
 
@@ -451,7 +507,7 @@ export class FacebookLeadsService {
       data: {
         tenantId,
         fullName,
-        phone: phone || null,
+        phone: normalizedPhone || phone || null,
         email: email || null,
         city: city || null,
         source: 'FACEBOOK',

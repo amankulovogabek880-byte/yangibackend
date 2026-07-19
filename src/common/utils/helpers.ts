@@ -279,3 +279,117 @@ export async function pickNextAgent(prisma: any, tenantId: string): Promise<stri
     return null;
   }
 }
+// ─── v12.3: Webhook xavfsizligi ──────────────────────────────────────────────
+
+/**
+ * Ochiq (@Public) webhook endpointlarini maxfiy kalit bilan himoyalaydi.
+ *
+ * Nega kerak: webhook manzillari autentifikatsiyasiz ishlaydi, ya'ni
+ * kim bo'lmasin so'rov yubora oladi. Kalitsiz kimdir soxta qo'ng'iroq
+ * yozuvi, soxta xabar yoki zararli havola kiritishi mumkin.
+ *
+ * Ishlatish:
+ *   .env → PHONE_WEBHOOK_SECRET=uzun-tasodifiy-satr
+ *   Provayderda: https://server/calls/webhook?secret=uzun-tasodifiy-satr
+ *   yoki header: x-webhook-secret: uzun-tasodifiy-satr
+ *
+ * @returns true — o'tsin, false — rad etilsin
+ *          Kalit sozlanmagan bo'lsa true qaytaradi (mavjud o'rnatmalar
+ *          buzilmasligi uchun), lekin chaqiruvchi ogohlantirish beradi.
+ */
+export function checkWebhookSecret(
+  headers: Record<string, any>,
+  query: Record<string, any>,
+  expected: string | undefined,
+): { ok: boolean; configured: boolean } {
+  if (!expected) return { ok: true, configured: false };
+
+  const got = String(
+    headers?.['x-webhook-secret'] || query?.secret || query?.token || '',
+  );
+
+  // Uzunlik farq qilsa darhol rad etamiz (timingSafeEqual buferlar teng
+  // uzunlikda bo'lishini talab qiladi)
+  if (got.length !== expected.length) return { ok: false, configured: true };
+
+  const crypto = require('crypto');
+  const ok = crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected));
+  return { ok, configured: true };
+}
+
+/**
+ * Provayderdan kelgan yozuv havolasini tekshiradi.
+ *
+ * Nega: webhook orqali `javascript:` yoki `data:` sxemali havola
+ * kelsa, agent uni bosganda brauzerda zararli kod ishga tushishi
+ * mumkin edi. Faqat http(s) ga ruxsat beramiz.
+ */
+export function sanitizeMediaUrl(url: any): string | null {
+  if (!url || typeof url !== 'string') return null;
+  const trimmed = url.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+  if (trimmed.length > 2000) return null;
+  return trimmed;
+}
+
+// ─── v12.3: Telefon raqamlarini yagona formatga keltirish ────────────────────
+
+/**
+ * O'zbekiston raqamlarini E.164 formatiga keltiradi.
+ *
+ * NEGA KERAK: Facebook "+998901234567" yuborishi ham, foydalanuvchi
+ * "90 123 45 67" yozishi ham mumkin. Ilgari bular TURLI mijoz deb
+ * qabul qilinardi va bazada dublikatlar yig'ilardi.
+ *
+ *   '+998 90 123-45-67' → '+998901234567'
+ *   '998901234567'      → '+998901234567'
+ *   '901234567'         → '+998901234567'
+ *   '8901234567'        → '+998901234567'
+ *
+ * Xorijiy raqamlar '+' bilan boshlansa o'zgarishsiz qoladi.
+ * Tushunarsiz qiymat kelsa null qaytadi (saqlamaslik uchun).
+ */
+export function normalizePhone(input: any): string | null {
+  if (input === null || input === undefined) return null;
+  let p = String(input).trim();
+  if (!p) return null;
+
+  const hadPlus = p.startsWith('+');
+  p = p.replace(/\D/g, '');
+  if (!p) return null;
+
+  if (hadPlus) {
+    // Xalqaro raqam — shundayligicha qoldiramiz
+    return p.length >= 7 && p.length <= 15 ? '+' + p : null;
+  }
+
+  if (p.startsWith('998') && p.length === 12) return '+' + p;
+  if (p.length === 9) return '+998' + p;                       // 901234567
+  if (p.length === 10 && p.startsWith('8')) return '+998' + p.slice(1); // 8901234567
+  if (p.length >= 7 && p.length <= 15) return '+' + p;         // boshqa davlat
+
+  return null;
+}
+
+/**
+ * Dublikat qidirish uchun raqamning mumkin bo'lgan barcha ko'rinishlari.
+ *
+ * Bazada eski yozuvlar turli formatda saqlangan bo'lishi mumkin,
+ * shuning uchun qidiruvda hammasini tekshiramiz.
+ */
+export function phoneVariants(input: any): string[] {
+  const raw = String(input ?? '').trim();
+  const normalized = normalizePhone(input);
+  const set = new Set<string>();
+
+  if (raw) set.add(raw);
+  if (normalized) {
+    set.add(normalized);
+    set.add(normalized.replace('+', ''));           // 998901234567
+    if (normalized.startsWith('+998')) {
+      set.add(normalized.slice(4));                  // 901234567
+      set.add('8' + normalized.slice(4));            // 8901234567
+    }
+  }
+  return [...set].filter(Boolean);
+}

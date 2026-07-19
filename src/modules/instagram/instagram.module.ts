@@ -10,6 +10,8 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser, Public } from '../../common/decorators';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { NotificationsService } from '../notifications/notifications.service';
+import { EncryptionService } from '../../common/encryption/encryption.service';
+import { normalizePhone, phoneVariants } from '../../common/utils/helpers';
 
 // Meta Graph API versiyasi — bitta joyda turadi.
 // Eskirsa (masalan v23 -> v25) faqat shu qatorni o'zgartiring.
@@ -64,6 +66,8 @@ export class InstagramService {
     private realtime: RealtimeGateway,
     private roundRobin: RoundRobinService,
     private notifications: NotificationsService,
+    // v12.3 XAVFSIZLIK: Access Token shifrlangan holda saqlanadi
+    private encryption: EncryptionService,
   ) {}
 
   async getConfig(tenantId: string) {
@@ -79,7 +83,7 @@ export class InstagramService {
       { id: 'date', question: 'Qachon ketmoqchisiz?', field: 'date' },
     ];
     return {
-      accessToken: s.instagramAccessToken || null,
+      accessToken: this.decryptToken(s.instagramAccessToken),
       pageId: s.instagramPageId || null,
       verifyToken: s.instagramVerifyToken || 'omoncrm_verify',
       botName: s.instagramBotName || 'Travel Bot',
@@ -89,6 +93,24 @@ export class InstagramService {
       isEnabled: !!s.instagramAccessToken,
       botSteps: s.instagramBotSteps || defaultSteps,
     };
+  }
+
+  /**
+   * Saqlangan tokenni ochadi.
+   *
+   * ORQAGA MOSLIK: eski o'rnatmalarda token OCHIQ MATNDA saqlangan.
+   * Shifrni ochib bo'lmasa — qiymatning o'zini qaytaramiz, shunda
+   * mavjud mijozlarning ulanishi buzilmaydi. Keyingi saqlashda u
+   * avtomatik shifrlanadi.
+   */
+  private decryptToken(value: string | null | undefined): string | null {
+    if (!value) return null;
+    try {
+      const plain = this.encryption.decrypt(value);
+      return plain || value;
+    } catch {
+      return value; // eski, shifrlanmagan qiymat
+    }
   }
 
   async saveConfig(tenantId: string, data: {
@@ -109,7 +131,10 @@ export class InstagramService {
       data: {
         settings: {
           ...cur,
-          instagramAccessToken: data.accessToken ?? cur.instagramAccessToken,
+          // Yangi token kelsa SHIFRLAB saqlaymiz; kelmasa eskisi qoladi
+          instagramAccessToken: data.accessToken
+            ? this.encryption.encrypt(String(data.accessToken).trim())
+            : cur.instagramAccessToken,
           instagramPageId: data.pageId ?? cur.instagramPageId,
           instagramVerifyToken: data.verifyToken ?? cur.instagramVerifyToken,
           instagramBotName: data.botName ?? cur.instagramBotName,
@@ -124,7 +149,8 @@ export class InstagramService {
     // MUHIM: faqat Access Token/Page ID saqlash yetarli emas — Meta shu
     // Page/Instagram akkauntini ilovamizga obuna qilishimizni talab qiladi.
     // Shu chaqiruvsiz webhook hech qachon kelmaydi, token to'g'ri bo'lsa ham.
-    const accessToken = data.accessToken ?? cur.instagramAccessToken;
+    // Obuna uchun OCHIQ token kerak (yangi kelgan yoki eskisini ochamiz)
+    const accessToken = data.accessToken ?? this.decryptToken(cur.instagramAccessToken);
     const pageId = data.pageId ?? cur.instagramPageId;
     if (accessToken && pageId) {
       await this.subscribeAppToPage(pageId, accessToken);
@@ -344,13 +370,16 @@ export class InstagramService {
     try {
       const res = await fetch(
         `https://graph.facebook.com/${GRAPH_API_VERSION}/${igsid}` +
-        `?fields=name,username,profile_pic&access_token=${encodeURIComponent(accessToken)}`,
+        `?fields=name,profile_pic&access_token=${encodeURIComponent(accessToken)}`,
       );
       if (!res.ok) return null;
       const j: any = await res.json();
       return {
-        firstName: j?.name || j?.username || null,
-        username: j?.username || null,
+        // DIQQAT: bu endpoint `username` ni QO'LLAB-QUVVATLAMAYDI.
+        // So'ralsa Meta butun so'rovni rad etadi:
+        // "(#100) Tried accessing nonexisting field (username)"
+        firstName: j?.name || null,
+        username: null,
         avatarUrl: j?.profile_pic || null,
       };
     } catch {
@@ -575,8 +604,13 @@ export class InstagramService {
     }
 
     // Check duplicate
+    // Raqamni yagona formatga keltiramiz va barcha ko'rinishlari
+    // bo'yicha dublikat qidiramiz (Facebook bilan bir xil mantiq)
+    const normalizedPhone = normalizePhone(s.phone);
     if (s.phone) {
-      const dup = await this.prisma.client.findFirst({ where: { tenantId, phone: s.phone } });
+      const dup = await this.prisma.client.findFirst({
+        where: { tenantId, phone: { in: phoneVariants(s.phone) } },
+      });
       if (dup) {
         this.logger.log('Instagram duplicate phone: ' + s.phone);
         return dup;
@@ -587,7 +621,7 @@ export class InstagramService {
       data: {
         tenantId,
         fullName: s.name || 'Instagram foydalanuvchi',
-        phone: s.phone || '',
+        phone: normalizedPhone || s.phone || '',
         source: 'INSTAGRAM',
         pipelineStage: 'NEW_LEAD',
         pipelineStageAt: new Date(),

@@ -2,8 +2,10 @@ import {
   Module, Injectable, Controller, Get, Post, Patch, Delete,
   Param, Body, Query, UseGuards, Logger, BadRequestException,
   NotFoundException, Req,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
+import { checkWebhookSecret } from '../../common/utils/helpers';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser, Public, Roles } from '../../common/decorators';
@@ -356,11 +358,40 @@ export class WhatsAppWebhookController {
   constructor(private svc: WhatsAppService) {}
 
   // UltraMsg webhook: POST /api/v1/public/whatsapp/webhook/TENANT_ID
+  /**
+   * XAVFSIZLIK: manzilda tenantId ochiq turadi, ya'ni uni bilgan
+   * har kim soxta xabar yubora olardi. Endi maxfiy kalit talab
+   * qilinadi (.env → WHATSAPP_WEBHOOK_SECRET).
+   *
+   * UltraMsg'da webhook manzilini shunday ko'rsating:
+   *   https://server/api/v1/public/whatsapp/webhook/TENANT_ID?secret=KALIT
+   */
   @Post('webhook/:tenantId')
   @Public()
-  webhook(@Param('tenantId') tenantId: string, @Body() body: any) {
+  webhook(
+    @Param('tenantId') tenantId: string,
+    @Body() body: any,
+    @Req() req: any,
+  ) {
+    const res = checkWebhookSecret(
+      req?.headers || {},
+      req?.query || {},
+      process.env.WHATSAPP_WEBHOOK_SECRET,
+    );
+    if (!res.ok) throw new UnauthorizedException("Webhook kaliti noto'g'ri");
+    if (!res.configured) {
+      if (!WhatsAppWebhookController.warned) {
+        WhatsAppWebhookController.warned = true;
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[XAVFSIZLIK] WHATSAPP_WEBHOOK_SECRET sozlanmagan — WhatsApp webhook himoyasiz.',
+        );
+      }
+    }
     return this.svc.handleWebhook(tenantId, body);
   }
+
+  private static warned = false;
 
   // GET - UltraMsg webhook verification uchun
   @Get('webhook/:tenantId')

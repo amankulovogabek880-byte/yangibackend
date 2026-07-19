@@ -15,6 +15,7 @@ import {
   calculateLeadScore,
   clean,
   pickNextAgent,
+  normalizePhone,
 } from '../../common/utils/helpers';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -231,11 +232,15 @@ export class ClientsService {
     // v9-SECURITY: Validate phone format if provided
     let phone = null;
     if (data.phone?.trim()) {
-      phone = String(data.phone).trim();
+      const entered = String(data.phone).trim();
       // Basic phone validation: at least 5 chars, alphanumeric + symbols
-      if (!phone.match(/^[0-9\+\-\(\) ]{5,20}$/)) {
+      if (!entered.match(/^[0-9\+\-\(\) ]{5,20}$/)) {
         throw new BadRequestException('Telefon raqam noto\'g\'ri formatda');
       }
+      // v12.3: yagona formatga keltiramiz (+998901234567).
+      // Shunda "90 123 45 67" va "+998901234567" BIR XIL mijoz bo'ladi
+      // va bazada dublikat yig'ilmaydi.
+      phone = normalizePhone(entered) || entered;
     }
 
     // Check duplicate phone ONLY if phone is provided

@@ -1,8 +1,18 @@
 import {
   Module, Injectable, Controller, Get, Post, Body, Query, Param, UseGuards,
   Logger, BadRequestException, NotFoundException, ForbiddenException,
+  Req,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiBody } from '@nestjs/swagger';
+import type { Request } from 'express';
+import { Cron } from '@nestjs/schedule';
+import {
+  checkWebhookSecret,
+  sanitizeMediaUrl,
+  normalizePhone,
+  phoneVariants,
+} from '../../common/utils/helpers';
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser, Public } from '../../common/decorators';
@@ -181,6 +191,135 @@ export class CallsService {
     return provider.testConnection();
   }
 
+
+  // ═══════════════════════════════════════════════════════════════
+  // KIRUVCHI QO'NG'IROQLAR (v12.3)
+  // ═══════════════════════════════════════════════════════════════
+  //
+  // MUAMMO: webhook faqat MAVJUD qo'ng'iroq yozuvini yangilaydi
+  // (providerCallId bo'yicha topadi). Mijoz o'zi qo'ng'iroq qilsa
+  // CRM'da hech qanday yozuv paydo bo'lmasdi.
+  //
+  // YECHIM: OnlinePBX tarixini muntazam o'qib, kiruvchi qo'ng'iroqlarni
+  // yaratamiz va telefon bo'yicha mijozni topamiz.
+  //
+  // mongo_history/search.json — rasmiy hujjatda tasdiqlangan endpoint.
+
+  /** Har 3 daqiqada kiruvchi qo'ng'iroqlarni tortib olamiz */
+  @Cron('*/3 * * * *')
+  async syncInboundCalls() {
+    // Telefoniya sozlamasi ALOHIDA ustunda: tenant.phoneConfig
+    // (tenant.settings ichida EMAS — provayder fabrikasi ham shundan o'qiydi)
+    const tenants = await this.prisma.tenant.findMany({
+      where: { status: 'ACTIVE', phoneProvider: 'ONLINEPBX' as any },
+      select: { id: true, phoneConfig: true },
+    }).catch(() => [] as any[]);
+
+    for (const t of tenants) {
+      const opbx: any = ((t as any).phoneConfig || {}).onlinepbx;
+      if (!opbx?.domain || !opbx?.apiKey) continue;
+
+      try {
+        await this.pullInboundForTenant(t.id);
+      } catch (e: any) {
+        this.logger.warn(`Kiruvchi sinx xato [${t.id}]: ${e?.message}`);
+      }
+    }
+  }
+
+  /** Bitta tenant uchun tarixdan kiruvchi qo'ng'iroqlarni oladi */
+  async pullInboundForTenant(tenantId: string) {
+    const provider: any = await this.providerFactory.getProvider(tenantId);
+    if (!provider || typeof provider.fetchHistory !== 'function') return { created: 0 };
+
+    // Oxirgi 30 daqiqa (kesishuv bo'lsa dublikat tekshiruvi ushlaydi)
+    const since = new Date(Date.now() - 30 * 60 * 1000);
+    const rows: any[] = await provider.fetchHistory(since, 200);
+    if (!Array.isArray(rows) || rows.length === 0) return { created: 0 };
+
+    let created = 0;
+
+    for (const r of rows) {
+      // Faqat kiruvchi
+      const dir = String(r.direction || r.call_direction || r.type || '').toLowerCase();
+      const isInbound = dir.includes('in') || r.accountcode === 'inbound';
+      if (!isInbound) continue;
+
+      const providerCallId = String(r.uuid || r.call_id || r.id || '');
+      if (!providerCallId) continue;
+
+      // Allaqachon yozilganmi?
+      const exists = await this.prisma.call.findFirst({
+        where: { providerCallId },
+        select: { id: true },
+      });
+      if (exists) continue;
+
+      const fromPhone = normalizePhone(r.caller_id_number || r.from || r.src);
+      if (!fromPhone) continue;
+
+      // Mijozni raqam bo'yicha topamiz (barcha formatlarni tekshiramiz)
+      const client = await this.prisma.client.findFirst({
+        where: { tenantId, phone: { in: phoneVariants(fromPhone) } },
+        select: { id: true, fullName: true, assignedAgentId: true },
+      });
+
+      const durationRaw = Number(r.billsec ?? r.duration ?? 0);
+      const answered = durationRaw > 0;
+
+      const call = await this.prisma.call.create({
+        data: {
+          tenantId,
+          clientId: client?.id || null,
+          agentId: client?.assignedAgentId || null,
+          direction: 'INBOUND' as any,
+          status: (answered ? 'COMPLETED' : 'NO_ANSWER') as any,
+          providerCallId,
+          // Kiruvchida qo'ng'iroq qiluvchi = mijoz, shuning uchun fromMasked.
+          // toMasked ham to'ldiriladi — mavjud ro'yxat UI'si shuni o'qiydi.
+          fromMasked: fromPhone,
+          toMasked: fromPhone,
+          duration: Number.isFinite(durationRaw) ? Math.round(durationRaw) : 0,
+          recordingUrl: sanitizeMediaUrl(r.recording_url || r.record_url || r.file_url),
+          startedAt: r.start_stamp ? new Date(Number(r.start_stamp) * 1000) : new Date(),
+        } as any,
+      }).catch(() => null);
+
+      if (!call) continue;
+      created++;
+
+      // Agentga darhol ko'rsatamiz — mijoz kartochkasi ochilishi uchun
+      const payload = {
+        callId: call.id,
+        clientId: client?.id || null,
+        clientName: client?.fullName || null,
+        phone: fromPhone,
+        answered,
+      };
+      if (client?.assignedAgentId) {
+        this.realtime.emitToUser(client.assignedAgentId, 'call:inbound', payload);
+      } else {
+        this.realtime.emitToTenant(tenantId, 'call:inbound', payload);
+      }
+
+      // Javobsiz qo'ng'iroq — bu yo'qotilgan mijoz bo'lishi mumkin
+      if (!answered && client?.assignedAgentId) {
+        await this.notifications.create({
+          tenantId,
+          userId: client.assignedAgentId,
+          type: 'CALL_MISSED',
+          title: "📞 Javobsiz qo'ng'iroq",
+          body: `${client.fullName || fromPhone} qo'ng'iroq qildi`,
+          link: client.id ? `/clients/${client.id}` : '/calls',
+          metadata: { callId: call.id, phone: fromPhone },
+        }).catch(() => {});
+      }
+    }
+
+    if (created) this.logger.log(`Kiruvchi qo'ng'iroqlar [${tenantId}]: +${created}`);
+    return { created };
+  }
+
   async handleWebhook(body: any) {
     const providerName = this.providerFactory.identifyProvider(body);
     if (!providerName) {
@@ -212,7 +351,10 @@ export class CallsService {
     const newStatus = statusMap[event.status] || call.status;
     const updateData: any = { status: newStatus };
     if (event.duration && event.duration > 0) updateData.duration = event.duration;
-    if (event.recordingUrl) updateData.recordingUrl = event.recordingUrl;
+    // XAVFSIZLIK: provayder yuborgan havolani tekshiramiz — faqat http(s).
+    // Aks holda `javascript:` sxemali havola agent brauzerida ishga tushardi.
+    const safeRecording = sanitizeMediaUrl(event.recordingUrl);
+    if (safeRecording) updateData.recordingUrl = safeRecording;
     if (['COMPLETED', 'FAILED', 'NO_ANSWER', 'BUSY'].includes(newStatus)) {
       updateData.endedAt = new Date();
     }
@@ -222,7 +364,7 @@ export class CallsService {
     this.realtime.emitToUser(call.agentId, 'call:status', {
       callId: call.id, status: newStatus,
       duration: event.duration,
-      recordingUrl: event.recordingUrl,
+      recordingUrl: safeRecording,
     });
 
     if (newStatus === 'NO_ANSWER' || newStatus === 'BUSY') {
@@ -433,10 +575,44 @@ export class CallsController {
       },
     },
   })
+  /**
+   * Telefoniya provayderidan keladigan webhook.
+   *
+   * XAVFSIZLIK: bu endpoint tashqi dunyoga ochiq (@Public), shuning uchun
+   * MAXFIY KALIT bilan himoyalangan. Kalitsiz kimdir soxta qo'ng'iroq
+   * yozuvi yoki zararli `recording_url` yuborishi mumkin edi.
+   *
+   * Sozlash: .env ga PHONE_WEBHOOK_SECRET qo'shing, so'ng provayderda
+   * webhook manzilini shunday ko'rsating:
+   *   https://sizning-server/calls/webhook?secret=SIZNING_KALIT
+   * yoki `x-webhook-secret` header'ida yuboring.
+   *
+   * Kalit sozlanmagan bo'lsa — ishlashda davom etadi (mavjud o'rnatmalar
+   * buzilmasin), lekin ogohlantirish log'ga yoziladi.
+   */
   @Post('webhook')
   @Public()
-  webhook(@Body() body: any) {
+  webhook(@Body() body: any, @Req() req: Request) {
+    const res = checkWebhookSecret(
+      req.headers as any,
+      req.query as any,
+      process.env.PHONE_WEBHOOK_SECRET,
+    );
+    if (!res.ok) throw new UnauthorizedException("Webhook kaliti noto'g'ri");
+    if (!res.configured) this.warnOnce();
+
     return this.svc.handleWebhook(body);
+  }
+
+  private static warned = false;
+  private warnOnce() {
+    if (CallsController.warned) return;
+    CallsController.warned = true;
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[XAVFSIZLIK] PHONE_WEBHOOK_SECRET sozlanmagan — /calls/webhook himoyasiz. ' +
+      'Ishlab chiqarishda albatta sozlang.',
+    );
   }
 }
 

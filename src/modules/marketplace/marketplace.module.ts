@@ -14,6 +14,12 @@ import {
   BadRequestException,
   Logger,
 } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
+import {
+  getCatalog,
+  getCatalogOperator,
+  CatalogOperator,
+} from './operator-catalog';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EncryptionService } from '../../common/encryption/encryption.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -410,6 +416,255 @@ export class MarketplaceService {
     return { success: true, message: `"${op.name}" operatori o'chirildi` };
   }
 
+
+  // ═══════════════════════════════════════════════════════════
+  // KATALOG: ulanish (v12.4)
+  // ═══════════════════════════════════════════════════════════
+  //
+  // Operator API manzillari SERVERDA (env) turadi — agentlik ularni
+  // ko'rmaydi. Agentlik faqat O'Z login/parolini kiritadi.
+
+  /** Katalogni shu tenantning ulanish holati bilan birga qaytaradi */
+  async listCatalog(tenantId: string) {
+    const catalog = getCatalog();
+
+    const connected = await this.prisma.tourOperator.findMany({
+      where: { tenantId, slug: { in: catalog.map((c) => c.slug) } },
+      select: {
+        id: true, slug: true, status: true, toursCount: true,
+        lastSyncAt: true, lastSyncError: true, credLogin: true,
+      },
+    });
+
+    const bySlug = new Map(connected.map((c: any) => [c.slug, c]));
+
+    return {
+      data: catalog.map((c) => {
+        const conn: any = bySlug.get(c.slug);
+        return {
+          slug: c.slug,
+          name: c.name,
+          logoUrl: c.logoUrl,
+          website: c.website,
+          description: c.description,
+          loginLabel: c.loginLabel,
+          passwordLabel: c.passwordLabel,
+          helpText: c.helpText,
+          authType: c.authType,
+          // env'da API manzili bormi
+          configured: c.configured,
+          // shu agentlik ulanganmi
+          connected: Boolean(conn),
+          operatorId: conn?.id || null,
+          status: conn?.status || null,
+          toursCount: conn?.toursCount || 0,
+          lastSyncAt: conn?.lastSyncAt || null,
+          lastSyncError: conn?.lastSyncError || null,
+          // Parol EMAS — faqat login ko'rsatiladi (kim ulanganini bilish uchun)
+          maskedLogin: conn?.credLogin ? '•••• ulangan' : null,
+        };
+      }),
+    };
+  }
+
+  /**
+   * Operator API'siga login/parolni tekshiradi.
+   * Muvaffaqiyatli bo'lsa token yoki null (Basic/API-key uchun) qaytaradi.
+   */
+  private async verifyCredentials(
+    op: CatalogOperator,
+    login: string,
+    password: string,
+  ): Promise<{ ok: boolean; token?: string | null; error?: string }> {
+    if (!op.apiBaseUrl) {
+      return {
+        ok: false,
+        error:
+          `"${op.name}" hali sozlanmagan (API manzili yo'q). ` +
+          `Platforma administratori .env dagi MARKETPLACE_OPERATORS_JSON ga qo'shishi kerak.`,
+      };
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+
+    try {
+      if (op.authType === 'login') {
+        // POST {apiBaseUrl}{loginPath}  →  { token } | { access_token } | { data.token }
+        const res = await fetch(`${op.apiBaseUrl}${op.loginPath || '/auth/login'}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({ login, username: login, email: login, password }),
+          signal: controller.signal as any,
+        });
+
+        if (res.status === 401 || res.status === 403) {
+          return { ok: false, error: "Login yoki parol noto'g'ri" };
+        }
+        if (!res.ok) {
+          const t = await res.text().catch(() => '');
+          return { ok: false, error: `Operator serveri xato qaytardi (HTTP ${res.status}): ${t.slice(0, 150)}` };
+        }
+
+        const j: any = await res.json().catch(() => ({}));
+        const token =
+          j?.token || j?.access_token || j?.accessToken ||
+          j?.data?.token || j?.data?.access_token || null;
+
+        if (!token) {
+          return {
+            ok: false,
+            error:
+              "Operator javobida token topilmadi. Integratsiya sozlamasi to'g'rilanishi kerak " +
+              '(kutilgan: token | access_token | data.token).',
+          };
+        }
+        return { ok: true, token };
+      }
+
+      // basic / apikey — turlar manzilini so'rab tekshiramiz
+      const headers: Record<string, string> = { Accept: 'application/json' };
+      if (op.authType === 'basic') {
+        headers.Authorization =
+          'Basic ' + Buffer.from(`${login}:${password}`).toString('base64');
+      } else {
+        // apikey: kalit "password" maydonida keladi
+        headers.Authorization = `Bearer ${password}`;
+      }
+
+      const res = await fetch(`${op.apiBaseUrl}${op.toursPath || '/tours'}`, {
+        method: 'GET',
+        headers,
+        signal: controller.signal as any,
+      });
+
+      if (res.status === 401 || res.status === 403) {
+        return {
+          ok: false,
+          error: op.authType === 'apikey' ? "API kalit noto'g'ri" : "Login yoki parol noto'g'ri",
+        };
+      }
+      if (!res.ok) {
+        return { ok: false, error: `Operator serveri xato qaytardi (HTTP ${res.status})` };
+      }
+      return { ok: true, token: null };
+    } catch (e: any) {
+      const msg = e?.name === 'AbortError'
+        ? "Operator serveri javob bermadi (20 soniya)"
+        : `Ulanib bo'lmadi: ${e?.message}`;
+      return { ok: false, error: msg };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Agentlikni operatorga ulaydi.
+   *
+   * Login/parol TEKSHIRILADI — noto'g'ri bo'lsa saqlanmaydi.
+   * To'g'ri bo'lsa shifrlanib saqlanadi va turlar darhol yuklanadi.
+   */
+  async connectCatalogOperator(
+    tenantId: string,
+    userId: string,
+    slug: string,
+    body: { login?: string; password?: string },
+  ) {
+    const op = getCatalogOperator(slug);
+    if (!op) throw new NotFoundException('Bunday operator katalogda yo\'q');
+
+    const login = String(body?.login || '').trim();
+    const password = String(body?.password || '').trim();
+
+    // apikey rejimida faqat kalit kerak
+    if (op.authType !== 'apikey' && !login) {
+      throw new BadRequestException(`${op.loginLabel || 'Login'} kiriting`);
+    }
+    if (!password) {
+      throw new BadRequestException(`${op.passwordLabel || 'Parol'} kiriting`);
+    }
+
+    // ── Haqiqiy tekshiruv ──
+    const check = await this.verifyCredentials(op, login, password);
+    if (!check.ok) {
+      throw new BadRequestException(check.error || "Ulanib bo'lmadi");
+    }
+
+    // ── Saqlaymiz (shifrlangan) ──
+    const existing = await this.prisma.tourOperator.findFirst({
+      where: { tenantId, slug: op.slug },
+    });
+
+    const data: any = {
+      name: op.name,
+      slug: op.slug,
+      logoUrl: op.logoUrl,
+      website: op.website,
+      description: op.description,
+      integrationType: 'API',
+      apiBaseUrl: op.apiBaseUrl,
+      credLogin: login ? this.encryption.encrypt(login) : null,
+      credPassword: this.encryption.encrypt(password),
+      status: 'ACTIVE',
+      lastSyncError: null,
+    };
+
+    const operator = existing
+      ? await this.prisma.tourOperator.update({ where: { id: existing.id }, data })
+      : await this.prisma.tourOperator.create({ data: { ...data, tenantId } });
+
+    this.audit.log({
+      tenantId, userId,
+      action: existing ? 'UPDATE' : 'CREATE',
+      entity: 'tour_operator', entityId: operator.id,
+      // Parol QIYMATI yozilmaydi — faqat ulanish fakti
+      metadata: { slug: op.slug, name: op.name, action: 'connect' },
+    });
+
+    // ── Turlarni darhol yuklaymiz ──
+    let sync: any = null;
+    try {
+      sync = await this.syncOperator(tenantId, userId, operator.id);
+    } catch (e: any) {
+      // Ulanish MUVAFFAQIYATLI, faqat turlar yuklanmadi —
+      // buni alohida aytamiz, ulanishni bekor qilmaymiz
+      this.logger.warn(`Ulandi, lekin turlar yuklanmadi [${op.name}]: ${e?.message}`);
+      return {
+        success: true,
+        connected: true,
+        message: `${op.name}: ulandingiz. Turlarni yuklashda muammo: ${e?.message}`,
+        operatorId: operator.id,
+        toursLoaded: 0,
+      };
+    }
+
+    return {
+      success: true,
+      connected: true,
+      message: `${op.name}: ulandingiz. ${sync?.created || 0} ta tur yuklandi.`,
+      operatorId: operator.id,
+      toursLoaded: (sync?.created || 0) + (sync?.updated || 0),
+    };
+  }
+
+  /** Ulanishni uzadi — operator va uning turlari o'chadi */
+  async disconnectCatalogOperator(tenantId: string, userId: string, slug: string) {
+    const existing = await this.prisma.tourOperator.findFirst({
+      where: { tenantId, slug: String(slug || '').toLowerCase() },
+    });
+    if (!existing) throw new NotFoundException('Bu operatorga ulanmagansiz');
+
+    await this.prisma.tourOperator.delete({ where: { id: existing.id } });
+
+    this.audit.log({
+      tenantId, userId,
+      action: 'DELETE', entity: 'tour_operator', entityId: existing.id,
+      metadata: { slug, name: existing.name, action: 'disconnect' },
+    });
+
+    return { success: true, message: `${existing.name}: ulanish uzildi` };
+  }
+
   // ═══════════════════════════════════════════════════════════
   // IMPORT / SINXRONIZATSIYA
   // ═══════════════════════════════════════════════════════════
@@ -536,9 +791,37 @@ export class MarketplaceService {
     const login = this.reveal(op.credLogin);
     const password = this.reveal(op.credPassword);
 
+    // Katalogdan integratsiya qoidalarini olamiz (authType, yo'llar).
+    // Katalogda bo'lmasa — eski, qo'lda qo'shilgan operator: umumiy
+    // usulda ishlaymiz (orqaga moslik).
+    const cat = getCatalogOperator(op.slug);
+
     const headers: Record<string, string> = { Accept: 'application/json' };
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-    else if (login && password) {
+    let toursUrl = op.apiBaseUrl;
+
+    if (cat?.apiBaseUrl) {
+      toursUrl = `${cat.apiBaseUrl}${cat.toursPath || '/tours'}`;
+    }
+
+    if (cat?.authType === 'login' && login && password) {
+      // Avval token olamiz, keyin turlarni so'raymiz
+      const auth = await this.verifyCredentials(cat, login, password);
+      if (!auth.ok) {
+        // Parol o'zgargan bo'lishi mumkin — buni aniq aytamiz
+        await this.prisma.tourOperator.update({
+          where: { id: operatorId },
+          data: { status: 'ERROR', lastSyncError: auth.error, lastSyncAt: new Date() },
+        });
+        throw new BadRequestException(
+          `${op.name}: ${auth.error}. Sozlamalar → Tur operatorlar bo'limida qayta ulaning.`,
+        );
+      }
+      if (auth.token) headers['Authorization'] = `Bearer ${auth.token}`;
+    } else if (cat?.authType === 'apikey') {
+      headers['Authorization'] = `Bearer ${password || apiKey}`;
+    } else if (apiKey) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    } else if (login && password) {
       headers['Authorization'] = 'Basic ' + Buffer.from(`${login}:${password}`).toString('base64');
     }
 
@@ -546,7 +829,7 @@ export class MarketplaceService {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 30000);
 
-      const res = await fetch(op.apiBaseUrl, {
+      const res = await fetch(toursUrl, {
         method: 'GET',
         headers,
         signal: controller.signal as any,
@@ -585,6 +868,49 @@ export class MarketplaceService {
       this.logger.error(`Sync xato [${op.name}]: ${message}`);
       throw new BadRequestException(`Sinxronizatsiya xatosi: ${message}`);
     }
+  }
+
+
+  // ═══════════════════════════════════════════════════════════
+  // AVTOMATIK YANGILASH (v12.3)
+  // ═══════════════════════════════════════════════════════════
+
+  /**
+   * Har kuni tunda API rejimidagi operatorlarning turlarini yangilaydi.
+   *
+   * Faqat integrationType = 'API' va status = 'ACTIVE' operatorlar.
+   * CSV/MANUAL operatorlarga tegilmaydi — ular qo'lda yuklanadi.
+   *
+   * Bitta operator xato bersa qolganlari davom etadi (xato o'sha
+   * operatorning lastSyncError maydoniga yoziladi va admin ko'radi).
+   */
+  @Cron('0 3 * * *') // har kuni 03:00
+  async autoSyncOperators() {
+    const operators = await this.prisma.tourOperator.findMany({
+      where: { integrationType: 'API', status: 'ACTIVE' },
+      select: { id: true, tenantId: true, name: true },
+    }).catch(() => [] as any[]);
+
+    if (!operators.length) return;
+    this.logger.log(`Avtomatik sinxronizatsiya: ${operators.length} ta operator`);
+
+    let ok = 0;
+    let failed = 0;
+
+    for (const op of operators) {
+      try {
+        // userId = 'system' — audit logda kim ishga tushirgani ko'rinadi
+        await this.syncOperator(op.tenantId, 'system', op.id);
+        ok++;
+      } catch (e: any) {
+        failed++;
+        this.logger.warn(`Avto-sinx xato [${op.name}]: ${e?.message}`);
+      }
+      // Operator serverlarini bosmaslik uchun kichik tanaffus
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    this.logger.log(`Avtomatik sinxronizatsiya tugadi: ${ok} muvaffaqiyatli, ${failed} xato`);
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -998,6 +1324,52 @@ export class MarketplaceOperatorsController {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// CONTROLLER 3 — KATALOG (Sozlamalar → Tur operatorlar)
+// ═══════════════════════════════════════════════════════════════
+//
+// Faqat TENANT_ADMIN. Agentlar bu bo'limni umuman ko'rmaydi —
+// ular tayyor turlar bilan ishlaydi.
+
+@Controller('marketplace/catalog')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles('TENANT_ADMIN')
+export class MarketplaceCatalogController {
+  constructor(private service: MarketplaceService) {}
+
+  /** Katalogdagi barcha operatorlar + ulanish holati */
+  @Get()
+  list(@CurrentUser() user: any) {
+    return this.service.listCatalog(user.tenantId);
+  }
+
+  /**
+   * Operatorga ulanish.
+   * body: { login, password }
+   *
+   * Ma'lumotlar operator API'sida TEKSHIRILADI — noto'g'ri bo'lsa
+   * saqlanmaydi va tushunarli xato qaytadi.
+   */
+  @Post(':slug/connect')
+  connect(
+    @CurrentUser() user: any,
+    @Param('slug') slug: string,
+    @Body() body: any,
+  ) {
+    return this.service.connectCatalogOperator(
+      user.tenantId, user.sub || user.id, slug, body,
+    );
+  }
+
+  /** Ulanishni uzish — operator va uning turlari o'chadi */
+  @Post(':slug/disconnect')
+  disconnect(@CurrentUser() user: any, @Param('slug') slug: string) {
+    return this.service.disconnectCatalogOperator(
+      user.tenantId, user.sub || user.id, slug,
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // CONTROLLER 2 — TURLAR + BOOKING
 // ═══════════════════════════════════════════════════════════════
 
@@ -1042,7 +1414,11 @@ export class MarketplaceToursController {
 // ═══════════════════════════════════════════════════════════════
 
 @Module({
-  controllers: [MarketplaceOperatorsController, MarketplaceToursController],
+  controllers: [
+    MarketplaceOperatorsController,
+    MarketplaceToursController,
+    MarketplaceCatalogController,
+  ],
   providers: [MarketplaceService],
   exports: [MarketplaceService],
 })
