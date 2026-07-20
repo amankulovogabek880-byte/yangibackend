@@ -190,6 +190,11 @@ export class V8Service {
 
   async bulkAddTag(tenantId: string, ids: string[], tag: string) {
     if (!ids?.length || !tag?.trim()) throw new BadRequestException("Parametr xato");
+    // v12.8: bir martada juda ko'p yozuv o'zgartirilmasin —
+    // katta massiv so'rovni ham, tranzaksiyani ham og'irlashtiradi.
+    if (ids.length > 500) {
+      throw new BadRequestException("Bir vaqtda eng ko'pi 500 ta mijoz tanlanadi");
+    }
     const t = tag.trim().toLowerCase();
     const clients = await this.prisma.client.findMany({
       where: { tenantId, id: { in: ids } },

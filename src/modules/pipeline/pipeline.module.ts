@@ -4,6 +4,7 @@ import {
   Param, Body, Query, UseGuards,
   NotFoundException, BadRequestException, Logger } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
+import { CronLockService } from '../../common/utils/cron-lock.service';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -56,7 +57,10 @@ const V10_STAGE_KEYS: Record<string, string> = {
 @Injectable()
 export class PipelineService {
   private readonly logger = new Logger('Pipeline');
-  constructor(private prisma: PrismaService) {}
+  constructor(private prisma: PrismaService,
+    // v12.7: cron qulfi (ko'p instansda takrorlanmasin)
+    private readonly cronLock: CronLockService,
+  ) {}
 
   // ─── Pipeline list (works with existing DB) ────────────────────────────────
   async listPipelines(tenantId: string) {
@@ -105,19 +109,20 @@ export class PipelineService {
       { name: 'Yo\'qotildi',         color: '#dc2626', order: 11, isLost: true },
     ];
 
-    for (const s of stages) {
-      await this.prisma.customStage.create({
-        data: {
-          tenantId,
-          pipelineId: pl.id,
-          name: s.name,
-          color: s.color,
-          order: s.order,
-          isClosing: (s as any).isClosing || false,
-          isLost: (s as any).isLost || false,
-        },
-      });
-    }
+    // v12.9: 12 ta alohida INSERT o'rniga bitta so'rov.
+    // Bu yangi agentlik yaratilganda ishlaydi — 12 marta bazaga
+    // borish o'rniga bir marta boriladi.
+    await this.prisma.customStage.createMany({
+      data: stages.map((s: any) => ({
+        tenantId,
+        pipelineId: pl.id,
+        name: s.name,
+        color: s.color,
+        order: s.order,
+        isClosing: s.isClosing || false,
+        isLost: s.isLost || false,
+      })),
+    });
 
     return this.prisma.pipeline.findUnique({
       where: { id: pl.id },
@@ -504,94 +509,106 @@ export class PipelineService {
   // ─── CRON: Travel notifications (reads from preferences JSON) ─────────────
   @Cron(CronExpression.EVERY_HOUR)
   async travelNotifications() {
-    const now = new Date();
+    // v12.7: bir nechta instansda TAKROR bajarilmasin —
+    // qulfni birinchi olgan instans bajaradi, qolganlari o'tkazadi.
+    await this.cronLock.runOnce('travel-notify', 3000, async () => {
+      const now = new Date();
 
-    // Find clients with travel info in preferences
-    const travelingClients = await this.prisma.client.findMany({
-      where: {
-        pipelineStage: { in: ['CONFIRMED', 'TRAVELING'] as PipelineStage[] },
-        status: 'ACTIVE',
-      },
-      take: 100,
-    });
+      // Find clients with travel info in preferences
+      const travelingClients = await this.prisma.client.findMany({
+        where: {
+          pipelineStage: { in: ['CONFIRMED', 'TRAVELING'] as PipelineStage[] },
+          status: 'ACTIVE',
+        },
+        take: 100,
+      });
 
-    for (const c of travelingClients) {
-      const prefs: any = (c as any).preferences || {};
-      if (!prefs.travelDepartDate || !(c as any).assignedAgentId) continue;
+      for (const c of travelingClients) {
+        const prefs: any = (c as any).preferences || {};
+        if (!prefs.travelDepartDate || !(c as any).assignedAgentId) continue;
 
-      const depart = new Date(prefs.travelDepartDate);
-      const diff = depart.getTime() - now.getTime();
+        const depart = new Date(prefs.travelDepartDate);
+        const diff = depart.getTime() - now.getTime();
 
-      // 1 day before departure
-      if (diff > 0 && diff < 25 * 3600000 && !prefs.departureNotified) {
-        await this.prisma.notification.create({
-          data: {
-            tenantId: c.tenantId, userId: (c as any).assignedAgentId,
-            type: 'STAGE_CHANGED' as any,
-            title: `${(c as any).fullName} ertaga sayohatga ketadi!`,
-            body: 'Omadli yo\'l tiling.', link: `/clients/${c.id}`, metadata: {},
-          } as any,
-        }).catch(swallow('bildirishnoma'));
-        await this.prisma.task.create({
-          data: {
-            tenantId: c.tenantId, creatorId: (c as any).assignedAgentId,
-            assigneeId: (c as any).assignedAgentId, clientId: c.id,
-            title: `${(c as any).fullName}ga omadli yo'l tiling`,
-            priority: 'HIGH', status: 'TODO', dueAt: depart,
-          } as any,
-        }).catch(swallow('yozuv yaratish'));
-        // Mark notified
-        await this.prisma.client.update({
-          where: { id: c.id },
-          data: { preferences: { ...prefs, departureNotified: true } } as any,
-        }).catch(swallow('yangilash'));
+        // 1 day before departure
+        if (diff > 0 && diff < 25 * 3600000 && !prefs.departureNotified) {
+          await this.prisma.notification.create({
+            data: {
+              tenantId: c.tenantId, userId: (c as any).assignedAgentId,
+              type: 'STAGE_CHANGED' as any,
+              title: `${(c as any).fullName} ertaga sayohatga ketadi!`,
+              body: 'Omadli yo\'l tiling.', link: `/clients/${c.id}`, metadata: {},
+            } as any,
+          }).catch(swallow('bildirishnoma'));
+          await this.prisma.task.create({
+            data: {
+              tenantId: c.tenantId, creatorId: (c as any).assignedAgentId,
+              assigneeId: (c as any).assignedAgentId, clientId: c.id,
+              title: `${(c as any).fullName}ga omadli yo'l tiling`,
+              priority: 'HIGH', status: 'TODO', dueAt: depart,
+            } as any,
+          }).catch(swallow('yozuv yaratish'));
+          // Mark notified
+          await this.prisma.client.update({
+            where: { id: c.id },
+            data: { preferences: { ...prefs, departureNotified: true } } as any,
+          }).catch(swallow('yangilash'));
+        }
       }
-    }
 
-    // Callback reminders (nextCallAt in preferences)
-    const noContactClients = await this.prisma.client.findMany({
-      where: { pipelineStage: 'INTERESTED', status: 'ACTIVE' },
-      take: 100,
-    });
+      // Callback reminders (nextCallAt in preferences)
+      const noContactClients = await this.prisma.client.findMany({
+        where: { pipelineStage: 'INTERESTED', status: 'ACTIVE' },
+        take: 100,
+      });
 
-    for (const c of noContactClients) {
-      const prefs: any = (c as any).preferences || {};
-      if (!prefs.nextCallAt || !(c as any).assignedAgentId) continue;
-      if (new Date(prefs.nextCallAt) <= now) {
-        await this.prisma.notification.create({
-          data: {
-            tenantId: c.tenantId, userId: (c as any).assignedAgentId,
-            type: 'FOLLOWUP_DUE' as any,
-            title: `${(c as any).fullName}ga qo'ng'iroq vaqti!`,
-            body: `${(prefs.noContactAttempts || 0) + 1}/6 urinish`,
-            link: `/clients/${c.id}`, metadata: {},
-          } as any,
-        }).catch(swallow('bildirishnoma'));
+      for (const c of noContactClients) {
+        const prefs: any = (c as any).preferences || {};
+        if (!prefs.nextCallAt || !(c as any).assignedAgentId) continue;
+        if (new Date(prefs.nextCallAt) <= now) {
+          await this.prisma.notification.create({
+            data: {
+              tenantId: c.tenantId, userId: (c as any).assignedAgentId,
+              type: 'FOLLOWUP_DUE' as any,
+              title: `${(c as any).fullName}ga qo'ng'iroq vaqti!`,
+              body: `${(prefs.noContactAttempts || 0) + 1}/6 urinish`,
+              link: `/clients/${c.id}`, metadata: {},
+            } as any,
+          }).catch(swallow('bildirishnoma'));
+        }
       }
-    }
-  }
+      });
+}
 
   // Task deadline reminders (every 5 min)
   @Cron('*/5 * * * *')
   async taskReminders() {
-    const now = new Date();
-    const in15 = new Date(now.getTime() + 15 * 60000);
-    const tasks = await this.prisma.task.findMany({
-      where: { status: { in: ['TODO', 'IN_PROGRESS'] }, dueAt: { gte: now, lte: in15 } } as any,
-      include: { client: { select: { fullName: true } } } as any,
-    });
-    for (const t of tasks as any[]) {
-      if (!t.assigneeId) continue;
-      await this.prisma.notification.create({
-        data: {
-          tenantId: t.tenantId, userId: t.assigneeId, type: 'TASK_DUE' as any,
-          title: `Vazifa: ${t.title}`,
-          body: t.client ? `Klient: ${t.client.fullName}` : '15 daqiqa qoldi',
-          link: t.clientId ? `/clients/${t.clientId}` : '/tasks', metadata: {},
-        } as any,
-      }).catch(swallow('bildirishnoma'));
-    }
-  }
+    // v12.7: bir nechta instansda TAKROR bajarilmasin —
+    // qulfni birinchi olgan instans bajaradi, qolganlari o'tkazadi.
+    await this.cronLock.runOnce('task-reminders', 280, async () => {
+      const now = new Date();
+      const in15 = new Date(now.getTime() + 15 * 60000);
+      // v12.8: 15 daqiqalik oyna odatda kichik, lekin ommaviy import
+      // qilingan vazifalar bir vaqtga to'g'ri kelsa minglab bo'lishi
+      // mumkin. Cheklov qo'yamiz — qolganlari keyingi ishga qoladi.
+      const tasks = await this.prisma.task.findMany({
+        where: { status: { in: ['TODO', 'IN_PROGRESS'] }, dueAt: { gte: now, lte: in15 } } as any,
+        include: { client: { select: { fullName: true } } } as any,
+        take: 500,
+      });
+      for (const t of tasks as any[]) {
+        if (!t.assigneeId) continue;
+        await this.prisma.notification.create({
+          data: {
+            tenantId: t.tenantId, userId: t.assigneeId, type: 'TASK_DUE' as any,
+            title: `Vazifa: ${t.title}`,
+            body: t.client ? `Klient: ${t.client.fullName}` : '15 daqiqa qoldi',
+            link: t.clientId ? `/clients/${t.clientId}` : '/tasks', metadata: {},
+          } as any,
+        }).catch(swallow('bildirishnoma'));
+      }
+      });
+}
 }
 
 // ─── Controller ───────────────────────────────────────────────────────────────

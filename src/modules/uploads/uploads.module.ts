@@ -9,6 +9,7 @@ import { CurrentUser } from '../../common/decorators';
 import { PrismaService } from '../../prisma/prisma.service';
 import { DocumentCategory } from '@prisma/client';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { swallow } from '../../common/utils/swallow';
 
 // ─── Supabase Storage konfiguratsiyasi ──────────────────────────────
 // .env da SUPABASE_URL va SUPABASE_SERVICE_KEY bo'lishi shart.
@@ -98,7 +99,7 @@ export class UploadsService {
 
   async deleteFromSupabase(path: string) {
     if (!supabase) return;
-    await supabase.storage.from(SUPABASE_BUCKET).remove([path]).catch(() => {});
+    await supabase.storage.from(SUPABASE_BUCKET).remove([path]).catch(swallow('yon amal'));
   }
 
   async saveRecord(
@@ -130,8 +131,12 @@ export class UploadsService {
     else if (entityId) {
       where.OR = [{ bookingId: entityId }, { clientId: entityId }];
     }
+    // v12.8: cheklov qo'yildi. Bitta mijoz/booking'da hujjat soni
+    // ko'payib ketsa (skanerlar, pasport nusxalari), cheksiz ro'yxat
+    // javobni og'irlashtiradi. 200 ta amalda yetarlidan ko'p.
     const docs = await this.prisma.document.findMany({
       where, orderBy: { createdAt: 'desc' },
+      take: 200,
     });
     return docs.map((d) => ({
       id: d.id,
@@ -277,6 +282,14 @@ export class UploadsController {
 
 @Module({
   controllers: [UploadsController],
-  providers: [UploadsService, PrismaService],
+  // v12.7 TUZATISH: PrismaService bu yerdan OLIB TASHLANDI.
+  //
+  // PrismaModule allaqachon @Global — bu yerda qayta e'lon qilinsa,
+  // Nest IKKINCHI PrismaClient nusxasini yaratardi, ya'ni IKKITA
+  // alohida baza ulanish havzasi. Bu:
+  //   - baza ulanishlari sonini ikki barobar oshiradi
+  //     (Render/Supabase limitiga tez uriladi)
+  //   - tenant-guard middleware'ini ikki marta o'rnatadi
+  providers: [UploadsService],
 })
 export class UploadsModule {}
