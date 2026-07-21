@@ -70,7 +70,13 @@ const KNOWN_OPERATORS: CatalogOperator[] = [
     website: 'https://www.ratehawk.com',
     description: 'Mehmonxonalar B2B API (Emerging Travel Group) — 2.5mln+ mehmonxona',
     apiBaseUrl: 'https://api.worldota.net/api/b2b/v3',
-    authType: 'apikey',
+    // 'apikey' EMAS — u frontendda faqat 1 ta maydon ko'rsatadi va
+    // login maydonini yashiradi. Ratehawk esa 2 ta qiymat (KEY_ID +
+    // API_KEY) talab qiladi, shuning uchun 'basic' — bu frontendda
+    // ikkala maydonni ham chiqaradi. (Backendga ta'siri yo'q: hasAdapter
+    // true bo'lgani uchun tekshiruv har doim RatehawkAdapter orqali
+    // boradi — authType faqat FORMA ko'rinishini boshqaradi.)
+    authType: 'basic',
     loginLabel: 'KEY_ID',
     passwordLabel: 'API_KEY',
     helpText:
