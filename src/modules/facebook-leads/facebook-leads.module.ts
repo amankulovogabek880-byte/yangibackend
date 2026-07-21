@@ -10,9 +10,9 @@ import {
   Res,
   UseGuards,
   Logger,
-  BadRequestException,
-} from '@nestjs/common';
+  BadRequestException, ForbiddenException } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { verifyMetaSignature, canSkipSignature } from '../../common/utils/meta-signature';
 import type { Response } from 'express';
 import * as crypto from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -27,6 +27,7 @@ import { RoundRobinService, RoundRobinModule } from '../v9/round-robin.module';
 import { InstagramService, InstagramModule } from '../instagram/instagram.module';
 import { LeadScoringService, LeadScoringModule } from '../v9/lead-scoring.module';
 import { AutoReplyService, AutoReplyModule } from '../v9/auto-reply.module';
+import { swallow } from '../../common/utils/swallow';
 
 const GRAPH_API_VERSION = 'v23.0';
 
@@ -188,9 +189,27 @@ export class FacebookLeadsService {
 
     const newPageId = data.pageId?.trim() || cur.facebookPageId || null;
 
+    // v13.0: boshqa agentlik shu Page'ni allaqachon ulaganmi?
+    // Baza @unique bilan to'xtatadi, lekin bu yerda tushunarli
+    // xabar berish uchun oldindan tekshiramiz.
+    if (newPageId) {
+      const taken = await this.prisma.tenant.findFirst({
+        where: { facebookPageId: newPageId, NOT: { id: tenantId } },
+        select: { id: true },
+      });
+      if (taken) {
+        throw new BadRequestException(
+          `Bu Facebook Page ID (${newPageId}) boshqa hisobga allaqachon ulangan. ` +
+          `O'z Page'ingizni tanlang yoki platforma administratoriga murojaat qiling.`,
+        );
+      }
+    }
+
     await this.prisma.tenant.update({
       where: { id: tenantId },
       data: {
+        // v13.0: indekslangan alohida ustun (webhook shu bo'yicha topadi)
+        facebookPageId: newPageId,
         settings: {
           ...cur,
           facebookPageAccessToken: newEncToken,
@@ -278,19 +297,22 @@ export class FacebookLeadsService {
   private async findTenantByPageId(
     pageId: string,
   ): Promise<{ tenantId: string; accessToken: string } | null> {
+    // v13.0: ilgari BARCHA tenantlar o'qib chiqilib, JSON ichidan
+    // qidirilardi. Bu sekin edi va Page ID'ni o'zlashtirib olish
+    // imkonini berardi. Endi @unique, indekslangan ustun bo'yicha
+    // bitta so'rov.
     if (!pageId) return null;
-    const tenants = await this.prisma.tenant.findMany({
-      where: { status: 'ACTIVE' as any },
-      select: { id: true, settings: true },
+    const t = await this.prisma.tenant.findUnique({
+      where: { facebookPageId: String(pageId).trim() },
+      select: { id: true, status: true, settings: true },
     });
-    for (const t of tenants) {
-      const s: any = t.settings || {};
-      if (s.facebookPageId === pageId && s.facebookPageAccessToken) {
-        const accessToken = this.encryption.decrypt(s.facebookPageAccessToken);
-        if (accessToken) return { tenantId: t.id, accessToken };
-      }
-    }
-    return null;
+    if (!t || t.status !== ('ACTIVE' as any)) return null;
+
+    const st: any = t.settings || {};
+    if (!st.facebookPageAccessToken) return null;
+
+    const accessToken = this.encryption.decrypt(st.facebookPageAccessToken);
+    return accessToken ? { tenantId: t.id, accessToken } : null;
   }
 
   // ── WEBHOOK QABUL QILISH ───────────────────────────────────────────
@@ -302,27 +324,18 @@ export class FacebookLeadsService {
     // Instagram va Facebook Lead Ads odatda bitta Meta App ostida
     // bo'ladi, shuning uchun FACEBOOK_APP_SECRET sozlanmagan bo'lsa
     // INSTAGRAM_APP_SECRET'ga tushiladi (agar bitta App ishlatilsa).
+    // ── IMZO TEKSHIRUVI (v13.0) — FAIL-CLOSED ──
+    //
+    // Instagram moduli bilan bir xil muammo edi: imzo sarlavhasi
+    // yuborilmasa tekshiruv o'tkazib yuborilardi va istalgan odam
+    // soxta lead yarata olardi (agentga bildirishnoma, soxta mijoz).
     const appSecret = process.env.FACEBOOK_APP_SECRET || process.env.INSTAGRAM_APP_SECRET;
-    if (signature && appSecret && rawBody) {
-      try {
-        const crypto = await import('crypto');
-        const expected =
-          'sha256=' + crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex');
-        const sigBuf = Buffer.from(signature);
-        const expBuf = Buffer.from(expected);
-        const valid =
-          sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf);
-        if (!valid) {
-          this.logger.warn('Facebook webhook: invalid signature');
-          return { ok: false };
-        }
-      } catch (e: any) {
-        this.logger.warn('Facebook webhook signature check error: ' + e.message);
+    if (!canSkipSignature()) {
+      const sig = verifyMetaSignature(rawBody, signature, appSecret);
+      if (!sig.ok) {
+        this.logger.warn(`Facebook webhook RAD ETILDI: ${sig.reason}`);
+        throw new ForbiddenException();
       }
-    } else if (process.env.NODE_ENV === 'production' && !appSecret) {
-      this.logger.warn(
-        'Facebook webhook: FACEBOOK_APP_SECRET sozlanmagan — imzo tekshirilmayapti!',
-      );
     }
 
     const entries: any[] = body?.entry || [];
@@ -459,7 +472,7 @@ export class FacebookLeadsService {
             },
           },
         })
-        .catch(() => {});
+        .catch(swallow('mijoz tarixi'));
 
       // ── v12.3: QAYTGAN MIJOZ e'tibordan chetda qolmasin ──
       // Ilgari faqat tarixga yozilardi va agent bilmasdan qolardi —
@@ -470,7 +483,7 @@ export class FacebookLeadsService {
         await this.prisma.client.update({
           where: { id: existing.id },
           data: { pipelineStage: 'NEW_LEAD', pipelineStageAt: new Date() },
-        }).catch(() => {});
+        }).catch(swallow('yangilash'));
       }
 
       if (existing.assignedAgentId) {
@@ -482,7 +495,7 @@ export class FacebookLeadsService {
           body: `${existing.fullName} — Facebook forma${formName ? ': ' + formName : ''}`,
           link: `/clients/${existing.id}`,
           metadata: { clientId: existing.id, leadgenId, isReturning: true },
-        }).catch(() => {});
+        }).catch(swallow('bildirishnoma'));
 
         this.realtime.emitToUser(existing.assignedAgentId, 'lead:returning', {
           clientId: existing.id,
@@ -532,7 +545,7 @@ export class FacebookLeadsService {
           },
         },
       })
-      .catch(() => {});
+      .catch(swallow('mijoz tarixi'));
 
     // Lead Scoring va Auto-Reply — asosiy oqimni bloklamaydi (fire-and-forget)
     this.scoring
@@ -574,7 +587,7 @@ export class FacebookLeadsService {
               metadata: { autoAssigned: true, source: 'FACEBOOK' },
             },
           })
-          .catch(() => {});
+          .catch(swallow('mijoz tarixi'));
       }
     }
 
@@ -657,8 +670,24 @@ export class FacebookLeadsService {
     }
   }
 
-  /** 1-qadam: admin uchun Facebook Login dialog URL'ini tayyorlaydi. */
-  getOAuthStartUrl(tenantId: string, userId?: string) {
+  /**
+   * 1-qadam: admin uchun Facebook Login dialog URL'ini tayyorlaydi.
+   *
+   * v13.0 CSRF HIMOYASI:
+   *   Ilgari `state` faqat imzolangan edi (tenantId+userId+vaqt), lekin
+   *   BIR MARTALIK emas edi. Hujum shunday ishlardi:
+   *     1) Hujumchi o'z hisobida OAuth boshlaydi va o'z `state`ini oladi
+   *     2) O'sha havolani qurbonga yuboradi
+   *     3) Qurbon Facebook'da tasdiqlaydi
+   *     4) Qurbonning Page tokeni HUJUMCHI hisobiga saqlanadi
+   *     → hujumchi qurbonning leadlari va DM'larini ko'ra boshlaydi
+   *
+   *   Endi har bir urinish uchun tasodifiy `nonce` yaratiladi va
+   *   SERVERDA saqlanadi. Callback'da u tekshiriladi va DARHOL
+   *   o'chiriladi — ya'ni bitta havola faqat bir marta ishlaydi va
+   *   faqat uni boshlagan hisob uchun.
+   */
+  async getOAuthStartUrl(tenantId: string, userId?: string) {
     const appId = process.env.FACEBOOK_APP_ID;
     const redirectUri = process.env.FACEBOOK_OAUTH_REDIRECT_URI;
     if (!appId || !redirectUri) {
@@ -666,7 +695,30 @@ export class FacebookLeadsService {
         "Serverda FACEBOOK_APP_ID va FACEBOOK_OAUTH_REDIRECT_URI env sozlanmagan. Administratorga murojaat qiling.",
       );
     }
-    const state = this.signState({ tenantId, userId, ts: Date.now() });
+    // Bir martalik nonce — serverda saqlanadi, callback'da iste'mol qilinadi
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const tenantRow = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const curSettings: any = tenantRow?.settings || {};
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: {
+        settings: {
+          ...curSettings,
+          facebookOAuthNonce: {
+            value: nonce,
+            userId: userId || null,
+            expiresAt: Date.now() + OAUTH_STATE_TTL_MS,
+          },
+        },
+      },
+    });
+
+    const state = this.signState({ tenantId, userId, nonce, ts: Date.now() });
+    // nonce controller'ga qaytariladi — u cookie'ga yozadi va o'chiradi
+    const __nonce = nonce;
     const scope = [
       'pages_show_list',
       'pages_read_engagement',
@@ -693,7 +745,7 @@ export class FacebookLeadsService {
       `&state=${encodeURIComponent(state)}` +
       `&scope=${encodeURIComponent(scope)}` +
       `&response_type=code`;
-    return { url };
+    return { nonce: __nonce, url };
   }
 
   /**
@@ -706,6 +758,8 @@ export class FacebookLeadsService {
     code: string | undefined,
     state: string | undefined,
     oauthError?: string,
+    /** v13.0: oqimni boshlagan brauzerdagi cookie (CSRF himoyasi) */
+    cookieNonce?: string,
   ): Promise<string> {
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
     const redirectBase = `${frontendUrl}/settings?tab=facebook`;
@@ -721,6 +775,53 @@ export class FacebookLeadsService {
       return `${redirectBase}&fb=error`;
     }
     if (!code) return `${redirectBase}&fb=error`;
+
+    // ── v13.0 CSRF: nonce'ni tekshirib, DARHOL iste'mol qilamiz ──
+    //
+    // Imzo `state` soxtalashtirilmaganini isbotlaydi, lekin uni
+    // QAYTA ISHLATISHNI to'xtatmaydi. Nonce shu bo'shliqni yopadi:
+    // har bir havola faqat bir marta va faqat uni boshlagan hisob
+    // uchun ishlaydi.
+    {
+      const row = await this.prisma.tenant.findUnique({
+        where: { id: payload.tenantId },
+        select: { settings: true },
+      });
+      const st: any = row?.settings || {};
+      const saved = st.facebookOAuthNonce;
+
+      const nonceOk =
+        saved &&
+        typeof saved.value === 'string' &&
+        typeof (payload as any).nonce === 'string' &&
+        saved.value === (payload as any).nonce &&
+        Date.now() <= Number(saved.expiresAt || 0) &&
+        // Boshlagan foydalanuvchi bilan bir xil bo'lsin
+        (saved.userId ?? null) === ((payload as any).userId ?? null) &&
+        // BRAUZER bog'lanishi: oqimni boshlagan brauzerdagi cookie
+        // bilan mos kelishi shart. Bu hujumchi havolasini qurbonga
+        // yuborish yo'lini yopadi.
+        cookieNonce === saved.value;
+
+      // Ishlatilgan yoki yaroqsiz — har holda nonce'ni o'chiramiz,
+      // shunda takroriy urinishlar ham foyda bermaydi.
+      if (saved) {
+        const cleaned = { ...st };
+        delete cleaned.facebookOAuthNonce;
+        await this.prisma.tenant.update({
+          where: { id: payload.tenantId },
+          data: { settings: cleaned },
+        }).catch(swallow('nonce tozalash'));
+      }
+
+      if (!nonceOk) {
+        this.logger.warn(
+          `Facebook OAuth RAD ETILDI: nonce mos kelmadi yoki allaqachon ishlatilgan ` +
+          `(tenant=${payload.tenantId})`,
+        );
+        return `${redirectBase}&fb=error`;
+      }
+    }
 
     const appId = process.env.FACEBOOK_APP_ID;
     const appSecret = process.env.FACEBOOK_APP_SECRET;
@@ -1202,8 +1303,32 @@ export class FacebookLeadsController {
   @Get('oauth/start-url')
   @UseGuards(RolesGuard)
   @Roles('TENANT_ADMIN')
-  getOAuthStartUrl(@CurrentUser() u: any) {
-    return this.svc.getOAuthStartUrl(u.tenantId, u.sub);
+  async getOAuthStartUrl(@CurrentUser() u: any, @Res({ passthrough: true }) res: Response) {
+    const result: any = await this.svc.getOAuthStartUrl(u.tenantId, u.sub);
+
+    // ── v13.0 CSRF: nonce'ni BRAUZERGA ham bog'laymiz ──
+    //
+    // Faqat serverdagi nonce yetarli emas: hujumchi o'z havolasini
+    // qurbonga yuborsa, nonce baribir haqiqiy bo'ladi va qurbonning
+    // Page'i hujumchi hisobiga ulanib qolardi.
+    //
+    // Cookie shu bo'shliqni yopadi — u FAQAT oqimni boshlagan
+    // brauzerda bo'ladi. Qurbonning brauzerida bu cookie yo'q,
+    // shuning uchun callback rad etiladi.
+    //
+    // SameSite=None SHART: Facebook'dan qaytish cross-site hisoblanadi,
+    // Lax bo'lsa cookie yuborilmaydi va o'z oqimimiz ham buziladi.
+    if (result?.nonce) {
+      res.cookie('fb_oauth_nonce', result.nonce, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+        maxAge: 10 * 60 * 1000,
+        path: '/api/v1/facebook-leads',
+      });
+      delete result.nonce; // frontendga chiqmasin
+    }
+    return result;
   }
 
   // MUHIM: Facebook shu manzilga brauzer orqali (JWT headersiz) qaytadi,
@@ -1215,9 +1340,14 @@ export class FacebookLeadsController {
     @Query('code') code: string,
     @Query('state') state: string,
     @Query('error') error: string,
+    @Req() req: any,
     @Res() res: Response,
   ) {
-    const redirectTo = await this.svc.handleOAuthCallback(code, state, error);
+    // Oqimni boshlagan brauzerdagi cookie (v13.0 CSRF himoyasi)
+    const cookieNonce = req.cookies?.fb_oauth_nonce;
+    res.clearCookie('fb_oauth_nonce', { path: '/api/v1/facebook-leads' });
+
+    const redirectTo = await this.svc.handleOAuthCallback(code, state, error, cookieNonce);
     return res.redirect(redirectTo);
   }
 

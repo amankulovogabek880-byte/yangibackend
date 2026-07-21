@@ -334,6 +334,20 @@ model Tenant {
   currency  Currency         @default(USD)
   settings  Json             @default("{}")
 
+  // ── v13.0 XAVFSIZLIK: Meta Page ID'lari ALOHIDA ustunda ──
+  //
+  // Ilgari ular faqat `settings` JSON ichida edi va webhook kelganda
+  // BARCHA tenantlar o'qib chiqilib, birinchi mos kelgani tanlanardi.
+  // Ikki muammo bor edi:
+  //   1) Boshqa agentlik o'zining Page ID'siga BEGONA ID yozib qo'yib,
+  //      o'sha kompaniyaning kiruvchi xabarlarini o'ziga tortib olardi
+  //      (JSON ustunga unique qo'yib bo'lmaydi).
+  //   2) Har bir webhook'da butun tenants jadvali skanerlanardi.
+  //
+  // Alohida ustun + @unique bazaning o'zida dublikatni bloklaydi.
+  instagramPageId  String? @unique
+  facebookPageId   String? @unique
+
   // v8: PHONE PROVIDER (Click2Call uchun)
   phoneProvider     PhoneProvider @default(STUB)
   phoneConfig       Json          @default("{}")

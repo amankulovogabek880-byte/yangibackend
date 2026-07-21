@@ -1,9 +1,11 @@
 import { RoundRobinService, RoundRobinModule } from '../v9/round-robin.module';
+import { RolesGuard } from '../../common/guards/roles.guard';
+import { Roles } from '../../common/decorators';
+import { verifyMetaSignature, canSkipSignature } from '../../common/utils/meta-signature';
 import {
   Module, Injectable, Controller,
   Get, Post, Body, Query, Req,
-  UseGuards, Logger, BadRequestException,
-} from '@nestjs/common';
+  UseGuards, Logger, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -12,6 +14,7 @@ import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { NotificationsService } from '../notifications/notifications.service';
 import { EncryptionService } from '../../common/encryption/encryption.service';
 import { normalizePhone, phoneVariants } from '../../common/utils/helpers';
+import { swallow } from '../../common/utils/swallow';
 
 // Meta Graph API versiyasi — bitta joyda turadi.
 // Eskirsa (masalan v23 -> v25) faqat shu qatorni o'zgartiring.
@@ -70,6 +73,32 @@ export class InstagramService {
     private encryption: EncryptionService,
   ) {}
 
+  /**
+   * ICHKI foydalanish uchun — ochiq token bilan.
+   *
+   * FAQAT modul ichida chaqiriladi (xabar yuborish, profil olish va h.k.).
+   * Hech qachon controller orqali tashqariga chiqarilmasin.
+   */
+  private async getInternalConfig(tenantId: string) {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const s: any = tenant?.settings || {};
+    return {
+      accessToken: this.decryptToken(s.instagramAccessToken),
+      pageId: s.instagramPageId || null,
+      verifyToken: s.instagramVerifyToken || 'omoncrm_verify',
+      botName: s.instagramBotName || 'Travel Bot',
+      greetingMessage: s.instagramGreeting || 'Salom! Sizga yordam berishdan mamnunman.',
+      farewell: s.instagramFarewell || 'Rahmat! Tez orada siz bilan boglanamiz.',
+      assignToAgentId: s.instagramAssignAgentId || null,
+      isEnabled: !!s.instagramAccessToken,
+      botSteps: s.instagramBotSteps || [],
+    };
+  }
+
+  /** TASHQI (controller) uchun — token MASKALANGAN */
   async getConfig(tenantId: string) {
     const tenant = await this.prisma.tenant.findUnique({
       where: { id: tenantId },
@@ -82,8 +111,20 @@ export class InstagramService {
       { id: 'phone', question: 'Telefon raqamingizni yozing (+998...)', field: 'phone' },
       { id: 'date', question: 'Qachon ketmoqchisiz?', field: 'date' },
     ];
+    // XAVFSIZLIK (v13.0): ilgari bu yerda `accessToken` OCHIQ MATNDA
+    // qaytarilardi. Controller'da esa @Roles yo'q edi — ya'ni oddiy
+    // AGENT `GET /instagram/config` chaqirib, butun kompaniyaning Meta
+    // Page Access Token'ini olardi. U bilan kompaniya nomidan DM
+    // yuborish va barcha yozishmalarni o'qish mumkin edi.
+    //
+    // Endi tashqariga faqat MASKALANGAN qiymat chiqadi. Modul ichida
+    // ochiq token kerak bo'lsa — getInternalConfig() ishlatiladi.
+    // (Bu naqsh facebook-leads modulida allaqachon to'g'ri qilingan edi.)
+    const plain = this.decryptToken(s.instagramAccessToken);
+
     return {
-      accessToken: this.decryptToken(s.instagramAccessToken),
+      hasAccessToken: !!plain,
+      maskedAccessToken: plain ? this.encryption.mask(plain, 6, 4) : null,
       pageId: s.instagramPageId || null,
       verifyToken: s.instagramVerifyToken || 'omoncrm_verify',
       botName: s.instagramBotName || 'Travel Bot',
@@ -126,9 +167,31 @@ export class InstagramService {
       select: { settings: true },
     });
     const cur: any = tenant?.settings || {};
+
+    // ── v13.0: Page ID to'qnashuvini OLDINDAN tekshiramiz ──
+    //
+    // Baza darajasida @unique cheklov bor, lekin u tushunarsiz
+    // "duplicate key" xatosi beradi. Bu yerda oldindan tekshirib,
+    // adminга aniq xabar ko'rsatamiz.
+    const newPageId = data.pageId ? String(data.pageId).trim() : null;
+    if (newPageId) {
+      const taken = await this.prisma.tenant.findFirst({
+        where: { instagramPageId: newPageId, NOT: { id: tenantId } },
+        select: { id: true },
+      });
+      if (taken) {
+        throw new BadRequestException(
+          `Bu Instagram Page ID (${newPageId}) boshqa hisobga allaqachon ulangan. ` +
+          `O'z Page ID'ingizni tekshiring yoki platforma administratoriga murojaat qiling.`,
+        );
+      }
+    }
+
     await this.prisma.tenant.update({
       where: { id: tenantId },
       data: {
+        // v13.0: alohida indekslangan ustun (webhook shu bo'yicha topadi)
+        instagramPageId: newPageId ?? cur.instagramPageId ?? null,
         settings: {
           ...cur,
           // Yangi token kelsa SHIFRLAB saqlaymiz; kelmasa eskisi qoladi
@@ -191,40 +254,54 @@ export class InstagramService {
   }
 
   /** entry.id (Page/Instagram Business Account ID) bo'yicha tenantni topadi. */
+  /**
+   * Page ID bo'yicha tenantni topadi.
+   *
+   * v13.0: ilgari BARCHA tenantlar o'qib chiqilib, JSON ichidan
+   * qidirilardi — bu ham sekin edi, ham Page ID'ni o'zlashtirib olish
+   * imkonini berardi. Endi indekslangan, @unique ustun bo'yicha
+   * bitta so'rov.
+   */
   private async findTenantByPageId(pageId: string): Promise<string | null> {
     if (!pageId) return null;
-    const tenants = await this.prisma.tenant.findMany({ select: { id: true, settings: true } });
-    for (const t of tenants) {
-      const s: any = t.settings || {};
-      if (s.instagramPageId === pageId) return t.id;
-    }
-    return null;
+    const t = await this.prisma.tenant.findUnique({
+      where: { instagramPageId: String(pageId).trim() },
+      select: { id: true },
+    });
+    return t?.id ?? null;
   }
 
   async processWebhook(body: any, signature?: string, rawBody?: Buffer) {
     if (body?.object !== 'instagram' && body?.object !== 'page') return { ok: true };
     // Meta signature verification (X-Hub-Signature-256 header).
     // Meta imzoni App Secret bilan hisoblaydi (Page Access Token emas!).
-    const appSecret = process.env.INSTAGRAM_APP_SECRET;
-    if (signature && appSecret && rawBody) {
-      try {
-        const crypto = await import('crypto');
-        const expected = 'sha256=' + crypto.createHmac('sha256', appSecret)
-          .update(rawBody).digest('hex');
-        const sigBuf = Buffer.from(signature);
-        const expBuf = Buffer.from(expected);
-        const valid = sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf);
-        if (!valid) {
-          this.logger.warn('Instagram webhook: invalid signature');
-          return { ok: false };
-        }
-      } catch (e: any) {
-        this.logger.warn('Instagram webhook signature check error: ' + e.message);
+    // ── IMZO TEKSHIRUVI (v13.0) — FAIL-CLOSED ──
+    //
+    // ILGARI: `if (signature && appSecret && rawBody)` shartida edi.
+    // Ya'ni imzo sarlavhasi YUBORILMASA, tekshiruv butunlay o'tkazib
+    // yuborilardi va istalgan odam soxta xabar/lead yarata olardi.
+    //
+    // ENDI: imzo yo'q yoki noto'g'ri bo'lsa — 403. Chekinish yo'li yo'q
+    // (development'dagi META_WEBHOOK_SKIP_SIGNATURE production'da
+    //  ishlamaydi — canSkipSignature() ichida qattiq shart bor).
+    if (!canSkipSignature()) {
+      const sig = verifyMetaSignature(rawBody, signature, process.env.INSTAGRAM_APP_SECRET);
+      if (!sig.ok) {
+        this.logger.warn(`Instagram webhook RAD ETILDI: ${sig.reason}`);
+        throw new ForbiddenException();
       }
-    } else if (process.env.NODE_ENV === 'production' && !appSecret) {
-      this.logger.warn('Instagram webhook: INSTAGRAM_APP_SECRET env sozlanmagan — imzo tekshirilmayapti!');
     }
-    this.logger.log('Instagram webhook received: ' + JSON.stringify(body).slice(0, 300));
+
+    // PII himoyasi (v13.0): ilgari butun body log'ga yozilardi —
+    // mijoz ismlari va xabar matnlari log fayllarida qolardi.
+    // Endi production'da faqat metama'lumot yoziladi.
+    if (process.env.NODE_ENV === 'production') {
+      this.logger.log(
+        `Instagram webhook: object=${body?.object} entries=${(body?.entry || []).length}`,
+      );
+    } else {
+      this.logger.log('Instagram webhook received: ' + JSON.stringify(body).slice(0, 300));
+    }
     const entries: any[] = body?.entry || [];
     for (const entry of entries) {
       // entry.id — shu xabarni qabul qilgan Page/Instagram Business Account ID.
@@ -253,7 +330,7 @@ export class InstagramService {
     // Echo (o'zimiz yuborgan xabar qaytib kelishi) — e'tiborsiz qoldiramiz
     if (event.message?.is_echo) return;
 
-    const config = await this.getConfig(tenantId);
+    const config = await this.getInternalConfig(tenantId);
     if (!config.isEnabled) return;
 
     // ── 1) Suhbatni topamiz/yaratamiz va xabarni Chat'ga yozamiz ──
@@ -281,7 +358,7 @@ export class InstagramService {
           body: conv.firstName || 'Instagram foydalanuvchi',
           link: `/inbox?conv=${conv.id}`,
           metadata: { conversationId: conv.id },
-        }).catch(() => {});
+        }).catch(swallow('bildirishnoma'));
       }
       return;
     }
@@ -337,7 +414,7 @@ export class InstagramService {
             assignedAgentId: conv.assignedAgentId || (lead as any).assignedAgentId || null,
             firstName: session.name || conv.firstName,
           },
-        }).catch(() => {});
+        }).catch(swallow('yozuvni yangilash'));
       }
       botSessionsCache.delete(key);
       await this.deleteSession(tenantId, senderId);
@@ -441,7 +518,7 @@ export class InstagramService {
         body: profile?.firstName || 'Instagram foydalanuvchi',
         link: `/inbox?conv=${conv.id}`,
         metadata: { conversationId: conv.id, channel: 'INSTAGRAM' },
-      }).catch(() => {});
+      }).catch(swallow('bildirishnoma'));
     }
 
     return { conv, isNew: true };
@@ -512,7 +589,7 @@ export class InstagramService {
     await this.prisma.conversation.update({
       where: { id: conv.id },
       data: { tags: [...tags, HUMAN_TAG] },
-    }).catch(() => {});
+    }).catch(swallow('yangilash'));
   }
 
   private isHumanMode(conv: any): boolean {
@@ -538,7 +615,7 @@ export class InstagramService {
     });
     if (!conv) throw new BadRequestException('Instagram suhbati topilmadi');
 
-    const config = await this.getConfig(tenantId);
+    const config = await this.getInternalConfig(tenantId);
     if (!config.accessToken) {
       throw new BadRequestException('Instagram ulanmagan. Sozlamalar → Instagram');
     }
@@ -643,7 +720,7 @@ export class InstagramService {
         description: 'Yonalish: ' + s.destination + ' | Tel: ' + s.phone + ' | Sana: ' + s.date,
         metadata: { source: 'instagram_bot', instagramUserId: s.instagramUserId },
       } as any,
-    }).catch(() => {});
+    }).catch(swallow('mijoz tarixi'));
 
     if (agentId) {
       this.realtime.emitToUser(agentId, 'lead:new', {
@@ -772,8 +849,11 @@ export class InstagramController {
 
   @ApiOperation({ summary: 'Instagram bot sozlamalarini olish' })
   @ApiBearerAuth('JWT')
+  // XAVFSIZLIK (v13.0): ilgari faqat JwtAuthGuard bor edi — oddiy AGENT
+  // ham integratsiya sozlamalarini o'qiy/yoza olardi. Endi faqat admin.
   @Get('config')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('TENANT_ADMIN')
   getConfig(@CurrentUser() u: any) {
     return this.svc.getConfig(u.tenantId);
   }
@@ -781,7 +861,8 @@ export class InstagramController {
   @ApiOperation({ summary: 'Instagram bot sozlamalarini saqlash' })
   @ApiBearerAuth('JWT')
   @Post('config')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('TENANT_ADMIN')
   saveConfig(@CurrentUser() u: any, @Body() body: any) {
     return this.svc.saveConfig(u.tenantId, body);
   }
