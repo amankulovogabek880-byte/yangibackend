@@ -38,6 +38,8 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { ClientsService } from '../clients/clients.service';
 import { CacheService } from '../../common/cache/cache.service';
+import { TourAdapterRegistry } from '../tour-search/adapters/adapter-registry';
+import { TourSearchModule } from '../tour-search/tour-search.module';
 
 /**
  * ═══════════════════════════════════════════════════════════════
@@ -106,6 +108,10 @@ export class MarketplaceService {
     private realtime: RealtimeGateway,
     private clients: ClientsService,
     private cache: CacheService,
+    // v13: Ratehawk kabi maxsus-adapterli operatorlar generic REST
+    // oqimini aylanib o'tadi — pastga qarang: verifyCredentials/
+    // connectCatalogOperator/syncOperator/autoSyncOperators.
+    private adapters: TourAdapterRegistry,
   ) {}
 
   /**
@@ -476,6 +482,20 @@ export class MarketplaceService {
     login: string,
     password: string,
   ): Promise<{ ok: boolean; token?: string | null; error?: string }> {
+    // ── v13: kod-adapterli operator (masalan Ratehawk) bo'lsa,
+    // generic REST oqimini butunlay aylanib o'tamiz ──
+    if (op.hasAdapter) {
+      const adapter = this.adapters.get(op.slug);
+      if (!adapter) {
+        return {
+          ok: false,
+          error: `"${op.name}" adapteri topilmadi — TourAdapterRegistry'ga ro'yxatdan o'tkazilmagan`,
+        };
+      }
+      const res = await adapter.verifyCredentials({ login, password });
+      return { ok: res.ok, token: null, error: res.error };
+    }
+
     if (!op.apiBaseUrl) {
       return {
         ok: false,
@@ -621,7 +641,22 @@ export class MarketplaceService {
       metadata: { slug: op.slug, name: op.name, action: 'connect' },
     });
 
-    // ── Turlarni darhol yuklaymiz ──
+    // ── v13: adapter-backed (jonli qidiruv) operatorlar uchun statik
+    // import YO'Q — narx/joy doim jonli so'raladi. "Sinxronizatsiya"
+    // o'rniga to'g'ridan-to'g'ri /tour-search/search ishlatiladi. ──
+    if (op.hasAdapter) {
+      return {
+        success: true,
+        connected: true,
+        message: `${op.name}: ulandingiz. Bu operator jonli qidiruv orqali ishlaydi — ` +
+          `"Tur qidirish" bo'limida sana va yo'nalish kiritib qidiring.`,
+        operatorId: operator.id,
+        toursLoaded: 0,
+        liveSearch: true,
+      };
+    }
+
+    // ── Turlarni darhol yuklaymiz (faqat generic REST / statik katalog operatorlar) ──
     let sync: any = null;
     try {
       sync = await this.syncOperator(tenantId, userId, operator.id);
@@ -779,6 +814,14 @@ export class MarketplaceService {
     const op = await this.prisma.tourOperator.findFirst({ where: { id: operatorId, tenantId } });
     if (!op) throw new NotFoundException('Operator topilmadi');
 
+    const cat0 = getCatalogOperator(op.slug);
+    if (cat0?.hasAdapter) {
+      throw new BadRequestException(
+        `${op.name}: bu operator jonli qidiruv orqali ishlaydi, statik sinxronizatsiya yo'q. ` +
+        `"Tur qidirish" bo'limidan foydalaning.`,
+      );
+    }
+
     if (op.integrationType !== 'API') {
       throw new BadRequestException(
         `Bu operator "${op.integrationType}" rejimida. Avtomatik sinxronizatsiya faqat API rejimida ishlaydi. ` +
@@ -886,8 +929,17 @@ export class MarketplaceService {
    */
   @Cron('0 3 * * *') // har kuni 03:00
   async autoSyncOperators() {
+    // v13: adapter-backed (Ratehawk kabi jonli qidiruv) slug'larni
+    // bu yerda o'tkazib yuboramiz — ularda statik "barcha turlar"
+    // tushunchasi yo'q, shuning uchun kunlik sync ma'nosiz va xato beradi.
+    const liveSearchSlugs = this.adapters.registeredSlugs;
+
     const operators = await this.prisma.tourOperator.findMany({
-      where: { integrationType: 'API', status: 'ACTIVE' },
+      where: {
+        integrationType: 'API',
+        status: 'ACTIVE',
+        ...(liveSearchSlugs.length ? { slug: { notIn: liveSearchSlugs } } : {}),
+      },
       select: { id: true, tenantId: true, name: true },
     }).catch(() => [] as any[]);
 
@@ -1414,6 +1466,7 @@ export class MarketplaceToursController {
 // ═══════════════════════════════════════════════════════════════
 
 @Module({
+  imports: [TourSearchModule], // TourAdapterRegistry shu yerdan keladi (v13)
   controllers: [
     MarketplaceOperatorsController,
     MarketplaceToursController,

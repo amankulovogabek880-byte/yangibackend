@@ -2,41 +2,28 @@ import { Logger } from '@nestjs/common';
 
 /**
  * ═══════════════════════════════════════════════════════════════
- * TUR OPERATORLAR KATALOGI — v12.4
+ * TUR OPERATORLAR KATALOGI — v13 (haqiqiy operatorlar bilan)
  * ═══════════════════════════════════════════════════════════════
  *
- * MODEL:
- *   Platforma egasi (siz) tur operatorlar bilan SHARTNOMA tuzadi va
- *   ularning API manzillarini oladi. Bu manzillar SERVERDA (env'da)
- *   turadi — agentliklar ularni ko'rmaydi va o'zgartira olmaydi.
+ * IKKI XIL OPERATOR TURI BOR:
  *
- *   Har bir agentlik (tenant) esa o'zining LOGIN/PAROLINI kiritadi —
- *   ya'ni o'sha operatordagi shaxsiy kabinetiga ulanadi.
+ * 1) hasAdapter: true — kod darajasida maxsus adapter yozilgan
+ *    (masalan Ratehawk). Bular src/modules/tour-search/adapters/
+ *    papkasida joylashadi va JONLI qidiruvni qo'llab-quvvatlaydi.
+ *    `configured` bu operatorlar uchun DOIM true — chunki API
+ *    manzili adapter kodining ichida (bu operatorlar uchun ochiq/
+ *    hujjatlashtirilgan bo'lgani sababli sir emas).
  *
- *   Natija: siz integratsiyani BIR MARTA yozasiz, 100 ta agentlik
- *   undan foydalanadi, lekin har biri o'z akkaunti bilan.
+ * 2) hasAdapter: false — hali adapter yozilmagan. Bular UI'da
+ *    ko'rinadi (nom/logo/sayt bilan), lekin ulanish tugmasi bosilsa
+ *    tushunarli xabar chiqadi: "bu operator hali ulanmagan, tez orada".
+ *    Adapter yozilgach shu yerda hasAdapter: true qilinadi — boshqa
+ *    hech narsa o'zgarmaydi.
  *
- * SOZLASH (.env):
- *   MARKETPLACE_OPERATORS_JSON='[{...},{...}]'
- *
- *   Har bir yozuv:
- *   {
- *     "slug":       "asia-tour",              // takrorlanmas kalit
- *     "name":       "Asia Tour",              // agent ko'radigan nom
- *     "logoUrl":    "https://.../logo.png",   // kartochkadagi logo
- *     "website":    "https://asiatour.uz",
- *     "apiBaseUrl": "https://api.asiatour.uz",
- *     "authType":   "login",                  // login | basic | apikey
- *     "loginPath":  "/auth/login",            // authType=login uchun
- *     "toursPath":  "/tours",                 // turlar ro'yxati
- *     "loginLabel": "Login",                  // forma yorlig'i (ixtiyoriy)
- *     "passwordLabel": "Parol",
- *     "helpText":   "Kabinetdagi login va parolingizni kiriting"
- *   }
- *
- * MUHIM: env sozlanmagan bo'lsa quyidagi BO'SH SLOTLAR ko'rinadi.
- * Ular namuna — shartnoma tuzgach haqiqiy ma'lumot bilan almashtiring.
- * Sozlanmagan operatorga ulanmoqchi bo'lsangiz tushunarli xato chiqadi.
+ * ESKI (env orqali) GENERIC REST OPERATORLAR ham ishlashda davom
+ * etadi — MARKETPLACE_OPERATORS_JSON orqali qo'shilgan har qanday
+ * operator quyidagi ro'yxatga QO'SHILADI (ustiga yozilmaydi), agar
+ * shu slug pastda band qilinmagan bo'lsa.
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -49,7 +36,6 @@ export interface CatalogOperator {
   website?: string | null;
   description?: string | null;
 
-  /** API manzili — env'da. Bo'sh bo'lsa operator "tayyor emas" hisoblanadi */
   apiBaseUrl?: string | null;
 
   authType: OperatorAuthType;
@@ -60,78 +46,229 @@ export interface CatalogOperator {
   passwordLabel?: string;
   helpText?: string;
 
-  /** env'da to'liq sozlanganmi (API manzili bormi) */
+  /** kod darajasidagi maxsus adapter bormi (tour-search/adapters) */
+  hasAdapter?: boolean;
+
+  /** env'da yoki adapter orqali to'liq sozlanganmi */
   configured: boolean;
 }
 
 const logger = new Logger('OperatorCatalog');
 
 /**
- * Standart 10 ta slot.
+ * HAQIQIY OPERATORLAR — foydalanuvchi bergan 19 ta sayt.
  *
- * Bular NAMUNA — haqiqiy operator emas. Shartnoma tuzganingizda
- * env orqali almashtiring. Nomlari ataylab neytral qoldirilgan,
- * chunki o'ylab topilgan brend nomi chalg'itadi.
+ * DIQQAT: bu yerda faqat OMMAVIY ma'lumot bor (nom, sayt manzili).
+ * Login/parol HECH QACHON bu faylga yozilmaydi — ular har bir
+ * tenant tomonidan "Ulanish" formasida kiritiladi va shifrlanib
+ * DB'ga saqlanadi (marketplace.module.ts → connectCatalogOperator).
  */
-const PLACEHOLDER_SLOTS: CatalogOperator[] = Array.from({ length: 10 }, (_, i) => ({
-  slug: `operator-${i + 1}`,
-  name: `Operator ${i + 1} (sozlanmagan)`,
-  logoUrl: null,
-  website: null,
-  description: "Shartnoma tuzilgach .env orqali sozlanadi",
-  apiBaseUrl: null,
-  authType: 'login' as OperatorAuthType,
+const KNOWN_OPERATORS: CatalogOperator[] = [
+  {
+    slug: 'ratehawk',
+    name: 'Ratehawk',
+    website: 'https://www.ratehawk.com',
+    description: 'Mehmonxonalar B2B API (Emerging Travel Group) — 2.5mln+ mehmonxona',
+    apiBaseUrl: 'https://api.worldota.net/api/b2b/v3',
+    authType: 'apikey',
+    loginLabel: 'KEY_ID',
+    passwordLabel: 'API_KEY',
+    helpText:
+      'Ratehawk shartnoma kabinetingizdagi "API" bo\'limidan (faqat Master account) ' +
+      'KEY_ID va API_KEY qiymatlarini kiriting.',
+    hasAdapter: true,
+    configured: true,
+  },
+  {
+    slug: 'asialuxe',
+    name: 'Asialuxe (DMC)',
+    website: 'https://b2b.asialuxe.uz/tour/dmc',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'prestige',
+    name: 'Prestige',
+    website: 'https://online.uz-prestige.com/search_tour',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'kompas',
+    name: 'Kompas Tour',
+    website: 'https://online.kompastour.uz/search_tour',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'tui-fstravel',
+    name: 'TUI (Fun&Sun)',
+    website: 'https://b2b.fstravel.asia/',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'kazunion',
+    name: 'KazUnion',
+    website: 'https://online.kazunion.com/search_tour',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'selfie',
+    name: 'Selfie Travel',
+    website: 'https://b2b.selfietravel.kz/search_tour',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'pegas',
+    name: 'Pegas Touristik',
+    website: 'https://uz.pegast.asia/ru/agency',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'anex',
+    name: 'Anex Tour',
+    website: 'https://agent.anextour.uz/',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'easybooking',
+    name: 'EasyBooking',
+    website: 'https://tours.easybooking.uz/search_tour',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'crystalbay',
+    name: 'Crystalbay',
+    website: 'https://booking-uz.crystalbay.com/search_tour',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'centrum-holidays',
+    name: 'Centrum Holidays',
+    website: 'https://online.centrum-holidays.com/search_tour',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'aqua-travel',
+    name: 'Aqua Travel Plus',
+    website: 'https://online.aquatravelplus.com/search_hotel',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'flykhiya',
+    name: 'FlyKhiya',
+    website: 'https://b2b.flykhiya.travel/',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'smart-holiday',
+    name: 'Smart Holiday Group',
+    website: 'http://online.smartholidaygroup.com/b2b/',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'unit-travel',
+    name: 'Unit Travel',
+    website: 'https://b2b.unittravel.uz',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'centbed',
+    name: 'Centbed',
+    website: 'https://b2b.centbed.com',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'malva',
+    name: 'Malva Tour Operator',
+    website: 'https://malvatouroperator.uz/search_tour',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+  {
+    slug: 'jahon',
+    name: 'Mir Jahon',
+    website: 'https://online.mir-jahon.uz/open/excursion-tours/index',
+    authType: 'login',
+    hasAdapter: false,
+    configured: false,
+  },
+].map((o) => ({
   loginPath: '/auth/login',
   toursPath: '/tours',
-  loginLabel: 'Login',
+  loginLabel: o.authType === 'apikey' ? 'API kalit' : 'Login',
   passwordLabel: 'Parol',
-  helpText: "Bu operator hali sozlanmagan. Platforma administratoriga murojaat qiling.",
-  configured: false,
-}));
+  helpText:
+    (o as any).helpText ||
+    ((o as any).hasAdapter
+      ? ''
+      : "Bu operator hali ulanmagan — integratsiya navbatda. Admin bilan bog'laning."),
+  ...o,
+})) as CatalogOperator[];
 
 let cached: CatalogOperator[] | null = null;
 
-/** env qiymatini xavfsiz o'qiydi va tekshiradi */
-function parseFromEnv(): CatalogOperator[] | null {
+/** env orqali qo'shimcha (yoki eski) generic REST operatorlarni o'qiydi */
+function parseFromEnv(): CatalogOperator[] {
   const raw = process.env.MARKETPLACE_OPERATORS_JSON;
-  if (!raw || !raw.trim()) return null;
+  if (!raw || !raw.trim()) return [];
 
   let arr: any;
   try {
     arr = JSON.parse(raw);
   } catch (e: any) {
-    logger.error(
-      `MARKETPLACE_OPERATORS_JSON noto'g'ri JSON: ${e.message}. ` +
-      `Standart bo'sh slotlar ishlatiladi.`,
-    );
-    return null;
+    logger.error(`MARKETPLACE_OPERATORS_JSON noto'g'ri JSON: ${e.message}`);
+    return [];
   }
-
   if (!Array.isArray(arr)) {
     logger.error("MARKETPLACE_OPERATORS_JSON massiv bo'lishi kerak");
-    return null;
+    return [];
   }
 
-  const seen = new Set<string>();
+  const known = new Set(KNOWN_OPERATORS.map((o) => o.slug));
   const out: CatalogOperator[] = [];
 
   for (const item of arr) {
     const slug = String(item?.slug || '').trim().toLowerCase();
     const name = String(item?.name || '').trim();
-
-    if (!slug || !name) {
-      logger.warn(`Katalog yozuvi o'tkazildi — slug yoki name yo'q`);
+    if (!slug || !name) continue;
+    if (known.has(slug)) {
+      logger.warn(`env'dagi "${slug}" allaqachon bilinadigan operator — o'tkazildi`);
       continue;
     }
-    if (seen.has(slug)) {
-      logger.warn(`Takrorlangan slug o'tkazildi: ${slug}`);
-      continue;
-    }
-    seen.add(slug);
 
     const authType: OperatorAuthType =
       ['login', 'basic', 'apikey'].includes(item?.authType) ? item.authType : 'login';
-
     const apiBaseUrl = String(item?.apiBaseUrl || '').trim().replace(/\/+$/, '') || null;
 
     out.push({
@@ -147,33 +284,25 @@ function parseFromEnv(): CatalogOperator[] | null {
       loginLabel: item?.loginLabel || (authType === 'apikey' ? 'API kalit' : 'Login'),
       passwordLabel: item?.passwordLabel || 'Parol',
       helpText: item?.helpText || '',
+      hasAdapter: false,
       configured: Boolean(apiBaseUrl),
     });
   }
 
-  if (out.length === 0) {
-    logger.warn('MARKETPLACE_OPERATORS_JSON bo\'sh — standart slotlar ishlatiladi');
-    return null;
-  }
-
-  logger.log(`Katalog yuklandi: ${out.length} ta operator`);
   return out;
 }
 
-/** Butun katalogni qaytaradi (birinchi chaqiruvda o'qiladi va keshlanadi) */
 export function getCatalog(): CatalogOperator[] {
   if (cached) return cached;
-  cached = parseFromEnv() || PLACEHOLDER_SLOTS;
+  cached = [...KNOWN_OPERATORS, ...parseFromEnv()];
   return cached;
 }
 
-/** Bitta operatorni slug bo'yicha topadi */
 export function getCatalogOperator(slug: string): CatalogOperator | null {
   const s = String(slug || '').trim().toLowerCase();
   return getCatalog().find((o) => o.slug === s) || null;
 }
 
-/** Testlar va env qayta yuklanganda keshni tozalaydi */
 export function resetCatalogCache(): void {
   cached = null;
 }
