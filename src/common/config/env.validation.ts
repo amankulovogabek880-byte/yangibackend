@@ -80,6 +80,32 @@ export function validateEnv(): void {
     );
   }
 
+  // ─── v13.1: Meta webhook sirlari ───────────────────────────────
+  //
+  // NEGA MUHIM: webhook imzosi endi FAIL-CLOSED ishlaydi (xavfsizlik
+  // tuzatishi). Ya'ni APP_SECRET sozlanmagan bo'lsa, HAR BIR webhook
+  // 403 bilan rad etiladi va integratsiya JIMGINA ishlamaydi.
+  //
+  // Bu ayniqsa Meta App Review paytida xavfli: reviewer sinab ko'radi,
+  // ishlamaydi, ariza rad etiladi — sabab esa ko'rinmaydi.
+  //
+  // Shuning uchun ilova ishga tushganda ANIQ ogohlantiramiz.
+  const igToken = process.env.INSTAGRAM_APP_SECRET;
+  const fbToken = process.env.FACEBOOK_APP_SECRET;
+
+  if (!igToken) {
+    warnings.push(
+      "INSTAGRAM_APP_SECRET sozlanmagan — Instagram webhook'lari RAD ETILADI " +
+      "(403). DM'lar CRM'ga tushmaydi.",
+    );
+  }
+  if (!fbToken && !igToken) {
+    warnings.push(
+      "FACEBOOK_APP_SECRET sozlanmagan — Facebook lead webhook'lari RAD ETILADI " +
+      '(403). Leadlar CRM\'ga tushmaydi.',
+    );
+  }
+
   for (const w of warnings) logger.warn(`⚠️  ${w}`);
 
   if (missing.length === 0) {
