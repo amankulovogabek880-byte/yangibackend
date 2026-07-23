@@ -584,6 +584,14 @@ model Client {
   pipelineStageAt  DateTime      @default(now())
   lostReason       LostReason?
 
+  // ── Speed-to-lead o'lchash (v14) ──
+  // Facebook/Instagram leadlarida birinchi javob tezligi konversiyaning
+  // asosiy omili. Bu maydonlarsiz "qancha vaqtda javob berdik" degan
+  // savolga umuman javob bera olmaymiz.
+  assignedAt       DateTime?   // agentga tayinlangan payt
+  firstResponseAt  DateTime?   // agent birinchi marta aloqaga chiqqan payt
+  slaBreachedAt    DateTime?   // SLA buzilgani qayd etilgan payt (takror eskalatsiya bo'lmasin)
+
   tags             String[]     @default([])
   notes            String?
   internalNotes    String?
@@ -634,6 +642,8 @@ model Client {
   @@index([telegramId])
   // Perf: dashboard/lead-analytics "yangi klientlar (createdAt oralig'i)" hisoblari uchun
   @@index([tenantId, createdAt])
+  @@index([tenantId, assignedAt])
+  @@index([tenantId, firstResponseAt])
   @@map("clients")
 }
 
@@ -1893,46 +1903,6 @@ model MarketplaceTour {
   @@index([operatorId])
   @@map("marketplace_tours")
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  BU FAYLNI KO'CHIRMANG — ICHIDAGINI `prisma/schema.prisma` GA QO'SHING
-// ═══════════════════════════════════════════════════════════════════════════
-//
-//  3 ta o'zgarish bor. Har birining qayerga qo'yilishi pastda yozilgan.
-//
-// ═══════════════════════════════════════════════════════════════════════════
-
-
-// ───────────────────────────────────────────────────────────────────────────
-// 1-QADAM.  `model Client { ... }` ICHIGA qo'shing.
-//
-//           Aniq joy: `pipelineStageAt  DateTime  @default(now())` qatoridan
-//           keyin (schema.prisma ~584-qator).
-// ───────────────────────────────────────────────────────────────────────────
-
-  // ── Speed-to-lead o'lchash (v14) ──
-  // Facebook/Instagram leadlarida birinchi javob tezligi konversiyaning
-  // asosiy omili. Bu maydonlarsiz "qancha vaqtda javob berdik" degan
-  // savolga umuman javob bera olmaymiz.
-  assignedAt       DateTime?   // agentga tayinlangan payt
-  firstResponseAt  DateTime?   // agent birinchi marta aloqaga chiqqan payt
-  slaBreachedAt    DateTime?   // SLA buzilgani qayd etilgan payt (takror eskalatsiya bo'lmasin)
-
-
-// ───────────────────────────────────────────────────────────────────────────
-// 2-QADAM.  `model Client { ... }` ning OXIRIDAGI @@index ro'yxatiga qo'shing.
-//
-//           Aniq joy: `@@index([tenantId, createdAt])` qatoridan keyin,
-//           `@@map("clients")` dan OLDIN.
-// ───────────────────────────────────────────────────────────────────────────
-
-  @@index([tenantId, assignedAt])
-  @@index([tenantId, firstResponseAt])
-
-
-// ───────────────────────────────────────────────────────────────────────────
-// 3-QADAM.  Butun modelni schema.prisma OXIRIGA qo'shing (fayl eng oxiriga).
-// ───────────────────────────────────────────────────────────────────────────
 
 // ═══════════════════════════════════════════════════════════════
 // FACEBOOK LEAD HODISALARI — YO'QOLMAYDIGAN NAVBAT (v14)
