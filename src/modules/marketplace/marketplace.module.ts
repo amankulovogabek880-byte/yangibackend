@@ -20,6 +20,7 @@ import {
   getCatalogOperator,
   CatalogOperator,
 } from './operator-catalog';
+import { CronLockService } from '../../common/utils/cron-lock.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EncryptionService } from '../../common/encryption/encryption.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -28,7 +29,6 @@ import { CurrentUser, Roles } from '../../common/decorators';
 import {
   paginate,
   meta,
-  generateRef,
   clean,
   safeEnum,
   convertToUSD,
@@ -112,6 +112,10 @@ export class MarketplaceService {
     // oqimini aylanib o'tadi — pastga qarang: verifyCredentials/
     // connectCatalogOperator/syncOperator/autoSyncOperators.
     private adapters: TourAdapterRegistry,
+    // v14: kunlik sinxronizatsiya bir nechta instansda TAKRORLANMASIN.
+    // Ilgari @Cron yalang'och edi — 2 ta server ishlasa har bir operator
+    // ikki marta so'ralar, tashqi API limitlariga bekorga urilardi.
+    private cronLock: CronLockService,
   ) {}
 
   /**
@@ -459,6 +463,13 @@ export class MarketplaceService {
           authType: c.authType,
           // env'da API manzili bormi
           configured: c.configured,
+          // v14: HOZIR ULANSA ISHLAYDIMI.
+          // Frontend `available: false` bo'lganlarni ALOHIDA "Tez orada"
+          // bo'limida, ulanish tugmasisiz ko'rsatadi. Ilgari 19 ta
+          // operatorning 18 tasi ishlamasa ham bir xil ko'rinardi va
+          // foydalanuvchi har birini bosib ko'rib ishonchini yo'qotardi.
+          available: c.available,
+          mode: c.mode,
           // shu agentlik ulanganmi
           connected: Boolean(conn),
           operatorId: conn?.id || null,
@@ -592,6 +603,17 @@ export class MarketplaceService {
   ) {
     const op = getCatalogOperator(slug);
     if (!op) throw new NotFoundException('Bunday operator katalogda yo\'q');
+
+    // v14: hali integratsiyasi tayyor bo'lmagan operatorga ulanishga
+    // urinish ma'nosiz — login/parol bekorga yuboriladi va noaniq xato
+    // qaytadi. Endi darhol, tushunarli javob beramiz.
+    if (!op.available) {
+      throw new BadRequestException(
+        `${op.name} bilan avtomatik integratsiya hali tayyor emas. ` +
+        `Hozircha turlarni Excel/CSV orqali yuklashingiz mumkin: ` +
+        `Sozlamalar → Tur operatorlar → «Qo'lda operator qo'shish».`,
+      );
+    }
 
     const login = String(body?.login || '').trim();
     const password = String(body?.password || '').trim();
@@ -929,6 +951,13 @@ export class MarketplaceService {
    */
   @Cron('0 3 * * *') // har kuni 03:00
   async autoSyncOperators() {
+    // v14: faqat BITTA instansda bajariladi (qulf 2 soat ushlab turadi)
+    await this.cronLock.runOnce('marketplace-autosync', 2 * 3600, () =>
+      this.doAutoSync(),
+    );
+  }
+
+  private async doAutoSync() {
     // v13: adapter-backed (Ratehawk kabi jonli qidiruv) slug'larni
     // bu yerda o'tkazib yuboramiz — ularda statik "barcha turlar"
     // tushunchasi yo'q, shuning uchun kunlik sync ma'nosiz va xato beradi.
@@ -1199,10 +1228,18 @@ export class MarketplaceService {
     }
 
     // ── Booking raqami ──
-    const count = await this._prisma.booking.count({ where: { tenantId } });
-    let bookingRef = generateRef('TRV', count);
-    const dup = await this._prisma.booking.findFirst({ where: { bookingRef } });
-    if (dup) bookingRef = generateRef('TRV', count + Math.floor(Math.random() * 1000) + 1);
+    //
+    // TUZATILDI: ilgari `booking.count()` chaqirilardi. Ikki muammo bor edi:
+    //   1) Butun jadval sanaladi — bookinglar ko'payishi bilan sekinlashadi
+    //   2) Ikki agent bir vaqtda bron qilsa IKKALASI ham bir xil raqam oladi
+    //      va `bookingRef @unique` sabab biri yiqilardi
+    // Endi vaqt + tasodif asosida — poyga ham yo'q, so'rov ham yo'q.
+    const bookingRef = `TRV-${new Date().getFullYear()}-${Date.now()
+      .toString(36)
+      .toUpperCase()}${Math.floor(Math.random() * 46655)
+      .toString(36)
+      .toUpperCase()
+      .padStart(3, '0')}`;
 
     const notes = [
       `Turlar bozori — operator: ${tour.operator?.name || '—'}`,

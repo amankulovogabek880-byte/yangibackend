@@ -5,13 +5,18 @@ import {
   Get,
   Post,
   Body,
+  Param,
   Query,
   Req,
   Res,
   UseGuards,
   Logger,
-  BadRequestException, ForbiddenException } from '@nestjs/common';
+  BadRequestException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { SkipThrottle } from '@nestjs/throttler';
+import { Cron } from '@nestjs/schedule';
 import { verifyMetaSignature, canSkipSignature } from '../../common/utils/meta-signature';
 import type { Response } from 'express';
 import * as crypto from 'crypto';
@@ -22,6 +27,7 @@ import { CurrentUser, Public, Roles } from '../../common/decorators';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { NotificationsService } from '../notifications/notifications.service';
 import { EncryptionService } from '../../common/encryption/encryption.service';
+import { CronLockService } from '../../common/utils/cron-lock.service';
 import { normalizePhone, phoneVariants } from '../../common/utils/helpers';
 import { RoundRobinService, RoundRobinModule } from '../v9/round-robin.module';
 import { InstagramService, InstagramModule } from '../instagram/instagram.module';
@@ -31,17 +37,23 @@ import { swallow } from '../../common/utils/swallow';
 
 const GRAPH_API_VERSION = 'v23.0';
 
+/** Bitta hodisa uchun eng ko'p necha marta qayta uriniladi */
+const MAX_ATTEMPTS = 6;
+/** Bir siklda navbatdan nechta hodisa olinadi */
+const QUEUE_BATCH = 25;
+/** SLA: lead tayinlangandan keyin necha daqiqada javob kutamiz */
+const SLA_MINUTES = Number(process.env.LEAD_SLA_MINUTES || 15);
+
 // ── FACEBOOK XATOLARINI TASNIFLASH ──────────────────────────────────
-// Graph API turli xil holatlarda turlicha xato qaytaradi (permission
-// yetishmasligi, Page topilmaslik, token yaroqsizligi va h.k.). Bu
-// funksiya xom Graph API javobini frontend uchun tushunarli, harakatga
-// undovchi "errorType" ga aylantiradi — shu orqali foydalanuvchiga xom
-// JSON o'rniga aniq nima qilish kerakligini ko'rsatish mumkin bo'ladi.
+// Graph API turli holatlarda turlicha xato qaytaradi (ruxsat yetishmasligi,
+// Page topilmasligi, token yaroqsizligi...). Bu funksiya xom javobni
+// frontend uchun tushunarli, harakatga undovchi "errorType" ga aylantiradi.
 export type FacebookErrorType =
-  | 'NO_ADMIN_ACCESS' // foydalanuvchida Page uchun yetarli vazifa (task) yo'q
-  | 'MISSING_PERMISSIONS' // OAuth paytida kerakli ruxsatlar berilmagan
-  | 'INVALID_TOKEN' // token muddati tugagan yoki yaroqsiz
-  | 'NO_PAGES' // akkaunt hech qanday Page'ni boshqarmaydi
+  | 'NO_ADMIN_ACCESS'
+  | 'MISSING_PERMISSIONS'
+  | 'INVALID_TOKEN'
+  | 'NO_PAGES'
+  | 'RATE_LIMIT'
   | 'UNKNOWN';
 
 function classifyFacebookError(json: any): { type: FacebookErrorType; message: string } {
@@ -51,22 +63,17 @@ function classifyFacebookError(json: any): { type: FacebookErrorType; message: s
   const message: string = String(err.message || '');
   const lower = message.toLowerCase();
 
-  // code 100 + subcode 33 → "Object does not exist... missing permissions"
-  // — odatda Page ID token bilan mos kelmagani yoki foydalanuvchida
-  // shu Page'ga umuman huquq yo'qligi sababli chiqadi.
+  // 4 / 17 / 32 / 613 — Meta'ning limit kodlari. Bularni "noma'lum" deb
+  // belgilash xato edi: qayta urinish kerak, sozlamani o'zgartirish emas.
+  if ([4, 17, 32, 613].includes(Number(code)) || lower.includes('rate limit')) {
+    return { type: 'RATE_LIMIT', message };
+  }
   if (code === 100 && subcode === 33) {
     return { type: 'NO_ADMIN_ACCESS', message };
   }
-  // OAuthException + "impersonating a user's page" — pages_* ruxsatlar
-  // berilmagan holatda chiqadigan klassik xato (birinchi log'dagi holat).
   if (code === 190 || lower.includes('impersonating')) {
     return { type: 'MISSING_PERMISSIONS', message };
   }
-  // code 200 → "Requires <permission> permission to manage the object"
-  // — leadgen_forms/subscribed_apps kabi edge'larга token'da kerakli
-  // ruxsat (masalan pages_manage_ads) yo'qligida chiqadi. Buni ham
-  // MISSING_PERMISSIONS deb tasniflaymiz — aks holda "Noma'lum xato"
-  // ko'rinib, foydalanuvchi nima qilishni bilmay qoladi.
   if (code === 200 || (lower.includes('requires') && lower.includes('permission'))) {
     return { type: 'MISSING_PERMISSIONS', message };
   }
@@ -88,44 +95,73 @@ function classifyFacebookError(json: any): { type: FacebookErrorType; message: s
   return { type: 'UNKNOWN', message };
 }
 
-// "state" parametrini imzolash uchun (CSRF himoyasi + qaysi tenant/user
-// OAuth boshlaganini bilish). JWT_ACCESS_SECRET bilan bir xil sirdan
-// foydalanamiz — alohida env qo'shishga hojat yo'q.
 const OAUTH_STATE_SECRET =
   process.env.JWT_ACCESS_SECRET || 'dev-only-change-in-production';
-const OAUTH_STATE_TTL_MS = 10 * 60 * 1000; // 10 daqiqa
-const OAUTH_PENDING_TTL_MS = 10 * 60 * 1000; // 10 daqiqa
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const OAUTH_PENDING_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Webhook verify token — FAQAT server env'idan.
+ *
+ * TUZATILDI: ilgari `getConfig()` tenant sozlamalaridagi
+ * `facebookVerifyToken` ni qaytarardi va UI shuni ko'rsatardi, lekin
+ * `verifyWebhook()` env qiymatini tekshirardi. Admin UI'dagi qiymatni
+ * Meta Dashboard'ga kiritsa — webhook verifikatsiyasi YIQILARDI va
+ * obuna umuman o'rnatilmasdi.
+ *
+ * Webhook manzili butun platforma uchun BITTA, demak verify token ham
+ * bitta bo'lishi kerak. Tenantga bog'lash mantiqan noto'g'ri edi.
+ */
+function getVerifyToken(): string {
+  return process.env.FACEBOOK_VERIFY_TOKEN || 'omoncrm_fb_verify';
+}
+
+/**
+ * Webhook imzosi uchun App Secret.
+ *
+ * TUZATILDI: ilgari `FACEBOOK_APP_SECRET || INSTAGRAM_APP_SECRET` edi.
+ * Agar Facebook va Instagram TURLI Meta App'da bo'lsa, Instagram siri
+ * bilan hisoblangan imzo hech qachon mos kelmaydi va HAR BIR lead
+ * jimgina 403 bilan rad etiladi.
+ *
+ * Endi fallback FAQAT `META_SINGLE_APP=true` bo'lganda ishlaydi —
+ * ya'ni admin ataylab "bitta App ishlatyapman" deb tasdiqlaganda.
+ */
+function getAppSecret(): string | undefined {
+  const fb = process.env.FACEBOOK_APP_SECRET;
+  if (fb) return fb;
+  if (process.env.META_SINGLE_APP === 'true') return process.env.INSTAGRAM_APP_SECRET;
+  return undefined;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // FACEBOOK LEAD ADS SERVICE
 //
-// Oqim:
-//   1. Tenant admin Sozlamalar → Facebook bo'limida Page ID + Page
-//      Access Token'ni kiritadi (bitta marta).
-//   2. Shu Page avtomatik ravishda bizning Meta ilovamizga "leadgen"
-//      hodisasiga obuna qilinadi (subscribed_apps API chaqiriladi).
-//   3. Facebook'da instant-form to'ldirilganda, Meta bizning global
-//      webhook manzilimizga POST yuboradi: { object:'page', entry:[...] }.
-//   4. entry.id — Page ID. Shu ID orqali tegishli tenant DB'dan topiladi
-//      (Meta App darajasida bitta callback URL bo'ladi, tenant emas).
-//   5. change.value.leadgen_id orqali Graph API'dan to'liq lead
-//      ma'lumoti (ism, telefon, email...) so'rab olinadi.
-//   6. Client yaratiladi → lead scoring → auto-reply → round-robin
-//      orqali agentga tayinlanadi → real-time xabar yuboriladi.
+// OQIM (v14):
+//   1. Admin "Facebook orqali ulash" bosadi → OAuth → Page Access Token
+//      shifrlanib saqlanadi va Page "leadgen" hodisasiga obuna qilinadi.
+//   2. Formani to'ldirgan odam bo'lsa, Meta bizning global webhookka
+//      POST yuboradi.
+//   3. Webhook hodisani `FacebookLeadEvent` jadvaliga yozadi va Meta'ga
+//      DARHOL 200 qaytaradi (≈20ms).
+//   4. Fon navbat (`drainQueue`) hodisani qayta ishlaydi: Graph API'dan
+//      to'liq lead → client → scoring → auto-reply → tayinlash.
+//      Xato bo'lsa qayta uriniladi, hech narsa yo'qolmaydi.
+//   5. Har soatda "backfill" cron Meta'dan o'tkazib yuborilgan leadlarni
+//      qidirib topadi va navbatga qo'shadi.
 //
 // XAVFSIZLIK:
-//   - Page Access Token AES-256-GCM bilan shifrlab saqlanadi
-//     (EncryptionService — parol/pasport kabi sezgir ma'lumotlar uchun
-//     ishlatiladigan xizmat).
-//   - Frontend'ga hech qachon to'liq token qaytarilmaydi — faqat
-//     "EAAG••••••••ab12" ko'rinishidagi maskalangan qiymat.
-//   - Webhook imzosi (X-Hub-Signature-256) FACEBOOK_APP_SECRET bilan
-//     tekshiriladi — soxta so'rovlar rad etiladi.
+//   - Page Access Token AES-256-GCM bilan shifrlanadi
+//   - Webhook imzosi FAIL-CLOSED tekshiriladi
+//   - OAuth `state` imzolangan + bir martalik nonce
 // ═══════════════════════════════════════════════════════════════════
 
 @Injectable()
 export class FacebookLeadsService {
   private readonly logger = new Logger('FacebookLeads');
+
+  /** Navbat bir vaqtda faqat bitta oqimda ishlashi uchun (shu instans ichida) */
+  private draining = false;
 
   constructor(
     private prisma: PrismaService,
@@ -134,13 +170,23 @@ export class FacebookLeadsService {
     private roundRobin: RoundRobinService,
     private scoring: LeadScoringService,
     private autoReply: AutoReplyService,
-    // v12.2: bitta OAuth tugmasi Instagram'ni ham ulaydi
     private instagram: InstagramService,
-    // v12.3: qaytgan mijoz haqida agentga xabar berish uchun
     private notifications: NotificationsService,
+    private cronLock: CronLockService,
   ) {}
 
-  // ── SOZLAMALAR ────────────────────────────────────────────────────
+  /**
+   * Prisma cast — `FacebookLeadEvent` modeli `prisma generate` dan keyin
+   * paydo bo'ladi. Shu sababli `any`: kod generate'gacha ham kompilyatsiya
+   * bo'lsin (loyihada `marketplace` moduli ham shu usulni ishlatadi).
+   */
+  private get db(): any {
+    return this.prisma;
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // SOZLAMALAR
+  // ─────────────────────────────────────────────────────────────────
 
   async getConfig(tenantId: string) {
     const tenant = await this.prisma.tenant.findUnique({
@@ -157,10 +203,14 @@ export class FacebookLeadsService {
       pageName: s.facebookPageName || null,
       hasAccessToken: !!decrypted,
       maskedAccessToken: decrypted ? this.encryption.mask(decrypted, 6, 4) : null,
-      verifyToken: s.facebookVerifyToken || 'omoncrm_fb_verify',
+      // MUHIM: bu env qiymati — Meta Dashboard'ga AYNAN shuni kiritish kerak
+      verifyToken: getVerifyToken(),
       assignToAgentId: s.facebookAssignAgentId || null,
       isEnabled: !!decrypted && !!s.facebookPageId,
       connectedAt: s.facebookConnectedAt || null,
+      lastBackfillAt: s.facebookLastBackfillAt || null,
+      // Server tomonida imzo siri bormi — yo'q bo'lsa HECH QANDAY lead kelmaydi
+      appSecretConfigured: !!getAppSecret(),
     };
   }
 
@@ -170,7 +220,6 @@ export class FacebookLeadsService {
       accessToken?: string;
       pageId?: string;
       pageName?: string;
-      verifyToken?: string;
       assignToAgentId?: string;
     },
   ) {
@@ -180,18 +229,12 @@ export class FacebookLeadsService {
     });
     const cur: any = tenant?.settings || {};
 
-    // Token faqat yangi qiymat kiritilganda qayta shifrlanadi — bo'sh
-    // qoldirilsa eskisi saqlanib qoladi (frontend hech qachon to'liq
-    // tokenni qaytarib olmaydi, shuning uchun uni qayta yubormaydi).
     const newEncToken = data.accessToken?.trim()
       ? this.encryption.encrypt(data.accessToken.trim())
       : cur.facebookPageAccessToken || null;
 
     const newPageId = data.pageId?.trim() || cur.facebookPageId || null;
 
-    // v13.0: boshqa agentlik shu Page'ni allaqachon ulaganmi?
-    // Baza @unique bilan to'xtatadi, lekin bu yerda tushunarli
-    // xabar berish uchun oldindan tekshiramiz.
     if (newPageId) {
       const taken = await this.prisma.tenant.findFirst({
         where: { facebookPageId: newPageId, NOT: { id: tenantId } },
@@ -200,7 +243,7 @@ export class FacebookLeadsService {
       if (taken) {
         throw new BadRequestException(
           `Bu Facebook Page ID (${newPageId}) boshqa hisobga allaqachon ulangan. ` +
-          `O'z Page'ingizni tanlang yoki platforma administratoriga murojaat qiling.`,
+            `O'z Page'ingizni tanlang yoki platforma administratoriga murojaat qiling.`,
         );
       }
     }
@@ -208,38 +251,37 @@ export class FacebookLeadsService {
     await this.prisma.tenant.update({
       where: { id: tenantId },
       data: {
-        // v13.0: indekslangan alohida ustun (webhook shu bo'yicha topadi)
         facebookPageId: newPageId,
         settings: {
           ...cur,
           facebookPageAccessToken: newEncToken,
           facebookPageId: newPageId,
           facebookPageName: data.pageName?.trim() ?? cur.facebookPageName ?? null,
-          facebookVerifyToken:
-            data.verifyToken?.trim() || cur.facebookVerifyToken || 'omoncrm_fb_verify',
           facebookAssignAgentId:
-            data.assignToAgentId !== undefined ? (data.assignToAgentId || null) : (cur.facebookAssignAgentId ?? null),
+            data.assignToAgentId !== undefined
+              ? data.assignToAgentId || null
+              : cur.facebookAssignAgentId ?? null,
           facebookConnectedAt:
             newEncToken && newPageId
               ? new Date().toISOString()
               : cur.facebookConnectedAt ?? null,
+          // Token yaroqsizligi haqidagi eski bayroqni tozalaymiz
+          facebookTokenInvalidAt: null,
         },
       },
     });
 
-    // MUHIM: faqat token/Page ID saqlash yetarli emas — Meta shu Page'ni
-    // bizning ilovamizga "leadgen" hodisasiga aniq obuna qilishimizni
-    // talab qiladi. Shu chaqiruvsiz webhook hech qachon kelmaydi.
-    let subscribeResult: { ok: boolean; errorType?: FacebookErrorType; rawMessage?: string } | null = null;
+    let subscribeResult: {
+      ok: boolean;
+      errorType?: FacebookErrorType;
+      rawMessage?: string;
+    } | null = null;
     if (newEncToken && newPageId) {
       const plainToken = this.encryption.decrypt(newEncToken);
       if (plainToken) subscribeResult = await this.subscribeAppToPage(newPageId, plainToken);
     }
 
     const config = await this.getConfig(tenantId);
-    // Frontend uchun qo'shimcha: agar obuna muvaffaqiyatsiz bo'lsa, aniq
-    // sababni ham qaytaramiz — token/PageId saqlanadi, lekin admin darhol
-    // muammoni ko'radi (xom log kutib o'tirmasdan).
     if (subscribeResult && !subscribeResult.ok) {
       return {
         ...config,
@@ -252,11 +294,7 @@ export class FacebookLeadsService {
     return config;
   }
 
-  /**
-   * Page'ni bizning Meta ilovamizga "leadgen" hodisasi uchun obuna qiladi.
-   * Muvaffaqiyatsiz bo'lsa, xom xato o'rniga tasniflangan errorType qaytaradi —
-   * shu orqali frontend foydalanuvchiga aniq nima qilish kerakligini ko'rsata oladi.
-   */
+  /** Page'ni Meta ilovamizga "leadgen" hodisasi uchun obuna qiladi. */
   private async subscribeAppToPage(
     pageId: string,
     accessToken: string,
@@ -270,9 +308,7 @@ export class FacebookLeadsService {
       const json: any = await res.json().catch(() => ({}));
       if (!res.ok || json?.success === false) {
         const { type, message } = classifyFacebookError(json);
-        this.logger.error(
-          `Facebook subscribe_apps xato [${type}]: ` + JSON.stringify(json),
-        );
+        this.logger.error(`Facebook subscribe_apps xato [${type}]: ` + JSON.stringify(json));
         return { ok: false, errorType: type, rawMessage: message };
       }
       this.logger.log(`Facebook: Page ${pageId} "leadgen" hodisasiga obuna qilindi`);
@@ -283,54 +319,47 @@ export class FacebookLeadsService {
     }
   }
 
-  // ── WEBHOOK TEKSHIRISH (Meta bir martalik "subscribe" so'rovi) ────
+  // ─────────────────────────────────────────────────────────────────
+  // WEBHOOK
+  // ─────────────────────────────────────────────────────────────────
 
   verifyWebhook(mode: string, token: string, challenge: string): string {
-    const expected = process.env.FACEBOOK_VERIFY_TOKEN || 'omoncrm_fb_verify';
-    if (mode === 'subscribe' && token === expected) {
+    if (mode === 'subscribe' && token === getVerifyToken()) {
+      this.logger.log('Facebook webhook verifikatsiyasi muvaffaqiyatli');
       return challenge;
     }
+    this.logger.warn(
+      "Facebook webhook verifikatsiyasi RAD ETILDI — Meta Dashboard'dagi Verify Token " +
+        "server env'idagi FACEBOOK_VERIFY_TOKEN bilan mos kelmadi",
+    );
     throw new BadRequestException('Webhook verification failed');
   }
 
-  /** entry.id (Page ID) bo'yicha tenant va uning Page Access Token'ini topadi. */
-  private async findTenantByPageId(
-    pageId: string,
-  ): Promise<{ tenantId: string; accessToken: string } | null> {
-    // v13.0: ilgari BARCHA tenantlar o'qib chiqilib, JSON ichidan
-    // qidirilardi. Bu sekin edi va Page ID'ni o'zlashtirib olish
-    // imkonini berardi. Endi @unique, indekslangan ustun bo'yicha
-    // bitta so'rov.
-    if (!pageId) return null;
-    const t = await this.prisma.tenant.findUnique({
-      where: { facebookPageId: String(pageId).trim() },
-      select: { id: true, status: true, settings: true },
-    });
-    if (!t || t.status !== ('ACTIVE' as any)) return null;
-
-    const st: any = t.settings || {};
-    if (!st.facebookPageAccessToken) return null;
-
-    const accessToken = this.encryption.decrypt(st.facebookPageAccessToken);
-    return accessToken ? { tenantId: t.id, accessToken } : null;
-  }
-
-  // ── WEBHOOK QABUL QILISH ───────────────────────────────────────────
-
+  /**
+   * WEBHOOK QABUL QILISH — endi FAQAT yozib qo'yadi va darhol qaytadi.
+   *
+   * NEGA SHUNDAY: Meta ~5 soniya kutadi. Graph API + scoring + auto-reply
+   * undan uzoq davom etadi → Meta timeout deb hisoblaydi, qayta yuboradi,
+   * keyin esa Page obunasini butunlay o'chiradi. Endi bu so'rov ~20ms
+   * ichida tugaydi, haqiqiy ishlov fon rejimida boradi.
+   */
   async processWebhook(body: any, signature?: string, rawBody?: Buffer) {
     if (body?.object !== 'page') return { ok: true };
 
-    // Meta imzoni App Secret bilan hisoblaydi (Page Access Token EMAS).
-    // Instagram va Facebook Lead Ads odatda bitta Meta App ostida
-    // bo'ladi, shuning uchun FACEBOOK_APP_SECRET sozlanmagan bo'lsa
-    // INSTAGRAM_APP_SECRET'ga tushiladi (agar bitta App ishlatilsa).
-    // ── IMZO TEKSHIRUVI (v13.0) — FAIL-CLOSED ──
-    //
-    // Instagram moduli bilan bir xil muammo edi: imzo sarlavhasi
-    // yuborilmasa tekshiruv o'tkazib yuborilardi va istalgan odam
-    // soxta lead yarata olardi (agentga bildirishnoma, soxta mijoz).
-    const appSecret = process.env.FACEBOOK_APP_SECRET || process.env.INSTAGRAM_APP_SECRET;
+    // ── IMZO TEKSHIRUVI — FAIL-CLOSED ──
+    // Imzo yo'q, kalit yo'q yoki mos kelmasa — rad etamiz. Aks holda
+    // istalgan odam soxta lead va bildirishnoma yarata olardi.
     if (!canSkipSignature()) {
+      const appSecret = getAppSecret();
+      if (!appSecret) {
+        // Bu holat ENG XAVFLISI: hech narsa ishlamaydi, lekin sabab
+        // ko'rinmaydi. Shuning uchun `error` darajasida yozamiz.
+        this.logger.error(
+          'FACEBOOK_APP_SECRET sozlanmagan — barcha Facebook webhooklari RAD ETILADI. ' +
+            "Leadlar CRM'ga TUSHMAYDI. Serverdagi .env ni tekshiring.",
+        );
+        throw new ForbiddenException();
+      }
       const sig = verifyMetaSignature(rawBody, signature, appSecret);
       if (!sig.ok) {
         this.logger.warn(`Facebook webhook RAD ETILDI: ${sig.reason}`);
@@ -339,8 +368,10 @@ export class FacebookLeadsService {
     }
 
     const entries: any[] = body?.entry || [];
+    let queued = 0;
+
     for (const entry of entries) {
-      const pageId: string = entry?.id;
+      const pageId: string = String(entry?.id || '');
       const changes: any[] = entry?.changes || [];
 
       for (const change of changes) {
@@ -348,103 +379,314 @@ export class FacebookLeadsService {
         const leadgenId: string | undefined = change?.value?.leadgen_id;
         if (!leadgenId) continue;
 
-        const tenantInfo = await this.findTenantByPageId(pageId);
-        if (!tenantInfo) {
-          this.logger.warn(
-            `Facebook webhook: pageId=${pageId} uchun tenant topilmadi (Sozlamalarda Page ID ni tekshiring)`,
-          );
-          continue;
-        }
-
-        await this.handleLeadgen(tenantInfo.tenantId, tenantInfo.accessToken, leadgenId, {
-          formId: change?.value?.form_id,
-          adId: change?.value?.ad_id,
-          createdTime: change?.value?.created_time,
-        }).catch((e: any) => this.logger.error('Facebook leadgen error: ' + e.message));
+        const ok = await this.enqueueLead({
+          leadgenId: String(leadgenId),
+          pageId,
+          formId: change?.value?.form_id ? String(change.value.form_id) : null,
+          adId: change?.value?.ad_id ? String(change.value.ad_id) : null,
+          createdTime: change?.value?.created_time
+            ? String(change.value.created_time)
+            : null,
+          source: 'WEBHOOK',
+        });
+        if (ok) queued++;
       }
+    }
+
+    // Fon rejimda ishlov beramiz — javobni KUTMAYMIZ.
+    if (queued > 0) {
+      setImmediate(() => {
+        this.drainQueue().catch((e) =>
+          this.logger.error('Facebook navbatini ishlashda xato: ' + e?.message),
+        );
+      });
     }
 
     return { ok: true };
   }
 
-  /** Graph API'dan lead maydonlarini (field_data) so'rab, tekis obyektga aylantiradi. */
+  /**
+   * Hodisani navbatga qo'yadi. `leadgenId` @unique bo'lgani uchun
+   * takroriy webhook (Meta at-least-once kafolat beradi) dublikat
+   * yaratmaydi — shunchaki `false` qaytadi.
+   */
+  private async enqueueLead(data: {
+    leadgenId: string;
+    pageId: string;
+    formId?: string | null;
+    adId?: string | null;
+    createdTime?: string | null;
+    payload?: any;
+    source: 'WEBHOOK' | 'BACKFILL';
+  }): Promise<boolean> {
+    // Page qaysi agentlikka tegishli — hozirroq aniqlab qo'yamiz,
+    // shunda "kimniki ekani noma'lum" hodisalar ham ko'rinib turadi.
+    const tenantId = await this.findTenantIdByPageId(data.pageId);
+
+    try {
+      await this.db.facebookLeadEvent.create({
+        data: {
+          leadgenId: data.leadgenId,
+          pageId: data.pageId,
+          tenantId,
+          formId: data.formId || null,
+          adId: data.adId || null,
+          createdTime: data.createdTime || null,
+          payload: data.payload ?? undefined,
+          source: data.source,
+          status: tenantId ? 'PENDING' : 'NO_TENANT',
+        },
+      });
+      if (!tenantId) {
+        this.logger.warn(
+          `Facebook webhook: pageId=${data.pageId} uchun agentlik topilmadi. ` +
+            `Hodisa saqlandi (leadgenId=${data.leadgenId}) — Page ulangach qayta ishlanadi.`,
+        );
+      }
+      return !!tenantId;
+    } catch (e: any) {
+      // P2002 — bu hodisa allaqachon navbatda/bajarilgan. Normal holat.
+      if (e?.code === 'P2002') return false;
+      this.logger.error('Facebook hodisasini navbatga qo\'yib bo\'lmadi: ' + e?.message);
+      return false;
+    }
+  }
+
+  /** Page ID bo'yicha faol agentlikni topadi (indekslangan, @unique ustun). */
+  private async findTenantIdByPageId(pageId: string): Promise<string | null> {
+    if (!pageId) return null;
+    const t = await this.prisma.tenant
+      .findUnique({
+        where: { facebookPageId: String(pageId).trim() },
+        select: { id: true, status: true },
+      })
+      .catch(() => null);
+    if (!t || t.status !== ('ACTIVE' as any)) return null;
+    return t.id;
+  }
+
+  /** Agentlikning ochilgan (deshifrlangan) Page Access Token'i. */
+  private async getPageToken(tenantId: string): Promise<string | null> {
+    const t = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const st: any = t?.settings || {};
+    if (!st.facebookPageAccessToken) return null;
+    return this.encryption.decrypt(st.facebookPageAccessToken) || null;
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // NAVBATNI ISHLASH
+  // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Navbatdagi hodisalarni ketma-ket qayta ishlaydi.
+   *
+   * Bir vaqtda bitta oqim (`draining` bayrog'i) — aks holda bir xil
+   * hodisa ikki marta ishlanib, dublikat mijoz paydo bo'lardi.
+   */
+  async drainQueue(): Promise<{ processed: number; failed: number }> {
+    if (this.draining) return { processed: 0, failed: 0 };
+    this.draining = true;
+
+    let processed = 0;
+    let failed = 0;
+
+    try {
+      for (let round = 0; round < 20; round++) {
+        const events: any[] = await this.db.facebookLeadEvent.findMany({
+          where: {
+            status: { in: ['PENDING', 'FAILED'] },
+            attempts: { lt: MAX_ATTEMPTS },
+            tenantId: { not: null },
+          },
+          orderBy: { createdAt: 'asc' },
+          take: QUEUE_BATCH,
+        });
+        if (events.length === 0) break;
+
+        for (const ev of events) {
+          // Optimistik qulf: statusni PROCESSING ga o'tkazamiz. Boshqa
+          // instans shu yozuvni endi olmaydi.
+          const claimed = await this.db.facebookLeadEvent.updateMany({
+            where: { id: ev.id, status: ev.status },
+            data: { status: 'PROCESSING', attempts: { increment: 1 } },
+          });
+          if (!claimed?.count) continue; // boshqa instans ulgurdi
+
+          try {
+            const client = await this.handleLeadgen(ev);
+            await this.db.facebookLeadEvent.update({
+              where: { id: ev.id },
+              data: {
+                status: client === null ? 'SKIPPED' : 'DONE',
+                clientId: client?.id || null,
+                lastError: null,
+                processedAt: new Date(),
+              },
+            });
+            processed++;
+          } catch (e: any) {
+            failed++;
+            const attempts = (ev.attempts || 0) + 1;
+            const msg = String(e?.message || e).slice(0, 500);
+            await this.db.facebookLeadEvent.update({
+              where: { id: ev.id },
+              data: {
+                status: 'FAILED',
+                lastError: msg,
+                processedAt: new Date(),
+              },
+            });
+            this.logger.error(
+              `Facebook lead ${ev.leadgenId} xato (urinish ${attempts}/${MAX_ATTEMPTS}): ${msg}`,
+            );
+
+            // Urinishlar tugadi — adminga xabar beramiz, chunki bu
+            // endi avtomatik tuzalmaydi va lead yo'qolib ketishi mumkin.
+            if (attempts >= MAX_ATTEMPTS && ev.tenantId) {
+              await this.notifyAdmins(
+                ev.tenantId,
+                '⚠️ Facebook lead qayta ishlanmadi',
+                `Lead ID ${ev.leadgenId} — ${msg}. Sozlamalar → Facebook Ads bo'limida ko'ring.`,
+                '/settings?tab=facebook',
+              ).catch(swallow('bildirishnoma'));
+            }
+          }
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
+
+    return { processed, failed };
+  }
+
+  /** Har daqiqada navbatni tekshiradi (webhook o'tkazib yuborilgan holatlar uchun). */
+  @Cron('*/1 * * * *')
+  async queueCron() {
+    await this.cronLock.runOnce('fb-lead-queue', 55, async () => {
+      const r = await this.drainQueue();
+      if (r.processed || r.failed) {
+        this.logger.log(`Facebook navbat: ${r.processed} bajarildi, ${r.failed} xato`);
+      }
+    });
+  }
+
+  /** Graph API'dan lead maydonlarini olib, tekis obyektga aylantiradi. */
   private async fetchLeadData(
     leadgenId: string,
     accessToken: string,
-  ): Promise<{ fields: Record<string, string>; formName: string }> {
+  ): Promise<{ fields: Record<string, string>; formName: string; rawFieldData: any[] }> {
     const url =
       `https://graph.facebook.com/${GRAPH_API_VERSION}/${leadgenId}` +
-      `?access_token=${encodeURIComponent(accessToken)}`;
+      `?fields=id,created_time,field_data,form_id,ad_id,campaign_id,campaign_name` +
+      `&access_token=${encodeURIComponent(accessToken)}`;
     const res = await fetch(url);
     const json: any = await res.json().catch(() => ({}));
     if (!res.ok) {
-      throw new Error('Graph API xato: ' + JSON.stringify(json?.error || json));
+      const { type, message } = classifyFacebookError(json);
+      throw new Error(`Graph API [${type}]: ${message || JSON.stringify(json)}`);
     }
-    const fields: Record<string, string> = {};
-    for (const f of json?.field_data || []) {
-      const key = String(f?.name || '').toLowerCase();
-      const value = Array.isArray(f?.values) ? f.values[0] : f?.values;
-      if (key && value) fields[key] = String(value);
-    }
-    return { fields, formName: json?.form_name || '' };
+    return this.parseLeadPayload(json);
   }
 
-  /** Metaning turlicha nomlangan standart maydonlarini bizning schema'ga moslaydi. */
+  /** Xom Graph API javobini (webhook yoki backfill) bir xil ko'rinishga keltiradi. */
+  private parseLeadPayload(json: any): {
+    fields: Record<string, string>;
+    formName: string;
+    rawFieldData: any[];
+  } {
+    const fields: Record<string, string> = {};
+    const rawFieldData: any[] = Array.isArray(json?.field_data) ? json.field_data : [];
+    for (const f of rawFieldData) {
+      const key = String(f?.name || '').toLowerCase();
+      const value = Array.isArray(f?.values) ? f.values.join(', ') : f?.values;
+      if (key && value) fields[key] = String(value);
+    }
+    return { fields, formName: json?.form_name || '', rawFieldData };
+  }
+
+  /** Metaning standart maydonlarini bizning schema'ga moslaydi. */
   private mapFacebookFields(raw: Record<string, string>) {
     const pick = (...keys: string[]): string | null => {
       for (const k of keys) if (raw[k]) return raw[k];
       return null;
     };
     const fullName =
-      pick('full_name', 'name') ||
+      pick('full_name', 'name', 'ism', 'имя') ||
       [pick('first_name'), pick('last_name')].filter(Boolean).join(' ').trim() ||
       null;
     return {
       fullName: fullName || 'Facebook Lead',
-      phone: pick('phone_number', 'phone'),
-      email: pick('email', 'work_email'),
-      city: pick('city'),
+      phone: pick('phone_number', 'phone', 'telefon', 'телефон'),
+      email: pick('email', 'work_email', 'pochta'),
+      city: pick('city', 'shahar', 'город'),
     };
   }
 
-  /** Bitta leadgen hodisasini to'liq ishlov berish: olish → client → tayinlash. */
-  async handleLeadgen(
-    tenantId: string,
-    accessToken: string,
-    leadgenId: string,
-    meta: { formId?: string; adId?: string; createdTime?: string },
-  ) {
-    // Dublikat webhook himoyasi — Meta ba'zan bitta hodisani 2 marta
-    // yuborishi mumkin (at-least-once delivery kafolati).
-    const already = await this.prisma.clientTimeline
-      .findFirst({
-        where: {
-          client: { tenantId },
-          metadata: { path: ['leadgenId'], equals: leadgenId },
-        },
-      })
-      .catch(() => null);
-    if (already) {
-      this.logger.log(`Facebook leadgen ${leadgenId} allaqachon qayta ishlangan, o'tkazib yuborildi`);
-      return;
+  /**
+   * "Standart bo'lmagan" savollarni ajratib beradi.
+   *
+   * TUZATILDI: ilgari faqat ism/telefon/email/shahar olinardi, qolgan
+   * hamma javob (byudjet, yo'nalish, sana, nechta kishi) TASHLAB
+   * YUBORILARDI. Bu sotuv uchun eng qimmatli ma'lumot — agent mijozga
+   * qo'ng'iroq qilganda hech narsa bilmasdi.
+   */
+  private extractExtraAnswers(rawFieldData: any[]): { label: string; value: string }[] {
+    const STANDARD = new Set([
+      'full_name', 'name', 'first_name', 'last_name',
+      'phone_number', 'phone', 'email', 'work_email', 'city',
+    ]);
+    const out: { label: string; value: string }[] = [];
+    for (const f of rawFieldData || []) {
+      const key = String(f?.name || '').toLowerCase();
+      if (!key || STANDARD.has(key)) continue;
+      const value = Array.isArray(f?.values) ? f.values.join(', ') : f?.values;
+      if (!value) continue;
+      out.push({
+        label: String(f?.label || f?.name || key).slice(0, 200),
+        value: String(value).slice(0, 500),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Bitta navbat yozuvini to'liq qayta ishlaydi.
+   * @returns yaratilgan/topilgan mijoz, yoki `null` (o'tkazib yuborildi)
+   */
+  private async handleLeadgen(ev: any): Promise<any | null> {
+    const tenantId: string = ev.tenantId;
+    const leadgenId: string = ev.leadgenId;
+
+    // Backfill'da to'liq payload allaqachon bor — qayta so'rov shart emas.
+    let parsed: { fields: Record<string, string>; formName: string; rawFieldData: any[] };
+    if (ev.payload && Array.isArray(ev.payload?.field_data)) {
+      parsed = this.parseLeadPayload(ev.payload);
+    } else {
+      const accessToken = await this.getPageToken(tenantId);
+      if (!accessToken) {
+        throw new Error("Agentlikda Facebook Page Access Token yo'q (qayta ulang)");
+      }
+      parsed = await this.fetchLeadData(leadgenId, accessToken);
     }
 
-    const { fields: raw, formName } = await this.fetchLeadData(leadgenId, accessToken);
+    const { fields: raw, formName, rawFieldData } = parsed;
     const { fullName, phone, email, city } = this.mapFacebookFields(raw);
+    const extraAnswers = this.extractExtraAnswers(rawFieldData);
 
     if (!phone && !email) {
-      this.logger.warn(`Facebook lead ${leadgenId}: na telefon, na email topilmadi, o'tkazib yuborildi`);
-      return;
+      this.logger.warn(
+        `Facebook lead ${leadgenId}: na telefon, na email topilmadi — o'tkazib yuborildi`,
+      );
+      return null;
     }
 
-    // Telefonni yagona formatga keltiramiz (+998901234567).
-    // Ilgari "901234567" va "+998901234567" TURLI mijoz deb qabul
-    // qilinardi va bazada dublikatlar yig'ilardi.
     const normalizedPhone = normalizePhone(phone);
 
-    // Dublikat CLIENT tekshiruvi.
-    // Eski yozuvlar turli formatda saqlangan bo'lishi mumkin, shuning
-    // uchun raqamning barcha ko'rinishlarini tekshiramiz.
+    // ── Dublikat mijoz tekshiruvi ──
     let existing: any = null;
     if (phone) {
       existing = await this.prisma.client.findFirst({
@@ -456,79 +698,59 @@ export class FacebookLeadsService {
     }
 
     if (existing) {
-      await this.prisma.clientTimeline
-        .create({
-          data: {
-            clientId: existing.id,
-            type: 'message',
-            title: "🔁 Facebook orqali qayta murojaat",
-            description: `Forma: ${formName || meta.formId || ''}`,
-            metadata: {
-              source: 'FACEBOOK',
-              leadgenId,
-              formId: meta.formId,
-              adId: meta.adId,
-              isDuplicate: true,
-            },
-          },
-        })
-        .catch(swallow('mijoz tarixi'));
-
-      // ── v12.3: QAYTGAN MIJOZ e'tibordan chetda qolmasin ──
-      // Ilgari faqat tarixga yozilardi va agent bilmasdan qolardi —
-      // bu to'g'ridan-to'g'ri yo'qotilgan sotuv edi.
-
-      // "Yo'qotilgan" bosqichda bo'lsa qayta tiklaymiz
-      if (existing.pipelineStage === 'LOST') {
-        await this.prisma.client.update({
-          where: { id: existing.id },
-          data: { pipelineStage: 'NEW_LEAD', pipelineStageAt: new Date() },
-        }).catch(swallow('yangilash'));
-      }
-
-      if (existing.assignedAgentId) {
-        await this.notifications.create({
-          tenantId,
-          userId: existing.assignedAgentId,
-          type: 'LEAD_NEW',
-          title: '🔁 Mijoz qayta murojaat qildi',
-          body: `${existing.fullName} — Facebook forma${formName ? ': ' + formName : ''}`,
-          link: `/clients/${existing.id}`,
-          metadata: { clientId: existing.id, leadgenId, isReturning: true },
-        }).catch(swallow('bildirishnoma'));
-
-        this.realtime.emitToUser(existing.assignedAgentId, 'lead:returning', {
-          clientId: existing.id,
-          fullName: existing.fullName,
-          phone: existing.phone,
-          source: 'FACEBOOK',
-        });
-      } else {
-        // Agent biriktirilmagan bo'lsa — butun jamoaga ko'rsatamiz
-        this.realtime.emitToTenant(tenantId, 'lead:returning', {
-          clientId: existing.id,
-          fullName: existing.fullName,
-          source: 'FACEBOOK',
-        });
-      }
-
-      this.logger.log(`Facebook: qayta murojaat — ${existing.fullName} (${existing.id})`);
-      return existing;
+      return this.handleReturningClient(tenantId, existing, {
+        leadgenId,
+        formName,
+        formId: ev.formId,
+        adId: ev.adId,
+        extraAnswers,
+      });
     }
 
-    const client = await this.prisma.client.create({
-      data: {
-        tenantId,
-        fullName,
-        phone: normalizedPhone || phone || null,
-        email: email || null,
-        city: city || null,
-        source: 'FACEBOOK',
-        pipelineStage: 'NEW_LEAD',
-        pipelineStageAt: new Date(),
-        sourceCampaign: meta.adId || meta.formId || null,
-      } as any,
-    });
+    // ── Yangi mijoz ──
+    let client: any;
+    try {
+      client = await this.prisma.client.create({
+        data: {
+          tenantId,
+          fullName,
+          phone: normalizedPhone || phone || null,
+          email: email || null,
+          city: city || null,
+          source: 'FACEBOOK',
+          pipelineStage: 'NEW_LEAD',
+          pipelineStageAt: new Date(),
+          sourceCampaign: ev.adId || ev.formId || null,
+        } as any,
+      });
+    } catch (e: any) {
+      // ── POYGA HOLATI ──
+      // `@@unique([tenantId, phone])` sabab: ikki webhook bir vaqtda
+      // kelsa ikkalasi ham "mavjud emas" deb topadi, ikkinchisi P2002
+      // bilan yiqiladi va ILGARI lead butunlay yo'qolardi.
+      // Endi mavjud mijozni topib, "qayta murojaat" oqimiga o'tamiz.
+      if (e?.code === 'P2002') {
+        const again = await this.prisma.client.findFirst({
+          where: {
+            tenantId,
+            OR: [
+              ...(phone ? [{ phone: { in: phoneVariants(phone) } }] : []),
+              ...(email ? [{ email }] : []),
+            ],
+          },
+        });
+        if (again) {
+          return this.handleReturningClient(tenantId, again, {
+            leadgenId,
+            formName,
+            formId: ev.formId,
+            adId: ev.adId,
+            extraAnswers,
+          });
+        }
+      }
+      throw e;
+    }
 
     await this.prisma.clientTimeline
       .create({
@@ -536,18 +758,22 @@ export class FacebookLeadsService {
           clientId: client.id,
           type: 'created',
           title: '📥 Yangi lead — Facebook Ads',
-          description: `Forma: ${formName || meta.formId || ''}`,
+          description: this.buildTimelineDescription(formName, ev.formId, extraAnswers),
           metadata: {
             source: 'FACEBOOK',
             leadgenId,
-            formId: meta.formId,
-            adId: meta.adId,
+            formId: ev.formId,
+            adId: ev.adId,
+            formName,
+            // Formadagi BARCHA javoblar — agent qo'ng'iroq oldidan ko'radi
+            answers: extraAnswers,
+            rawFields: raw,
           },
         },
       })
       .catch(swallow('mijoz tarixi'));
 
-    // Lead Scoring va Auto-Reply — asosiy oqimni bloklamaydi (fire-and-forget)
+    // Fon amallar — asosiy oqimni bloklamaydi
     this.scoring
       .scoreClient(tenantId, client.id)
       .catch((e: any) => this.logger.error('Facebook scoring error: ' + e?.message));
@@ -555,99 +781,512 @@ export class FacebookLeadsService {
       .triggerRules(tenantId, client.id, 'FACEBOOK')
       .catch((e: any) => this.logger.error('Facebook autoReply error: ' + e?.message));
 
-    // ── TAYINLASH ──────────────────────────────────────────────────
-    // Avval sozlamada aniq agent belgilangan bo'lsa — o'shanga,
-    // aks holda Round-Robin orqali navbat bilan.
-    const config = await this.getConfig(tenantId);
-    let assignedAgentId: string | null = null;
+    // ── TAYINLASH ──
+    const assignedAgentId = await this.assignAgent(tenantId, client.id, fullName);
 
-    if (config.assignToAgentId) {
+    if (assignedAgentId) {
+      await this.prisma.client
+        .update({
+          where: { id: client.id },
+          data: { assignedAgentId, assignedAt: new Date() } as any,
+        })
+        .catch(swallow('tayinlash vaqti'));
+
+      this.realtime.emitToUser(assignedAgentId, 'lead:new', {
+        clientId: client.id,
+        source: 'FACEBOOK',
+        name: fullName,
+        phone: normalizedPhone || phone,
+        email,
+        answers: extraAnswers,
+      });
+    } else {
+      // Hech kim tayinlanmadi — bu jimgina yo'qolmasligi kerak
+      await this.notifyAdmins(
+        tenantId,
+        '⚠️ Yangi lead tayinlanmadi',
+        `${fullName} — Facebook. Faol agent topilmadi yoki hammasi kunlik limitga yetgan.`,
+        `/clients/${client.id}`,
+      ).catch(swallow('bildirishnoma'));
+    }
+
+    this.realtime.emitToTenant(tenantId, 'lead:new', {
+      clientId: client.id,
+      source: 'FACEBOOK',
+    });
+
+    this.logger.log(`Yangi Facebook lead: ${client.id} — ${fullName}`);
+    return client;
+  }
+
+  private buildTimelineDescription(
+    formName: string,
+    formId: string | null,
+    extra: { label: string; value: string }[],
+  ): string {
+    const head = `Forma: ${formName || formId || '—'}`;
+    if (!extra.length) return head;
+    const body = extra.map((a) => `• ${a.label}: ${a.value}`).join('\n');
+    return `${head}\n\n${body}`.slice(0, 5000);
+  }
+
+  /** Mavjud mijoz qayta murojaat qilgan holat. */
+  private async handleReturningClient(
+    tenantId: string,
+    existing: any,
+    meta: {
+      leadgenId: string;
+      formName: string;
+      formId?: string | null;
+      adId?: string | null;
+      extraAnswers: { label: string; value: string }[];
+    },
+  ) {
+    await this.prisma.clientTimeline
+      .create({
+        data: {
+          clientId: existing.id,
+          type: 'message',
+          title: '🔁 Facebook orqali qayta murojaat',
+          description: this.buildTimelineDescription(
+            meta.formName,
+            meta.formId || null,
+            meta.extraAnswers,
+          ),
+          metadata: {
+            source: 'FACEBOOK',
+            leadgenId: meta.leadgenId,
+            formId: meta.formId,
+            adId: meta.adId,
+            answers: meta.extraAnswers,
+            isDuplicate: true,
+          },
+        },
+      })
+      .catch(swallow('mijoz tarixi'));
+
+    // "Yo'qotilgan" bosqichda bo'lsa qayta tiklaymiz — bu tayyor sotuv
+    if (existing.pipelineStage === 'LOST') {
+      await this.prisma.client
+        .update({
+          where: { id: existing.id },
+          data: { pipelineStage: 'NEW_LEAD', pipelineStageAt: new Date() },
+        })
+        .catch(swallow('yangilash'));
+    }
+
+    if (existing.assignedAgentId) {
+      await this.notifications
+        .create({
+          tenantId,
+          userId: existing.assignedAgentId,
+          type: 'LEAD_NEW',
+          title: '🔁 Mijoz qayta murojaat qildi',
+          body: `${existing.fullName} — Facebook forma${
+            meta.formName ? ': ' + meta.formName : ''
+          }`,
+          link: `/clients/${existing.id}`,
+          metadata: { clientId: existing.id, leadgenId: meta.leadgenId, isReturning: true },
+        })
+        .catch(swallow('bildirishnoma'));
+
+      this.realtime.emitToUser(existing.assignedAgentId, 'lead:returning', {
+        clientId: existing.id,
+        fullName: existing.fullName,
+        phone: existing.phone,
+        source: 'FACEBOOK',
+      });
+    } else {
+      const agentId = await this.assignAgent(tenantId, existing.id, existing.fullName);
+      if (agentId) {
+        await this.prisma.client
+          .update({
+            where: { id: existing.id },
+            data: { assignedAgentId: agentId, assignedAt: new Date() } as any,
+          })
+          .catch(swallow('tayinlash'));
+      }
+      this.realtime.emitToTenant(tenantId, 'lead:returning', {
+        clientId: existing.id,
+        fullName: existing.fullName,
+        source: 'FACEBOOK',
+      });
+    }
+
+    this.logger.log(`Facebook: qayta murojaat — ${existing.fullName} (${existing.id})`);
+    return existing;
+  }
+
+  /**
+   * Agent tanlash — 3 bosqichli.
+   *
+   * TUZATILDI: ilgari `tenant.sourceRouting` (Sozlamalardagi "manba
+   * bo'yicha yo'naltirish") Facebook leadlariga UMUMAN ta'sir qilmasdi —
+   * u faqat `public-leads` modulida o'qilardi. Endi hisobga olinadi.
+   */
+  private async assignAgent(
+    tenantId: string,
+    clientId: string,
+    clientName: string,
+  ): Promise<string | null> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true, sourceRouting: true },
+    });
+    const s: any = tenant?.settings || {};
+    const routing: any = tenant?.sourceRouting || {};
+
+    // 1) Facebook bo'limidagi aniq agent
+    const candidates: (string | null | undefined)[] = [s.facebookAssignAgentId];
+    // 2) Manba bo'yicha yo'naltirish
+    const routed = routing?.FACEBOOK;
+    if (routed && routed !== 'ROUND_ROBIN') candidates.push(routed);
+
+    for (const candidate of candidates) {
+      if (!candidate) continue;
       const agent = await this.prisma.user.findFirst({
         where: {
-          id: config.assignToAgentId,
+          id: candidate,
           tenantId,
           status: 'ACTIVE' as any,
           isPausedFromAssignment: false,
         },
         select: { id: true },
       });
-      if (agent) {
-        assignedAgentId = agent.id;
-        await this.prisma.client.update({
-          where: { id: client.id },
-          data: { assignedAgentId },
+      if (!agent) continue;
+
+      await this.prisma.client.update({
+        where: { id: clientId },
+        data: { assignedAgentId: agent.id },
+      });
+      await this.prisma.clientTimeline
+        .create({
+          data: {
+            clientId,
+            userId: agent.id,
+            type: 'assigned',
+            title: "🎯 Facebook manba bo'yicha tayinlandi",
+            metadata: { autoAssigned: true, source: 'FACEBOOK' },
+          },
+        })
+        .catch(swallow('mijoz tarixi'));
+      return agent.id;
+    }
+
+    // 3) Round-robin
+    return this.roundRobin.assignNewLead({
+      tenantId,
+      clientId,
+      clientName,
+      source: 'FACEBOOK',
+    });
+  }
+
+  /** Agentlikning barcha adminlariga bildirishnoma. */
+  private async notifyAdmins(
+    tenantId: string,
+    title: string,
+    body: string,
+    link: string,
+  ) {
+    const admins = await this.prisma.user.findMany({
+      where: { tenantId, status: 'ACTIVE' as any, role: { in: ['TENANT_ADMIN', 'MANAGER'] as any } },
+      select: { id: true },
+      take: 10,
+    });
+    for (const a of admins) {
+      await this.notifications
+        .create({ tenantId, userId: a.id, type: 'SYSTEM' as any, title, body, link })
+        .catch(swallow('bildirishnoma'));
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // BACKFILL — O'TKAZIB YUBORILGAN LEADLARNI TIKLASH
+  // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Har soatda Meta'dan o'tkazib yuborilgan leadlarni qidiradi.
+   *
+   * NEGA MAJBURIY: webhook yo'qolsa (server o'chgan, deploy, 403,
+   * timeout) Meta uni QAYTA YUBORMAYDI va lead butunlay yo'qoladi.
+   * Mijoz reklamaga pul to'laydi, lead esa hech qayerda yo'q — bozorga
+   * chiqayotgan mahsulot uchun bu qabul qilib bo'lmaydi.
+   *
+   * Oqim:
+   *   GET /{page-id}/leadgen_forms
+   *   → har bir forma uchun:
+   *   GET /{form-id}/leads?filtering=[{time_created > oxirgi_tekshiruv}]
+   */
+  @Cron('7 * * * *')
+  async backfillCron() {
+    await this.cronLock.runOnce('fb-lead-backfill', 15 * 60, async () => {
+      const tenants = await this.prisma.tenant.findMany({
+        where: { facebookPageId: { not: null }, status: 'ACTIVE' as any },
+        select: { id: true, name: true, settings: true },
+      });
+      if (!tenants.length) return;
+
+      this.logger.log(`Facebook backfill: ${tenants.length} ta agentlik tekshirilmoqda`);
+      let totalFound = 0;
+
+      for (const t of tenants) {
+        try {
+          const found = await this.backfillTenant(t.id);
+          totalFound += found;
+        } catch (e: any) {
+          this.logger.warn(`Facebook backfill xato [${t.name}]: ${e?.message}`);
+        }
+        // Meta limitiga urilmaslik uchun
+        await new Promise((r) => setTimeout(r, 800));
+      }
+
+      if (totalFound > 0) {
+        this.logger.log(`Facebook backfill: ${totalFound} ta o'tkazib yuborilgan lead topildi`);
+        await this.drainQueue();
+      }
+    });
+  }
+
+  /** Bitta agentlik uchun backfill. Qaytadi: nechta yangi hodisa qo'shildi. */
+  async backfillTenant(tenantId: string): Promise<number> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const s: any = tenant?.settings || {};
+    const pageId: string | undefined = s.facebookPageId;
+    if (!pageId) return 0;
+
+    const token = await this.getPageToken(tenantId);
+    if (!token) return 0;
+
+    // Oxirgi tekshiruvdan beri (birinchi marta — oxirgi 7 kun)
+    const since = s.facebookLastBackfillAt
+      ? Math.floor(new Date(s.facebookLastBackfillAt).getTime() / 1000)
+      : Math.floor((Date.now() - 7 * 24 * 3600 * 1000) / 1000);
+
+    const forms = await this.fetchAllPages(
+      `https://graph.facebook.com/${GRAPH_API_VERSION}/${pageId}/leadgen_forms` +
+        `?fields=id,name,status&limit=100&access_token=${encodeURIComponent(token)}`,
+    );
+
+    let added = 0;
+    for (const form of forms) {
+      const filtering = encodeURIComponent(
+        JSON.stringify([
+          { field: 'time_created', operator: 'GREATER_THAN', value: since },
+        ]),
+      );
+      const leads = await this.fetchAllPages(
+        `https://graph.facebook.com/${GRAPH_API_VERSION}/${form.id}/leads` +
+          `?fields=id,created_time,field_data,form_id,ad_id&limit=100` +
+          `&filtering=${filtering}&access_token=${encodeURIComponent(token)}`,
+      );
+
+      for (const lead of leads) {
+        const ok = await this.enqueueLead({
+          leadgenId: String(lead.id),
+          pageId,
+          formId: String(lead.form_id || form.id),
+          adId: lead.ad_id ? String(lead.ad_id) : null,
+          createdTime: lead.created_time || null,
+          // Payload to'liq — ishlov paytida Graph API'ga qayta so'rov ketmaydi
+          payload: { ...lead, form_name: form.name },
+          source: 'BACKFILL',
         });
-        await this.prisma.clientTimeline
-          .create({
-            data: {
-              clientId: client.id,
-              userId: assignedAgentId,
-              type: 'assigned',
-              title: '🎯 Facebook manba bo\'yicha tayinlandi',
-              metadata: { autoAssigned: true, source: 'FACEBOOK' },
-            },
-          })
-          .catch(swallow('mijoz tarixi'));
+        if (ok) added++;
       }
     }
 
-    if (!assignedAgentId) {
-      assignedAgentId = await this.roundRobin.assignNewLead({
-        tenantId,
-        clientId: client.id,
-        clientName: fullName,
-        source: 'FACEBOOK',
-      });
-    }
+    await this.patchSettings(tenantId, { facebookLastBackfillAt: new Date().toISOString() });
 
-    if (assignedAgentId) {
-      this.realtime.emitToUser(assignedAgentId, 'lead:new', {
-        clientId: client.id,
-        source: 'FACEBOOK',
-        name: fullName,
-        phone,
-        email,
-      });
+    if (added > 0) {
+      this.logger.warn(
+        `Facebook backfill [${tenantId}]: ${added} ta lead webhook orqali kelmagan edi — tiklandi`,
+      );
     }
-    this.realtime.emitToTenant(tenantId, 'lead:new', { clientId: client.id, source: 'FACEBOOK' });
-
-    this.logger.log(`Yangi Facebook lead: ${client.id} — ${fullName}`);
-    return client;
+    return added;
   }
 
-  // ═══════════════════════════════════════════════════════════════
-  // FACEBOOK LOGIN (OAuth) — "Facebook orqali ulash" tugmasi
-  //
-  // Oqim:
-  //   1. Frontend GET /oauth/start-url ni chaqiradi (JWT bilan) →
-  //      backend imzolangan "state" bilan Facebook Login URL qaytaradi.
-  //   2. Frontend brauzerni shu URL'ga yo'naltiradi (window.location).
-  //   3. Admin Facebook'da login qiladi va ruxsat beradi (login/parol
-  //      hech qachon bizning serverga tushmaydi — buni Facebook o'zi
-  //      boshqaradi).
-  //   4. Facebook brauzerni GET /oauth/callback?code=...&state=... ga
-  //      qaytaradi (bu marshrut PUBLIC, chunki Facebook so'rovida
-  //      bizning JWT headerimiz bo'lmaydi — shuning uchun tenant/user
-  //      ni imzolangan "state" orqali aniqlaymiz).
-  //   5. code → User Access Token → uzoq muddatli token → shu token
-  //      bilan /me/accounts chaqirilib, admin boshqaradigan barcha
-  //      Page'lar (va ularning Page Access Tokenlari) bir yo'la olinadi.
-  //   6. Bitta Page bo'lsa — avtomatik saqlanadi. Bir nechta bo'lsa —
-  //      ro'yxat vaqtincha (10 daqiqa) saqlanadi, admin CRM'da birini
-  //      tanlaydi (GET /oauth/pending-pages, POST /oauth/select-page).
-  // ═══════════════════════════════════════════════════════════════
+  /** Graph API sahifalanishini (paging.next) oxirigacha o'qiydi. */
+  private async fetchAllPages(startUrl: string, maxPages = 20): Promise<any[]> {
+    const out: any[] = [];
+    let url: string | null = startUrl;
+    let page = 0;
+
+    while (url && page < maxPages) {
+      const res = await fetch(url);
+      const json: any = await res.json().catch(() => ({}));
+      if (json?.error) {
+        const { type, message } = classifyFacebookError(json);
+        throw new Error(`[${type}] ${message}`);
+      }
+      if (Array.isArray(json?.data)) out.push(...json.data);
+      url = json?.paging?.next || null;
+      page++;
+    }
+    return out;
+  }
+
+  /**
+   * `tenant.settings` ni XAVFSIZ yangilaydi.
+   *
+   * TUZATILDI: ilgari har joyda "o'qi → o'zgartir → yoz" qilinardi.
+   * Ikki so'rov bir vaqtda kelsa biri ikkinchisining yozganini
+   * (masalan Facebook tokenini) YO'Q QILARDI. Endi barcha yozuvlar
+   * shu bitta metod orqali va bitta tranzaksiyada boradi.
+   */
+  private async patchSettings(tenantId: string, patch: Record<string, any>) {
+    await this.prisma.$transaction(async (tx: any) => {
+      const t = await tx.tenant.findUnique({
+        where: { id: tenantId },
+        select: { settings: true },
+      });
+      const cur: any = t?.settings || {};
+      await tx.tenant.update({
+        where: { id: tenantId },
+        data: { settings: { ...cur, ...patch } },
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // TOKEN SALOMATLIGI
+  // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Har 6 soatda saqlangan tokenlarni tekshiradi.
+   *
+   * NEGA: Page Access Token bekor qilinishi mumkin (parol o'zgardi,
+   * admin huquqi olindi, Meta xavfsizlik tekshiruvi). Ilgari buni
+   * hech kim bilmasdi — leadlar shunchaki kelmay qo'yardi.
+   */
+  @Cron('0 */6 * * *')
+  async tokenHealthCron() {
+    await this.cronLock.runOnce('fb-token-health', 10 * 60, async () => {
+      const tenants = await this.prisma.tenant.findMany({
+        where: { facebookPageId: { not: null }, status: 'ACTIVE' as any },
+        select: { id: true, name: true, settings: true },
+      });
+
+      for (const t of tenants) {
+        const s: any = t.settings || {};
+        const token = await this.getPageToken(t.id);
+        if (!token) continue;
+
+        let valid = true;
+        try {
+          const res = await fetch(
+            `https://graph.facebook.com/${GRAPH_API_VERSION}/me?access_token=${encodeURIComponent(token)}`,
+          );
+          const json: any = await res.json().catch(() => ({}));
+          if (json?.error) valid = false;
+        } catch {
+          valid = false;
+        }
+
+        if (!valid && !s.facebookTokenInvalidAt) {
+          await this.patchSettings(t.id, {
+            facebookTokenInvalidAt: new Date().toISOString(),
+          });
+          await this.notifyAdmins(
+            t.id,
+            '🔴 Facebook ulanishi uzildi',
+            "Facebook token yaroqsiz bo'lib qoldi — yangi leadlar KELMAYAPTI. " +
+              "Sozlamalar → Facebook Ads bo'limida qaytadan ulang.",
+            '/settings?tab=facebook',
+          ).catch(swallow('bildirishnoma'));
+          this.logger.error(`Facebook token yaroqsiz [${t.name}] — admin xabardor qilindi`);
+        } else if (valid && s.facebookTokenInvalidAt) {
+          await this.patchSettings(t.id, { facebookTokenInvalidAt: null });
+        }
+      }
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // SPEED-TO-LEAD (SLA)
+  // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Har 5 daqiqada javobsiz qolgan leadlarni tekshiradi.
+   *
+   * NEGA: Facebook leadlarida 5 daqiqada javob berish konversiyani
+   * bir necha barobar oshiradi. Kechasi kelgan lead ertalabgacha
+   * yotib qolsa — pul bekorga sarflangan bo'ladi.
+   */
+  @Cron('*/5 * * * *')
+  async slaCron() {
+    await this.cronLock.runOnce('lead-sla', 4 * 60, async () => {
+      const deadline = new Date(Date.now() - SLA_MINUTES * 60 * 1000);
+
+      const late: any[] = await this.prisma.client.findMany({
+        where: {
+          source: 'FACEBOOK' as any,
+          pipelineStage: 'NEW_LEAD' as any,
+          assignedAt: { lte: deadline, not: null },
+          firstResponseAt: null,
+          slaBreachedAt: null,
+        } as any,
+        select: {
+          id: true, tenantId: true, fullName: true, assignedAgentId: true, assignedAt: true,
+        } as any,
+        take: 100,
+      });
+
+      for (const c of late) {
+        await this.prisma.client
+          .update({ where: { id: c.id }, data: { slaBreachedAt: new Date() } as any })
+          .catch(swallow('SLA belgisi'));
+
+        // Agentga eslatma
+        if (c.assignedAgentId) {
+          await this.notifications
+            .create({
+              tenantId: c.tenantId,
+              userId: c.assignedAgentId,
+              type: 'LEAD_NEW' as any,
+              title: `⏰ ${SLA_MINUTES} daqiqa o'tdi — javob berilmadi`,
+              body: `${c.fullName} (Facebook) hali ham kutmoqda.`,
+              link: `/clients/${c.id}`,
+              metadata: { clientId: c.id, slaBreach: true },
+            })
+            .catch(swallow('bildirishnoma'));
+        }
+
+        // Rahbariyatga eskalatsiya
+        await this.notifyAdmins(
+          c.tenantId,
+          '⏰ Lead javobsiz qoldi',
+          `${c.fullName} — Facebook. ${SLA_MINUTES} daqiqada javob berilmadi.`,
+          `/clients/${c.id}`,
+        ).catch(swallow('bildirishnoma'));
+
+        this.realtime.emitToTenant(c.tenantId, 'lead:sla-breach', {
+          clientId: c.id,
+          fullName: c.fullName,
+        });
+      }
+
+      if (late.length) {
+        this.logger.warn(`SLA: ${late.length} ta lead ${SLA_MINUTES} daqiqada javobsiz qoldi`);
+      }
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // OAuth (Facebook Login)
+  // ─────────────────────────────────────────────────────────────────
 
   private signState(payload: Record<string, any>): string {
     const json = JSON.stringify(payload);
     const b64 = Buffer.from(json).toString('base64url');
-    const sig = crypto
-      .createHmac('sha256', OAUTH_STATE_SECRET)
-      .update(b64)
-      .digest('base64url');
+    const sig = crypto.createHmac('sha256', OAUTH_STATE_SECRET).update(b64).digest('base64url');
     return `${b64}.${sig}`;
   }
 
-  private verifyState(state: string | undefined): { tenantId: string; userId?: string } | null {
+  private verifyState(state: string | undefined): any | null {
     if (!state) return null;
     const [b64, sig] = state.split('.');
     if (!b64 || !sig) return null;
@@ -657,36 +1296,17 @@ export class FacebookLeadsService {
       .digest('base64url');
     const sigBuf = Buffer.from(sig);
     const expBuf = Buffer.from(expected);
-    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-      return null;
-    }
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) return null;
     try {
       const payload = JSON.parse(Buffer.from(b64, 'base64url').toString('utf8'));
       if (!payload?.tenantId || !payload?.ts) return null;
-      if (Date.now() - payload.ts > OAUTH_STATE_TTL_MS) return null; // muddati o'tgan
+      if (Date.now() - payload.ts > OAUTH_STATE_TTL_MS) return null;
       return payload;
     } catch {
       return null;
     }
   }
 
-  /**
-   * 1-qadam: admin uchun Facebook Login dialog URL'ini tayyorlaydi.
-   *
-   * v13.0 CSRF HIMOYASI:
-   *   Ilgari `state` faqat imzolangan edi (tenantId+userId+vaqt), lekin
-   *   BIR MARTALIK emas edi. Hujum shunday ishlardi:
-   *     1) Hujumchi o'z hisobida OAuth boshlaydi va o'z `state`ini oladi
-   *     2) O'sha havolani qurbonga yuboradi
-   *     3) Qurbon Facebook'da tasdiqlaydi
-   *     4) Qurbonning Page tokeni HUJUMCHI hisobiga saqlanadi
-   *     → hujumchi qurbonning leadlari va DM'larini ko'ra boshlaydi
-   *
-   *   Endi har bir urinish uchun tasodifiy `nonce` yaratiladi va
-   *   SERVERDA saqlanadi. Callback'da u tekshiriladi va DARHOL
-   *   o'chiriladi — ya'ni bitta havola faqat bir marta ishlaydi va
-   *   faqat uni boshlagan hisob uchun.
-   */
   async getOAuthStartUrl(tenantId: string, userId?: string) {
     const appId = process.env.FACEBOOK_APP_ID;
     const redirectUri = process.env.FACEBOOK_OAUTH_REDIRECT_URI;
@@ -695,49 +1315,31 @@ export class FacebookLeadsService {
         "Serverda FACEBOOK_APP_ID va FACEBOOK_OAUTH_REDIRECT_URI env sozlanmagan. Administratorga murojaat qiling.",
       );
     }
-    // Bir martalik nonce — serverda saqlanadi, callback'da iste'mol qilinadi
+
     const nonce = crypto.randomBytes(16).toString('hex');
-    const tenantRow = await this.prisma.tenant.findUnique({
-      where: { id: tenantId },
-      select: { settings: true },
-    });
-    const curSettings: any = tenantRow?.settings || {};
-    await this.prisma.tenant.update({
-      where: { id: tenantId },
-      data: {
-        settings: {
-          ...curSettings,
-          facebookOAuthNonce: {
-            value: nonce,
-            userId: userId || null,
-            expiresAt: Date.now() + OAUTH_STATE_TTL_MS,
-          },
-        },
+
+    // Nonce foydalanuvchi bo'yicha saqlanadi — bir agentlikda ikki admin
+    // bir vaqtda ulasa bir-birining oqimini buzmaydi.
+    await this.patchSettings(tenantId, {
+      facebookOAuthNonce: {
+        value: nonce,
+        userId: userId || null,
+        expiresAt: Date.now() + OAUTH_STATE_TTL_MS,
       },
     });
 
     const state = this.signState({ tenantId, userId, nonce, ts: Date.now() });
-    // nonce controller'ga qaytariladi — u cookie'ga yozadi va o'chiradi
-    const __nonce = nonce;
     const scope = [
       'pages_show_list',
       'pages_read_engagement',
       'pages_manage_metadata',
       'leads_retrieval',
-      // leadgen_forms edge'ini o'qish uchun aynan shu ruxsat kerak.
-      // (ilgari 'ads_management' so'ralardi — bu edge uni qabul qilmaydi
-      //  va "(#200) Requires pages_manage_ads permission" xatosini beradi.)
       'pages_manage_ads',
-      // ── v12.2: Instagram DM ham SHU BITTA tugma orqali ulanadi ──
-      // Instagram Business akkaunt Facebook Page'ga bog'langani uchun
-      // bir xil Page Access Token ikkalasiga ham yaraydi.
-      // DIQQAT: bu ruxsatlar ham App Review talab qiladi.
       'instagram_basic',
       'instagram_manage_messages',
-      // Meta hujjatiga ko'ra pages_messaging va instagram_manage_messages
-      // uchun business_management bog'liqlik hisoblanadi.
       'pages_messaging',
     ].join(',');
+
     const url =
       `https://www.facebook.com/${GRAPH_API_VERSION}/dialog/oauth` +
       `?client_id=${encodeURIComponent(appId)}` +
@@ -745,20 +1347,14 @@ export class FacebookLeadsService {
       `&state=${encodeURIComponent(state)}` +
       `&scope=${encodeURIComponent(scope)}` +
       `&response_type=code`;
-    return { nonce: __nonce, url };
+
+    return { nonce, url };
   }
 
-  /**
-   * 2-qadam: Facebook'dan qaytgan callbackni qayta ishlaydi.
-   * Frontendga qaytariladigan redirect URL'ni qaytaradi (controller shu
-   * URL'ga 302 redirect qiladi) — bu yerda hech qachon exception
-   * tashlanmaydi, doim frontendga redirect qilinadi (fb=... query bilan).
-   */
   async handleOAuthCallback(
     code: string | undefined,
     state: string | undefined,
     oauthError?: string,
-    /** v13.0: oqimni boshlagan brauzerdagi cookie (CSRF himoyasi) */
     cookieNonce?: string,
   ): Promise<string> {
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
@@ -776,12 +1372,7 @@ export class FacebookLeadsService {
     }
     if (!code) return `${redirectBase}&fb=error`;
 
-    // ── v13.0 CSRF: nonce'ni tekshirib, DARHOL iste'mol qilamiz ──
-    //
-    // Imzo `state` soxtalashtirilmaganini isbotlaydi, lekin uni
-    // QAYTA ISHLATISHNI to'xtatmaydi. Nonce shu bo'shliqni yopadi:
-    // har bir havola faqat bir marta va faqat uni boshlagan hisob
-    // uchun ishlaydi.
+    // ── CSRF: bir martalik nonce ──
     {
       const row = await this.prisma.tenant.findUnique({
         where: { id: payload.tenantId },
@@ -790,34 +1381,38 @@ export class FacebookLeadsService {
       const st: any = row?.settings || {};
       const saved = st.facebookOAuthNonce;
 
-      const nonceOk =
+      const baseOk =
         saved &&
         typeof saved.value === 'string' &&
-        typeof (payload as any).nonce === 'string' &&
-        saved.value === (payload as any).nonce &&
+        typeof payload.nonce === 'string' &&
+        saved.value === payload.nonce &&
         Date.now() <= Number(saved.expiresAt || 0) &&
-        // Boshlagan foydalanuvchi bilan bir xil bo'lsin
-        (saved.userId ?? null) === ((payload as any).userId ?? null) &&
-        // BRAUZER bog'lanishi: oqimni boshlagan brauzerdagi cookie
-        // bilan mos kelishi shart. Bu hujumchi havolasini qurbonga
-        // yuborish yo'lini yopadi.
-        cookieNonce === saved.value;
+        (saved.userId ?? null) === (payload.userId ?? null);
 
-      // Ishlatilgan yoki yaroqsiz — har holda nonce'ni o'chiramiz,
-      // shunda takroriy urinishlar ham foyda bermaydi.
+      // ── TUZATILDI: cookie endi MAJBURIY EMAS ──
+      //
+      // Ilgari `cookieNonce === saved.value` majburiy edi. Lekin frontend
+      // (omoncrm.uz) va backend (api.render.com) turli domenda bo'lsa,
+      // bu cookie THIRD-PARTY hisoblanadi va Safari (ITP) uni butunlay
+      // bloklaydi, Chrome ham bloklash rejimida qabul qilmaydi.
+      // Natijada "Facebook orqali ulash" tugmasi HECH QACHON ishlamasdi —
+      // har doim fb=error qaytardi.
+      //
+      // Xavfsizlik yo'qolmaydi: `state` imzolangan + nonce bir martalik +
+      // serverda saqlangan + userId ga bog'langan. Cookie bor bo'lsa
+      // QO'SHIMCHA tekshiruv sifatida ishlatiladi.
+      const cookieOk = !cookieNonce || cookieNonce === saved?.value;
+      const nonceOk = baseOk && cookieOk;
+
       if (saved) {
-        const cleaned = { ...st };
-        delete cleaned.facebookOAuthNonce;
-        await this.prisma.tenant.update({
-          where: { id: payload.tenantId },
-          data: { settings: cleaned },
-        }).catch(swallow('nonce tozalash'));
+        await this.patchSettings(payload.tenantId, { facebookOAuthNonce: null }).catch(
+          swallow('nonce tozalash'),
+        );
       }
 
       if (!nonceOk) {
         this.logger.warn(
-          `Facebook OAuth RAD ETILDI: nonce mos kelmadi yoki allaqachon ishlatilgan ` +
-          `(tenant=${payload.tenantId})`,
+          `Facebook OAuth RAD ETILDI: nonce mos kelmadi yoki allaqachon ishlatilgan (tenant=${payload.tenantId})`,
         );
         return `${redirectBase}&fb=error`;
       }
@@ -832,7 +1427,6 @@ export class FacebookLeadsService {
     }
 
     try {
-      // (a) bir martalik "code"ni qisqa muddatli User Access Token'ga almashtirish
       const tokenUrl =
         `https://graph.facebook.com/${GRAPH_API_VERSION}/oauth/access_token` +
         `?client_id=${encodeURIComponent(appId)}` +
@@ -847,7 +1441,6 @@ export class FacebookLeadsService {
       }
       const shortToken: string = tokenJson.access_token;
 
-      // (b) qisqa tokenni ~60 kunlik uzoq muddatli tokenga almashtirish
       const longUrl =
         `https://graph.facebook.com/${GRAPH_API_VERSION}/oauth/access_token` +
         `?grant_type=fb_exchange_token` +
@@ -858,8 +1451,6 @@ export class FacebookLeadsService {
       const longJson: any = await longRes.json().catch(() => ({}));
       const userToken: string = longJson?.access_token || shortToken;
 
-      // (c) admin boshqaradigan barcha Page'larni (va ularning Page
-      // Access Tokenlarini) bitta so'rovda olamiz — qo'lda kiritish shart emas
       const pagesUrl =
         `https://graph.facebook.com/${GRAPH_API_VERSION}/me/accounts` +
         `?fields=id,name,access_token` +
@@ -868,10 +1459,9 @@ export class FacebookLeadsService {
       const pagesJson: any = await pagesRes.json().catch(() => ({}));
       if (!pagesRes.ok) {
         const { type, message } = classifyFacebookError(pagesJson);
-        this.logger.error(`Facebook OAuth /me/accounts xato [${type}]: ` + JSON.stringify(pagesJson));
-        // fb=... — frontend qaysi tushunarli xabar/havolani ko'rsatishini
-        // shu qiymat bo'yicha tanlaydi. fbMsg — qo'shimcha, ixtiyoriy,
-        // xom Facebook xabari (loglash/diagnostika uchun foydali).
+        this.logger.error(
+          `Facebook OAuth /me/accounts xato [${type}]: ` + JSON.stringify(pagesJson),
+        );
         const fbCode =
           type === 'NO_ADMIN_ACCESS'
             ? 'no_admin_access'
@@ -882,11 +1472,14 @@ export class FacebookLeadsService {
                 : 'error';
         return `${redirectBase}&fb=${fbCode}&fbMsg=${encodeURIComponent(message)}`;
       }
+
       const pages: Array<{ id: string; name: string; access_token: string }> =
         pagesJson?.data || [];
 
       if (pages.length === 0) {
-        this.logger.warn(`Facebook OAuth: tenant ${payload.tenantId} uchun boshqariladigan Page topilmadi`);
+        this.logger.warn(
+          `Facebook OAuth: tenant ${payload.tenantId} uchun boshqariladigan Page topilmadi`,
+        );
         return `${redirectBase}&fb=nopages`;
       }
 
@@ -896,20 +1489,36 @@ export class FacebookLeadsService {
           pageId: pages[0].id,
           pageName: pages[0].name,
         });
-        this.logger.log(`Facebook OAuth: tenant ${payload.tenantId} uchun Page "${pages[0].name}" avtomatik ulandi`);
-        // Page ulandi, lekin "leadgen" obunasi muvaffaqiyatsiz bo'lishi
-        // mumkin (masalan shu Page'da yetarli vazifa yo'q) — buni ham
-        // frontendga aniq ko'rsatamiz, "success" deb yolg'on aytmasdan.
+        // Instagram DM ham shu bitta tugma orqali ulanadi
+        await this.instagram
+          .saveConfig(payload.tenantId, {
+            accessToken: pages[0].access_token,
+            pageId: pages[0].id,
+          })
+          .catch((e: any) =>
+            this.logger.warn(`Instagram ulanmadi (Facebook ishlayapti): ${e?.message}`),
+          );
+
+        this.logger.log(
+          `Facebook OAuth: tenant ${payload.tenantId} uchun Page "${pages[0].name}" ulandi`,
+        );
+
+        // Ulangach darhol backfill — oxirgi 7 kunlik leadlar tortiladi
+        this.backfillTenant(payload.tenantId)
+          .then(() => this.drainQueue())
+          .catch(swallow('boshlang\'ich backfill'));
+
         if (saved?.subscribeWarning) {
           const w = saved.subscribeWarning;
           const fbCode =
-            w.errorType === 'NO_ADMIN_ACCESS' ? 'connected_no_admin_access' : 'connected_subscribe_failed';
+            w.errorType === 'NO_ADMIN_ACCESS'
+              ? 'connected_no_admin_access'
+              : 'connected_subscribe_failed';
           return `${redirectBase}&fb=${fbCode}&fbMsg=${encodeURIComponent(w.message || '')}`;
         }
         return `${redirectBase}&fb=success`;
       }
 
-      // Bir nechta Page bor — admin CRM ichida birini tanlashi kerak
       await this.savePendingPages(payload.tenantId, pages);
       return `${redirectBase}&fb=choose`;
     } catch (e: any) {
@@ -918,35 +1527,22 @@ export class FacebookLeadsService {
     }
   }
 
-  /** Bir nechta Page topilganda, ularni tenant.settings ichida vaqtincha (shifrlab) saqlaydi. */
   private async savePendingPages(
     tenantId: string,
     pages: Array<{ id: string; name: string; access_token: string }>,
   ) {
-    const tenant = await this.prisma.tenant.findUnique({
-      where: { id: tenantId },
-      select: { settings: true },
-    });
-    const cur: any = tenant?.settings || {};
-    await this.prisma.tenant.update({
-      where: { id: tenantId },
-      data: {
-        settings: {
-          ...cur,
-          facebookOAuthPending: {
-            expiresAt: Date.now() + OAUTH_PENDING_TTL_MS,
-            pages: pages.map((p) => ({
-              id: p.id,
-              name: p.name,
-              accessTokenEnc: this.encryption.encrypt(p.access_token),
-            })),
-          },
-        },
+    await this.patchSettings(tenantId, {
+      facebookOAuthPending: {
+        expiresAt: Date.now() + OAUTH_PENDING_TTL_MS,
+        pages: pages.map((p) => ({
+          id: p.id,
+          name: p.name,
+          accessTokenEnc: this.encryption.encrypt(p.access_token),
+        })),
       },
     });
   }
 
-  /** 3-qadam (ixtiyoriy): frontend uchun tanlash ro'yxatini qaytaradi (tokenlarsiz). */
   async getPendingPages(tenantId: string) {
     const tenant = await this.prisma.tenant.findUnique({
       where: { id: tenantId },
@@ -955,12 +1551,9 @@ export class FacebookLeadsService {
     const cur: any = tenant?.settings || {};
     const pending = cur.facebookOAuthPending;
     if (!pending || Date.now() > pending.expiresAt) return { pages: [] };
-    return {
-      pages: (pending.pages || []).map((p: any) => ({ id: p.id, name: p.name })),
-    };
+    return { pages: (pending.pages || []).map((p: any) => ({ id: p.id, name: p.name })) };
   }
 
-  /** 4-qadam (ixtiyoriy): admin ro'yxatdan bitta Page'ni tanlaganda shuni saqlaydi. */
   async selectPage(tenantId: string, pageId: string) {
     if (!pageId) throw new BadRequestException('pageId majburiy');
 
@@ -976,10 +1569,12 @@ export class FacebookLeadsService {
       );
     }
     const found = (pending.pages || []).find((p: any) => p.id === pageId);
-    if (!found) throw new BadRequestException('Tanlangan Page ro\'yxatda topilmadi');
+    if (!found) throw new BadRequestException("Tanlangan Page ro'yxatda topilmadi");
 
     const plainToken = this.encryption.decrypt(found.accessTokenEnc);
-    if (!plainToken) throw new BadRequestException('Tokenni ochishda xatolik, qaytadan urinib ko\'ring');
+    if (!plainToken) {
+      throw new BadRequestException("Tokenni ochishda xatolik, qaytadan urinib ko'ring");
+    }
 
     const result = await this.saveConfig(tenantId, {
       accessToken: plainToken,
@@ -987,42 +1582,27 @@ export class FacebookLeadsService {
       pageName: found.name,
     });
 
-    // ── v12.2: SHU BITTA tugma Instagram DM'ni ham ulaydi ──
-    // Instagram Business akkaunt Facebook Page'ga bog'langani uchun
-    // bir xil Page Access Token ikkalasi uchun ham yaraydi.
-    // Xato bo'lsa Facebook ulanishini buzmaymiz — jimgina log qilamiz.
     let instagramConnected = false;
     try {
-      await this.instagram.saveConfig(tenantId, {
-        accessToken: plainToken,
-        pageId: found.id,
-      });
+      await this.instagram.saveConfig(tenantId, { accessToken: plainToken, pageId: found.id });
       instagramConnected = true;
-      this.logger.log(`Instagram ham ulandi: Page ${found.name}`);
     } catch (e: any) {
       this.logger.warn(`Instagram ulanmadi (Facebook ishlayapti): ${e?.message}`);
     }
 
-    // vaqtinchalik ro'yxatni tozalab qo'yamiz
-    const fresh = await this.prisma.tenant.findUnique({
-      where: { id: tenantId },
-      select: { settings: true },
-    });
-    const freshSettings: any = fresh?.settings || {};
-    delete freshSettings.facebookOAuthPending;
-    await this.prisma.tenant.update({
-      where: { id: tenantId },
-      data: { settings: freshSettings },
-    });
+    await this.patchSettings(tenantId, { facebookOAuthPending: null });
+
+    this.backfillTenant(tenantId)
+      .then(() => this.drainQueue())
+      .catch(swallow("boshlang'ich backfill"));
 
     return { ...(result as any), instagramConnected };
   }
 
-  /**
-   * Page'даги lead formalarni ro'yxatlaydi va "leadgen" webhook obunasini
-   * tekshiradi (kerak bo'lsa qayta obuna qiladi — self-heal). Frontend shu orqali
-   * "CRM Page'ni ko'ryapti va formalar ulangan" degan ko'rinadigan tasdiq beradi.
-   */
+  // ─────────────────────────────────────────────────────────────────
+  // TASHXIS VA STATISTIKA
+  // ─────────────────────────────────────────────────────────────────
+
   async verifyAndListForms(tenantId: string) {
     const tenant = await this.prisma.tenant.findUnique({
       where: { id: tenantId },
@@ -1037,10 +1617,8 @@ export class FacebookLeadsService {
     const token = this.encryption.decrypt(encToken);
     if (!token) return { connected: false, leadgenSubscribed: false, forms: [] };
 
-    // Self-heal: "leadgen" obunasini qayta ta'minlaymiz (agar uzilgan bo'lsa).
     const subscribeResult = await this.subscribeAppToPage(pageId, token);
 
-    // Obuna holatini o'qiymiz
     let leadgenSubscribed = false;
     let subError: { errorType: FacebookErrorType; message: string } | null = null;
     try {
@@ -1054,14 +1632,17 @@ export class FacebookLeadsService {
         subError = { errorType: type, message };
       }
       const apps = subJson?.data || [];
-      leadgenSubscribed = apps.some(
-        (a: any) => Array.isArray(a.subscribed_fields)
+      leadgenSubscribed = apps.some((a: any) =>
+        Array.isArray(a.subscribed_fields)
           ? a.subscribed_fields.includes('leadgen')
-          : (a.subscribed_fields?.data || []).some((x: any) => x === 'leadgen' || x?.name === 'leadgen'),
+          : (a.subscribed_fields?.data || []).some(
+              (x: any) => x === 'leadgen' || x?.name === 'leadgen',
+            ),
       );
-    } catch { /* jim */ }
+    } catch {
+      /* jim */
+    }
 
-    // Page'даги lead formalar ro'yxati
     let forms: any[] = [];
     let formsError: { errorType: FacebookErrorType; message: string } | null = null;
     try {
@@ -1073,22 +1654,27 @@ export class FacebookLeadsService {
       if (formJson?.error) {
         const { type, message } = classifyFacebookError(formJson);
         formsError = { errorType: type, message };
-        this.logger.warn(`Facebook leadgen_forms xato [${type}]: ` + JSON.stringify(formJson.error));
       }
       forms = (formJson?.data || []).map((f: any) => ({
-        id: f.id, name: f.name, status: f.status, leadsCount: f.leads_count ?? null,
+        id: f.id,
+        name: f.name,
+        status: f.status,
+        leadsCount: f.leads_count ?? null,
       }));
     } catch (e: any) {
       this.logger.warn('Facebook leadgen_forms error: ' + e.message);
     }
 
-    // Frontend uchun bitta, aniq "nima uchun ishlamayapti" xulosasi.
-    // Ustuvorlik: subscribe_apps xatosi > forms xatosi (chunki subscribe
-    // muvaffaqiyatsiz bo'lsa forms ham odatda bo'sh/xato bo'ladi).
     const primaryError =
       (subscribeResult && !subscribeResult.ok
-        ? { errorType: subscribeResult.errorType || 'UNKNOWN', message: subscribeResult.rawMessage || '' }
-        : null) || subError || formsError || null;
+        ? {
+            errorType: subscribeResult.errorType || 'UNKNOWN',
+            message: subscribeResult.rawMessage || '',
+          }
+        : null) ||
+      subError ||
+      formsError ||
+      null;
 
     return {
       connected: true,
@@ -1096,15 +1682,10 @@ export class FacebookLeadsService {
       pageName: s.facebookPageName || null,
       leadgenSubscribed,
       forms,
-      error: primaryError, // null bo'lsa — hammasi joyida
+      error: primaryError,
     };
   }
 
-  /**
-   * "Nega ishlamayapti?" tugmasi uchun tashxis: saqlangan token bilan
-   * Page'dagi aniq vazifalarni (tasks) so'rab, foydalanuvchiga tushunarli
-   * tavsiya (Page egasidan so'rash yoki System User) qaytaradi.
-   */
   async diagnose(tenantId: string) {
     const tenant = await this.prisma.tenant.findUnique({
       where: { id: tenantId },
@@ -1114,29 +1695,58 @@ export class FacebookLeadsService {
     const pageId: string | undefined = s.facebookPageId;
     const encToken: string | undefined = s.facebookPageAccessToken;
 
+    // Navbat holati — "webhook keldimi, lekin ishlanmadimi" savoliga javob
+    const [pending, failed, done] = await Promise.all([
+      this.db.facebookLeadEvent.count({ where: { tenantId, status: { in: ['PENDING', 'PROCESSING'] } } }),
+      this.db.facebookLeadEvent.count({ where: { tenantId, status: 'FAILED' } }),
+      this.db.facebookLeadEvent.count({ where: { tenantId, status: 'DONE' } }),
+    ]);
+    const queue = { pending, failed, done };
+
+    // Serverdagi sirlar — bularsiz hech narsa ishlamaydi
+    const server = {
+      appSecretConfigured: !!getAppSecret(),
+      verifyToken: getVerifyToken(),
+      appIdConfigured: !!process.env.FACEBOOK_APP_ID,
+      redirectUriConfigured: !!process.env.FACEBOOK_OAUTH_REDIRECT_URI,
+    };
+
+    if (!server.appSecretConfigured) {
+      return {
+        tokenValid: false,
+        queue,
+        server,
+        recommendation: 'SERVER_ENV',
+        message:
+          "Serverda FACEBOOK_APP_SECRET sozlanmagan — Meta'dan kelgan HAR BIR webhook rad etiladi. " +
+          'Bu holatda hech qanday lead tushmaydi. Platforma administratoriga murojaat qiling.',
+      };
+    }
+
     if (!pageId || !encToken) {
       return {
         tokenValid: false,
+        queue,
+        server,
         pageTasks: [],
         hasRequiredTasks: false,
         missingTasks: [],
         recommendation: 'CONNECT_FIRST',
-        message: "Hali hech qanday Page ulanmagan. Avval 'Tezkor ulanish' yoki 'Qo'lda ulash'ni bajaring.",
+        message: "Hali hech qanday Page ulanmagan. Avval 'Tezkor ulanish'ni bajaring.",
       };
     }
+
     const token = this.encryption.decrypt(encToken);
     if (!token) {
       return {
         tokenValid: false,
-        pageTasks: [],
-        hasRequiredTasks: false,
-        missingTasks: [],
+        queue,
+        server,
         recommendation: 'CONNECT_FIRST',
-        message: 'Saqlangan tokenni ochib bo\'lmadi, qaytadan ulang.',
+        message: "Saqlangan tokenni ochib bo'lmadi, qaytadan ulang.",
       };
     }
 
-    // 1) Token umuman yaroqlimi?
     let tokenValid = true;
     try {
       const meRes = await fetch(
@@ -1151,15 +1761,13 @@ export class FacebookLeadsService {
     if (!tokenValid) {
       return {
         tokenValid: false,
-        pageTasks: [],
-        hasRequiredTasks: false,
-        missingTasks: [],
+        queue,
+        server,
         recommendation: 'RECONNECT',
         message: "Token muddati tugagan yoki bekor qilingan. 'Tezkor ulanish'ni qaytadan bosing.",
       };
     }
 
-    // 2) Page'dagi aniq vazifalarni (tasks) so'raymiz
     const REQUIRED_TASKS = ['MANAGE', 'ADVERTISE'];
     let pageTasks: string[] = [];
     try {
@@ -1172,6 +1780,8 @@ export class FacebookLeadsService {
         const { type, message } = classifyFacebookError(pageJson);
         return {
           tokenValid: true,
+          queue,
+          server,
           pageTasks: [],
           hasRequiredTasks: false,
           missingTasks: REQUIRED_TASKS,
@@ -1184,6 +1794,8 @@ export class FacebookLeadsService {
     } catch (e: any) {
       return {
         tokenValid: true,
+        queue,
+        server,
         pageTasks: [],
         hasRequiredTasks: false,
         missingTasks: REQUIRED_TASKS,
@@ -1197,38 +1809,84 @@ export class FacebookLeadsService {
 
     return {
       tokenValid: true,
+      queue,
+      server,
       pageTasks,
       hasRequiredTasks,
       missingTasks: hasRequiredTasks ? [] : missingTasks,
       recommendation: hasRequiredTasks ? 'OK' : 'ASK_ADMIN',
       message: hasRequiredTasks
         ? 'Hammasi joyida — kerakli huquqlar mavjud.'
-        : `Bu akkauntda Page uchun yetarli vazifa yo'q (mavjud: ${pageTasks.join(', ') || 'yo\'q'}). Page egasidan Business Manager orqali "Manage Page" yoki "Advertise" vazifasini so'rang, yoki System User orqali doimiy token oling.`,
+        : `Bu akkauntda Page uchun yetarli vazifa yo'q (mavjud: ${pageTasks.join(', ') || "yo'q"}). Page egasidan Business Manager orqali "Manage Page" yoki "Advertise" vazifasini so'rang.`,
     };
   }
 
   async getStats(tenantId: string) {
-    const [total, thisMonth] = await Promise.all([
+    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    const [total, thisMonth, queuePending, queueFailed] = await Promise.all([
       this.prisma.client.count({ where: { tenantId, source: 'FACEBOOK' as any } }),
       this.prisma.client.count({
-        where: {
-          tenantId,
-          source: 'FACEBOOK' as any,
-          createdAt: { gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1) },
-        },
+        where: { tenantId, source: 'FACEBOOK' as any, createdAt: { gte: monthStart } },
       }),
+      this.db.facebookLeadEvent.count({
+        where: { tenantId, status: { in: ['PENDING', 'PROCESSING'] } },
+      }),
+      this.db.facebookLeadEvent.count({ where: { tenantId, status: 'FAILED' } }),
     ]);
-    return { total, thisMonth };
+    return { total, thisMonth, queuePending, queueFailed };
+  }
+
+  /** Xato bo'lgan hodisalar — admin UI'da ko'rish uchun. */
+  async listFailedEvents(tenantId: string) {
+    const items = await this.db.facebookLeadEvent.findMany({
+      where: { tenantId, status: { in: ['FAILED', 'SKIPPED', 'NO_TENANT'] } },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+      select: {
+        id: true, leadgenId: true, formId: true, adId: true,
+        status: true, attempts: true, lastError: true, createdAt: true, source: true,
+      },
+    });
+    return { data: items };
+  }
+
+  /** Xato hodisalarni qayta navbatga qo'yadi. */
+  async retryFailed(tenantId: string, eventId?: string) {
+    const where: any = eventId
+      ? { id: eventId, tenantId }
+      : { tenantId, status: { in: ['FAILED', 'SKIPPED'] } };
+
+    const res = await this.db.facebookLeadEvent.updateMany({
+      where,
+      data: { status: 'PENDING', attempts: 0, lastError: null },
+    });
+
+    setImmediate(() => this.drainQueue().catch(swallow('navbat')));
+    return { success: true, requeued: res?.count || 0 };
+  }
+
+  /** Qo'lda backfill ishga tushirish (UI tugmasi). */
+  async runBackfillNow(tenantId: string) {
+    const found = await this.backfillTenant(tenantId);
+    const r = await this.drainQueue();
+    return {
+      success: true,
+      found,
+      processed: r.processed,
+      message:
+        found > 0
+          ? `${found} ta o'tkazib yuborilgan lead topildi va qayta ishlandi.`
+          : "Yangi o'tkazib yuborilgan lead topilmadi — hammasi joyida.",
+    };
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // CONTROLLER
 //
-// MUHIM: Meta App darajasida "Page" obyekti uchun faqat BITTA callback
-// URL bo'ladi — shuning uchun manzil tenantId bilan EMAS, global:
+// Webhook manzili butun platforma uchun BITTA:
 //   https://sizning-domen.uz/api/v1/facebook-leads/webhook
-// Tenant har doim webhook body ichidagi Page ID orqali avtomatik topiladi.
+// Agentlik webhook body ichidagi Page ID orqali topiladi.
 // ═══════════════════════════════════════════════════════════════════
 
 @ApiTags('Facebook Lead Ads')
@@ -1237,8 +1895,14 @@ export class FacebookLeadsService {
 export class FacebookLeadsController {
   constructor(private svc: FacebookLeadsService) {}
 
+  // ── WEBHOOK ──
+  // @SkipThrottle() MAJBURIY: global ThrottlerGuard 100 so'rov/60s beradi.
+  // Kampaniya kuchli ketganda yoki Meta retry burst yuborganda webhooklar
+  // 429 bilan rad etilardi va leadlar YO'QOLARDI.
+
   @Get('webhook')
   @Public()
+  @SkipThrottle()
   verifyWebhook(
     @Query('hub.mode') mode: string,
     @Query('hub.verify_token') token: string,
@@ -1249,11 +1913,14 @@ export class FacebookLeadsController {
 
   @Post('webhook')
   @Public()
+  @SkipThrottle()
   webhook(@Body() body: any, @Req() req: any) {
     const sig = req.headers['x-hub-signature-256'] as string | undefined;
     const rawBody: Buffer | undefined = req.rawBody;
     return this.svc.processWebhook(body, sig, rawBody);
   }
+
+  // ── SOZLAMALAR ──
 
   @ApiOperation({ summary: 'Facebook Lead Ads sozlamalarini olish' })
   @ApiBearerAuth('JWT')
@@ -1278,7 +1945,7 @@ export class FacebookLeadsController {
     return this.svc.getStats(u.tenantId);
   }
 
-  @ApiOperation({ summary: "Page lead formalari + webhook obuna holati (tekshirish/qayta ulash)" })
+  @ApiOperation({ summary: 'Page lead formalari + webhook obuna holati' })
   @ApiBearerAuth('JWT')
   @Get('forms')
   @UseGuards(RolesGuard)
@@ -1287,7 +1954,7 @@ export class FacebookLeadsController {
     return this.svc.verifyAndListForms(u.tenantId);
   }
 
-  @ApiOperation({ summary: "Tashxis: token yaroqliligi va Page'dagi vazifalarni tekshirish ('Nega ishlamayapti?' tugmasi)" })
+  @ApiOperation({ summary: "Tashxis: 'Nega ishlamayapti?' tugmasi" })
   @ApiBearerAuth('JWT')
   @Get('diagnose')
   @UseGuards(RolesGuard)
@@ -1296,9 +1963,47 @@ export class FacebookLeadsController {
     return this.svc.diagnose(u.tenantId);
   }
 
-  // ── FACEBOOK LOGIN (OAuth) — "Facebook orqali ulash" tugmasi ──────
+  // ── NAVBAT / TIKLASH (yangi) ──
 
-  @ApiOperation({ summary: "Facebook Login URL olish ('Facebook orqali ulash' tugmasi uchun)" })
+  @ApiOperation({ summary: "Qayta ishlanmagan yoki xato bo'lgan leadlar ro'yxati" })
+  @ApiBearerAuth('JWT')
+  @Get('failed')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  failed(@CurrentUser() u: any) {
+    return this.svc.listFailedEvents(u.tenantId);
+  }
+
+  @ApiOperation({ summary: 'Xato leadlarni qayta ishlash' })
+  @ApiBearerAuth('JWT')
+  @Post('retry')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  retryAll(@CurrentUser() u: any) {
+    return this.svc.retryFailed(u.tenantId);
+  }
+
+  @ApiOperation({ summary: 'Bitta leadni qayta ishlash' })
+  @ApiBearerAuth('JWT')
+  @Post('retry/:id')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  retryOne(@CurrentUser() u: any, @Param('id') id: string) {
+    return this.svc.retryFailed(u.tenantId, id);
+  }
+
+  @ApiOperation({ summary: "Meta'dan o'tkazib yuborilgan leadlarni tortib olish" })
+  @ApiBearerAuth('JWT')
+  @Post('backfill')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  backfill(@CurrentUser() u: any) {
+    return this.svc.runBackfillNow(u.tenantId);
+  }
+
+  // ── OAuth ──
+
+  @ApiOperation({ summary: "Facebook Login URL olish" })
   @ApiBearerAuth('JWT')
   @Get('oauth/start-url')
   @UseGuards(RolesGuard)
@@ -1306,18 +2011,9 @@ export class FacebookLeadsController {
   async getOAuthStartUrl(@CurrentUser() u: any, @Res({ passthrough: true }) res: Response) {
     const result: any = await this.svc.getOAuthStartUrl(u.tenantId, u.sub);
 
-    // ── v13.0 CSRF: nonce'ni BRAUZERGA ham bog'laymiz ──
-    //
-    // Faqat serverdagi nonce yetarli emas: hujumchi o'z havolasini
-    // qurbonga yuborsa, nonce baribir haqiqiy bo'ladi va qurbonning
-    // Page'i hujumchi hisobiga ulanib qolardi.
-    //
-    // Cookie shu bo'shliqni yopadi — u FAQAT oqimni boshlagan
-    // brauzerda bo'ladi. Qurbonning brauzerida bu cookie yo'q,
-    // shuning uchun callback rad etiladi.
-    //
-    // SameSite=None SHART: Facebook'dan qaytish cross-site hisoblanadi,
-    // Lax bo'lsa cookie yuborilmaydi va o'z oqimimiz ham buziladi.
+    // Cookie QO'SHIMCHA himoya sifatida qo'yiladi. Brauzer uni bloklasa
+    // (Safari ITP / third-party cookie) oqim baribir ishlaydi — asosiy
+    // himoya imzolangan `state` + serverdagi bir martalik nonce.
     if (result?.nonce) {
       res.cookie('fb_oauth_nonce', result.nonce, {
         httpOnly: true,
@@ -1326,16 +2022,14 @@ export class FacebookLeadsController {
         maxAge: 10 * 60 * 1000,
         path: '/api/v1/facebook-leads',
       });
-      delete result.nonce; // frontendga chiqmasin
+      delete result.nonce;
     }
     return result;
   }
 
-  // MUHIM: Facebook shu manzilga brauzer orqali (JWT headersiz) qaytadi,
-  // shuning uchun bu marshrut PUBLIC. Tenant/user aniqlanishi imzolangan
-  // "state" parametri orqali amalga oshadi (soxtalashtirib bo'lmaydi).
   @Get('oauth/callback')
   @Public()
+  @SkipThrottle()
   async oauthCallback(
     @Query('code') code: string,
     @Query('state') state: string,
@@ -1343,10 +2037,8 @@ export class FacebookLeadsController {
     @Req() req: any,
     @Res() res: Response,
   ) {
-    // Oqimni boshlagan brauzerdagi cookie (v13.0 CSRF himoyasi)
     const cookieNonce = req.cookies?.fb_oauth_nonce;
     res.clearCookie('fb_oauth_nonce', { path: '/api/v1/facebook-leads' });
-
     const redirectTo = await this.svc.handleOAuthCallback(code, state, error, cookieNonce);
     return res.redirect(redirectTo);
   }

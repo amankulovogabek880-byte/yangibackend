@@ -1,61 +1,44 @@
 /**
  * ═══════════════════════════════════════════════════════════════
- * TUR-OPERATOR ADAPTER INTERFEYSI — v1
+ * TUR OPERATOR ADAPTERI — UMUMIY SHARTNOMA (v14)
  * ═══════════════════════════════════════════════════════════════
  *
- * Nima uchun kerak:
- *   Mavjud `marketplace` moduli BITTA umumiy naqshni taxmin qiladi:
- *   "login qil → token ol → /tours dan JSON RO'YXAT ol → DB'ga import qil".
- *   Bu naqsh statik katalog (masalan Excel eksport) beradigan
- *   operatorlar uchun to'g'ri ishlaydi.
+ * Har bir operatorning API'si o'zgacha. Bu interfeys ularni bitta
+ * ko'rinishga keltiradi — CRM qolgan qismi qaysi operator bilan
+ * ishlayotganini umuman bilmaydi.
  *
- *   Lekin haqiqiy hotel/tur B2B tizimlari (Ratehawk va aksariyat
- *   boshqa operatorlar) BUTUNLAY BOSHQACHA ishlaydi: ular sizga
- *   "barcha turlar ro'yxati"ni bermaydi — sana, mehmonxona/shahar va
- *   mehmonlar soniga qarab JONLI (live) narx qaytaradi. Bugun $120
- *   bo'lgan xona ertaga $95 yoki "joy yo'q" bo'lishi mumkin.
- *
- *   Shu sababli har bir operator uchun alohida ADAPTER yozamiz — u
- *   operatorning o'ziga xos API/portal formatini shu interfeysga
- *   "tarjima" qiladi. CRM qolgan qismi esa faqat shu interfeys bilan
- *   ishlaydi va operator qanday ishlashidan bexabar bo'ladi.
- *
- * QANDAY QO'SHISH KERAK (yangi operator uchun):
- *   1. Shu interfeysni implement qiluvchi klass yozing
- *      (masalan `kompas.adapter.ts`).
- *   2. `adapter-registry.ts` da slug → klass bog'lang.
- *   3. `operator-catalog.ts` da operatorga `hasAdapter: true` qo'ying.
- *   Boshqa hech narsani o'zgartirish shart emas — marketplace moduli
- *   va frontend avtomatik ishlay boshlaydi.
- * ═══════════════════════════════════════════════════════════════
+ * Yangi operator qo'shish uchun:
+ *   1. `ITourAdapter` ni implement qiluvchi klass yozing
+ *   2. `adapter-registry.ts` ga bitta qator qo'shing
+ *   3. `operator-catalog.ts` da `available: true, hasAdapter: true` qiling
  */
 
-/** Operatorga ulanish uchun tenant kiritgan maxfiy ma'lumotlar (deshifrlangan holda) */
 export interface TourAdapterCredentials {
-  /** Ratehawk uchun: KEY_ID. Boshqa operatorlar uchun: login/username */
   login: string;
-  /** Ratehawk uchun: API_KEY. Boshqa operatorlar uchun: parol */
   password: string;
 }
 
 export interface LiveSearchParams {
-  /** Erkin matn: "Antalya", "Dubay", "Bali" va h.k. */
   destination: string;
-  /** Agar oldindan ma'lum bo'lsa (masalan keshdan) — resolve bosqichini tejaydi */
-  regionId?: number | string;
-  /** YYYY-MM-DD */
-  checkin: string;
-  /** YYYY-MM-DD */
-  checkout: string;
+  /** Oldindan aniqlangan region ID (autocomplete orqali tanlangan bo'lsa) */
+  regionId?: string | number | null;
+  checkin: string;  // YYYY-MM-DD
+  checkout: string; // YYYY-MM-DD
   adults: number;
-  /** Har bir bola yoshi, masalan [5, 9] */
   childrenAges?: number[];
-  /** Standart: USD */
   currency?: string;
-  /** Mijoz fuqaroligi (ba'zi operatorlar buni talab qiladi). Standart: 'uz' */
   residency?: string;
-  /** Natijalar sonini cheklash (default adapter ichida belgilanadi) */
   limit?: number;
+}
+
+/** Autocomplete natijasi — foydalanuvchi yo'nalishni ANIQ tanlaydi */
+export interface RegionSuggestion {
+  id: string;
+  name: string;
+  /** "Turkiya, Antalya viloyati" kabi to'liq nom */
+  fullName?: string | null;
+  countryCode?: string | null;
+  type?: string | null;
 }
 
 export interface NormalizedSearchResult {
@@ -65,7 +48,10 @@ export interface NormalizedSearchResult {
   /**
    * Keyingi bosqich (prebook/booking) uchun kerak bo'ladigan xom
    * identifikator — masalan Ratehawk'da bu "rate hash". CRM buni
-   * o'zgartirmasdan saqlaydi va booking chaqirig'ida qaytaradi.
+   * o'zgartirmasdan saqlaydi.
+   *
+   * DIQQAT: bu qiymat qisqa muddat (Ratehawk'da ~38 daqiqa) amal
+   * qiladi. Uni "doimiy tur" sifatida saqlamang.
    */
   externalId: string;
 
@@ -76,7 +62,24 @@ export interface NormalizedSearchResult {
   mealPlan?: string | null;
   roomName?: string | null;
 
+  /** BRUTTO — mijoz to'laydigan narx */
   price: number;
+
+  /**
+   * NETTO — operatordan sotib olish narxi.
+   *
+   * TUZATILDI: ilgari bu maydon UMUMAN YO'Q edi. Natijada jonli
+   * qidiruvdan yaratilgan har bir bookingda `supplierCost = 0` bo'lardi
+   * va `profit = totalPrice` chiqardi. Ya'ni hisobotlarda foyda
+   * haqiqiydan bir necha barobar katta ko'rinardi, agent komissiyasi
+   * (`agentCommissionPercent` foydadan hisoblanadi) va KPI pog'onalari
+   * ham noto'g'ri hisoblanardi. Bu pul bilan bog'liq xato edi.
+   *
+   * `null` bo'lsa CRM tenant sozlamasidagi standart ustama (markup)
+   * bo'yicha hisoblaydi — pastdagi `TourSearchService.resolveNetPrice`.
+   */
+  netPrice?: number | null;
+
   currency: string;
 
   /** Bekor qilish shartlari — inson o'qiy oladigan qisqa matn */
@@ -92,22 +95,28 @@ export interface CredentialCheckResult {
 }
 
 export interface ITourAdapter {
-  /** operator-catalog.ts dagi slug bilan bir xil bo'lishi SHART */
+  /** `operator-catalog.ts` dagi slug bilan bir xil bo'lishi shart */
   readonly slug: string;
 
-  /**
-   * Login/parolni (yoki API kalitni) operatorda tekshiradi.
-   * Tenant "Ulanish" tugmasini bosganda chaqiriladi.
-   */
+  /** Login/parolni operator API'sida tekshiradi */
   verifyCredentials(creds: TourAdapterCredentials): Promise<CredentialCheckResult>;
 
-  /**
-   * Jonli qidiruv. Har chaqiruvda operator serveriga so'rov ketadi —
-   * natija DB'ga saqlanmaydi (yoki qisqa muddatga keshlanadi), chunki
-   * narx/joy tez eskiradi.
-   */
+  /** Jonli qidiruv */
   searchLive(
     creds: TourAdapterCredentials,
     params: LiveSearchParams,
   ): Promise<NormalizedSearchResult[]>;
+
+  /**
+   * Yo'nalish autocomplete (ixtiyoriy).
+   *
+   * NEGA KERAK: ilgari qidiruv matnni o'zi region'ga aylantirib,
+   * BIRINCHI natijani ko'r-ko'rona olardi. "Antalya" yozilganda
+   * ba'zan noto'g'ri region tanlanib, natijalar butunlay boshqa
+   * joydan kelardi va sababi ko'rinmasdi.
+   */
+  suggestRegions?(
+    creds: TourAdapterCredentials,
+    query: string,
+  ): Promise<RegionSuggestion[]>;
 }

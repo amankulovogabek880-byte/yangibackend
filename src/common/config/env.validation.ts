@@ -4,7 +4,7 @@ const logger = new Logger('EnvValidation');
 
 interface EnvConfig {
   required: string[];
-  optional: Record<string, string>; // key: defaultValue description
+  optional: Record<string, string>;
 }
 
 const config: EnvConfig = {
@@ -12,7 +12,6 @@ const config: EnvConfig = {
   optional: {
     PORT: '3000',
     NODE_ENV: 'development',
-    // XAVFSIZLIK: '*' default olib tashlandi. Production'da majburiy (main.ts tekshiradi).
     CORS_ORIGINS: '(production-da MAJBURIY, masalan: https://crm.example.uz)',
     COOKIE_DOMAIN: '(ixtiyoriy, masalan: .omoncrm.uz)',
     COOKIE_SAMESITE: 'lax',
@@ -20,7 +19,6 @@ const config: EnvConfig = {
     JWT_REFRESH_EXPIRES: '7d',
     THROTTLE_TTL: '60',
     THROTTLE_LIMIT: '100',
-    // Cache: Redis ulanishi (ixtiyoriy). Bo'lmasa cache o'chadi (in-memory fallback).
     REDIS_URL: '(ixtiyoriy, masalan: redis://localhost:6379)',
     MIN_PASSWORD_LENGTH: '8',
     MAX_LOGIN_ATTEMPTS: '5',
@@ -32,6 +30,14 @@ const config: EnvConfig = {
     SENDGRID_API_KEY: '(optional)',
     OWNER_EMAIL: 'owner@omoncrm.uz',
     OWNER_PASSWORD: 'Owner@123456!',
+    // ── Meta (Facebook + Instagram) ──
+    FACEBOOK_APP_ID: '(Facebook Lead Ads uchun)',
+    FACEBOOK_APP_SECRET: '(Facebook Lead Ads uchun — MAJBURIY)',
+    FACEBOOK_VERIFY_TOKEN: 'omoncrm_fb_verify',
+    FACEBOOK_OAUTH_REDIRECT_URI: '(https://api.domen.uz/api/v1/facebook-leads/oauth/callback)',
+    INSTAGRAM_APP_SECRET: '(Instagram DM uchun)',
+    META_SINGLE_APP: 'false',
+    LEAD_SLA_MINUTES: '15',
   },
 };
 
@@ -39,23 +45,28 @@ export function validateEnv(): void {
   const isProd = process.env.NODE_ENV === 'production';
   const missing: string[] = [];
   const warnings: string[] = [];
+  const critical: string[] = [];
 
   for (const key of config.required) {
     const val = process.env[key];
     if (!val || val.trim() === '') {
       missing.push(key);
-    } else if (isProd && (val.includes('change-me') || val.includes('change-this') || val.includes('paste-64'))) {
+    } else if (
+      isProd &&
+      (val.includes('change-me') || val.includes('change-this') || val.includes('paste-64'))
+    ) {
       missing.push(`${key} (placeholder deyarli o'zgartirilmagan)`);
     }
   }
 
   if (missing.length > 0) {
-    const msg = `\n\n❌ MUHIM: Quyidagi ENV o'zgaruvchilar to'ldirilmagan:\n${missing.map(k => `   - ${k}`).join('\n')}\n\n.env faylini tekshiring!\n`;
+    const msg = `\n\n❌ MUHIM: Quyidagi ENV o'zgaruvchilar to'ldirilmagan:\n${missing
+      .map((k) => `   - ${k}`)
+      .join('\n')}\n\n.env faylini tekshiring!\n`;
     if (isProd) throw new Error(msg);
     else logger.warn(msg);
   }
 
-  // ENCRYPTION_KEY uzunligini tekshirish
   const encKey = process.env.ENCRYPTION_KEY || '';
   if (encKey && encKey.length < 32) {
     const w = `ENCRYPTION_KEY kamida 32 belgi bo'lishi kerak (hozir: ${encKey.length})`;
@@ -63,7 +74,6 @@ export function validateEnv(): void {
     else warnings.push(w);
   }
 
-  // JWT secrets uzunligi
   for (const jwtKey of ['JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET']) {
     const val = process.env[jwtKey] || '';
     if (val && val.length < 32) {
@@ -71,45 +81,89 @@ export function validateEnv(): void {
     }
   }
 
-  // CORS: production'da '*' yoki bo'sh bo'lishi mumkin emas
   const cors = (process.env.CORS_ORIGINS || '').trim();
   if (isProd && (!cors || cors === '*')) {
     throw new Error(
       "CORS_ORIGINS production'da majburiy va '*' bo'lishi mumkin emas. " +
-      'Masalan: CORS_ORIGINS=https://crm.example.uz',
+        'Masalan: CORS_ORIGINS=https://crm.example.uz',
     );
   }
 
-  // ─── v13.1: Meta webhook sirlari ───────────────────────────────
+  // ═══════════════════════════════════════════════════════════════
+  // META WEBHOOK SIRLARI — QAYTA YOZILDI (v14)
+  // ═══════════════════════════════════════════════════════════════
   //
-  // NEGA MUHIM: webhook imzosi endi FAIL-CLOSED ishlaydi (xavfsizlik
-  // tuzatishi). Ya'ni APP_SECRET sozlanmagan bo'lsa, HAR BIR webhook
-  // 403 bilan rad etiladi va integratsiya JIMGINA ishlamaydi.
+  // ILGARI QANDAY EDI (va nima uchun xato edi):
   //
-  // Bu ayniqsa Meta App Review paytida xavfli: reviewer sinab ko'radi,
-  // ishlamaydi, ariza rad etiladi — sabab esa ko'rinmaydi.
+  //   if (!fbToken && !igToken) { warnings.push("FACEBOOK_APP_SECRET yo'q") }
   //
-  // Shuning uchun ilova ishga tushganda ANIQ ogohlantiramiz.
-  const igToken = process.env.INSTAGRAM_APP_SECRET;
-  const fbToken = process.env.FACEBOOK_APP_SECRET;
+  //   Ya'ni INSTAGRAM_APP_SECRET bor, FACEBOOK_APP_SECRET yo'q bo'lsa —
+  //   HECH QANDAY ogohlantirish chiqmasdi. Bu esa aynan ENG XAVFLI holat:
+  //   webhook imzosi fail-closed ishlaydi, demak har bir Facebook lead
+  //   403 bilan rad etiladi va tizim "hammasi joyida" ko'rinadi.
+  //
+  //   Ikkita alohida Meta App ishlatilganda esa Instagram siri bilan
+  //   hisoblangan imzo hech qachon mos kelmaydi — natija bir xil.
+  //
+  // ENDI:
+  //   - Ikkalasi ham alohida tekshiriladi
+  //   - Fallback faqat META_SINGLE_APP=true bo'lganda ruxsat etiladi
+  //   - Production'da yetishmasa — ILOVA ISHGA TUSHMAYDI. Ataylab shunday:
+  //     jimgina ishlamaydigan integratsiyadan ko'ra, aniq xato bilan
+  //     to'xtagan server ancha yaxshi.
+  // ═══════════════════════════════════════════════════════════════
 
-  if (!igToken) {
+  const igSecret = process.env.INSTAGRAM_APP_SECRET;
+  const fbSecret = process.env.FACEBOOK_APP_SECRET;
+  const singleApp = process.env.META_SINGLE_APP === 'true';
+
+  // Facebook integratsiyasi umuman yoqilganmi? (App ID bor = yoqilgan)
+  const facebookEnabled = !!process.env.FACEBOOK_APP_ID;
+
+  if (facebookEnabled) {
+    if (!fbSecret && !(singleApp && igSecret)) {
+      critical.push(
+        "FACEBOOK_APP_SECRET sozlanmagan — Facebook lead webhook'lari 403 bilan RAD ETILADI. " +
+          "Leadlar CRM'ga UMUMAN TUSHMAYDI. " +
+          "(Agar Facebook va Instagram BITTA Meta App'da bo'lsa, META_SINGLE_APP=true qo'ying.)",
+      );
+    }
+    if (!process.env.FACEBOOK_OAUTH_REDIRECT_URI) {
+      warnings.push(
+        "FACEBOOK_OAUTH_REDIRECT_URI sozlanmagan — 'Facebook orqali ulash' tugmasi ishlamaydi.",
+      );
+    }
+    if (!process.env.FACEBOOK_VERIFY_TOKEN) {
+      warnings.push(
+        "FACEBOOK_VERIFY_TOKEN sozlanmagan — standart 'omoncrm_fb_verify' ishlatiladi. " +
+          "Meta Dashboard'dagi Verify Token AYNAN shu qiymat bo'lishi shart.",
+      );
+    }
+  }
+
+  if (!igSecret && !(singleApp && fbSecret)) {
     warnings.push(
-      "INSTAGRAM_APP_SECRET sozlanmagan — Instagram webhook'lari RAD ETILADI " +
-      "(403). DM'lar CRM'ga tushmaydi.",
+      "INSTAGRAM_APP_SECRET sozlanmagan — Instagram webhook'lari RAD ETILADI. DM'lar CRM'ga tushmaydi.",
     );
   }
-  if (!fbToken && !igToken) {
+
+  // Frontend manzili — OAuth callback shu yerga qaytadi
+  if (facebookEnabled && !process.env.FRONTEND_URL) {
     warnings.push(
-      "FACEBOOK_APP_SECRET sozlanmagan — Facebook lead webhook'lari RAD ETILADI " +
-      '(403). Leadlar CRM\'ga tushmaydi.',
+      "FRONTEND_URL sozlanmagan — Facebook OAuth'dan keyin foydalanuvchi localhost'ga qaytariladi.",
     );
   }
 
   for (const w of warnings) logger.warn(`⚠️  ${w}`);
 
-  if (missing.length === 0) {
+  if (critical.length > 0) {
+    const msg =
+      `\n\n🔴 JIDDIY SOZLAMA XATOSI:\n${critical.map((c) => `   - ${c}`).join('\n')}\n`;
+    if (isProd) throw new Error(msg);
+    else logger.error(msg);
+  }
+
+  if (missing.length === 0 && critical.length === 0) {
     logger.log('✅ ENV validatsiya muvaffaqiyatli');
   }
 }
-// salom

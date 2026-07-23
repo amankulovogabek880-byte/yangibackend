@@ -1893,3 +1893,112 @@ model MarketplaceTour {
   @@index([operatorId])
   @@map("marketplace_tours")
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BU FAYLNI KO'CHIRMANG — ICHIDAGINI `prisma/schema.prisma` GA QO'SHING
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  3 ta o'zgarish bor. Har birining qayerga qo'yilishi pastda yozilgan.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ───────────────────────────────────────────────────────────────────────────
+// 1-QADAM.  `model Client { ... }` ICHIGA qo'shing.
+//
+//           Aniq joy: `pipelineStageAt  DateTime  @default(now())` qatoridan
+//           keyin (schema.prisma ~584-qator).
+// ───────────────────────────────────────────────────────────────────────────
+
+  // ── Speed-to-lead o'lchash (v14) ──
+  // Facebook/Instagram leadlarida birinchi javob tezligi konversiyaning
+  // asosiy omili. Bu maydonlarsiz "qancha vaqtda javob berdik" degan
+  // savolga umuman javob bera olmaymiz.
+  assignedAt       DateTime?   // agentga tayinlangan payt
+  firstResponseAt  DateTime?   // agent birinchi marta aloqaga chiqqan payt
+  slaBreachedAt    DateTime?   // SLA buzilgani qayd etilgan payt (takror eskalatsiya bo'lmasin)
+
+
+// ───────────────────────────────────────────────────────────────────────────
+// 2-QADAM.  `model Client { ... }` ning OXIRIDAGI @@index ro'yxatiga qo'shing.
+//
+//           Aniq joy: `@@index([tenantId, createdAt])` qatoridan keyin,
+//           `@@map("clients")` dan OLDIN.
+// ───────────────────────────────────────────────────────────────────────────
+
+  @@index([tenantId, assignedAt])
+  @@index([tenantId, firstResponseAt])
+
+
+// ───────────────────────────────────────────────────────────────────────────
+// 3-QADAM.  Butun modelni schema.prisma OXIRIGA qo'shing (fayl eng oxiriga).
+// ───────────────────────────────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════
+// FACEBOOK LEAD HODISALARI — YO'QOLMAYDIGAN NAVBAT (v14)
+// ═══════════════════════════════════════════════════════════════
+//
+// NEGA KERAK:
+//   Ilgari webhook kelganda lead DARHOL, o'sha so'rov ichida qayta
+//   ishlanardi. Ikkita halokatli oqibati bor edi:
+//
+//     1) Meta webhookdan ~5 soniyada javob kutadi. Graph API +
+//        scoring + auto-reply + notification esa undan uzoq davom
+//        etadi. Meta timeout deb hisoblab qayta yuboradi, ketma-ket
+//        muvaffaqiyatsizlikdan keyin esa Page obunasini O'CHIRADI —
+//        va hech kim buni sezmaydi.
+//
+//     2) Ishlov paytida istalgan xato (Graph API 500, telefon
+//        dublikati, agent topilmasligi) bo'lsa — lead BUTUNLAY
+//        yo'qolardi. Meta uni qayta yubormaydi.
+//
+// ENDI QANDAY:
+//   Webhook kelishi bilan hodisa SHU JADVALGA yoziladi va Meta'ga
+//   darhol 200 qaytariladi. Haqiqiy ishlov fon rejimida boradi va
+//   xato bo'lsa qayta uriniladi. Hech qanday lead yo'qolmaydi.
+//
+//   `leadgenId` @unique — Meta bir hodisani bir necha marta yuborsa
+//   ham (at-least-once kafolat) bazada bitta yozuv qoladi.
+//
+model FacebookLeadEvent {
+  id          String    @id @default(cuid())
+
+  /// Meta'dagi lead ID — takrorlanmas. Idempotentlikning kaliti.
+  leadgenId   String    @unique
+
+  /// Qaysi Page'dan kelgan (webhook body ichidagi entry.id)
+  pageId      String
+
+  /// Qaysi agentlikka tegishli. Page hali hech kimga ulanmagan bo'lsa null
+  /// bo'lishi mumkin — yozuv baribir saqlanadi, keyin qo'lda tiklash uchun.
+  tenantId    String?
+
+  formId      String?
+  adId        String?
+  createdTime String?
+
+  /// PENDING | DONE | FAILED | SKIPPED | NO_TENANT
+  status      String    @default("PENDING")
+
+  attempts    Int       @default(0)
+  lastError   String?
+
+  /// Yaratilgan mijoz (muvaffaqiyatli bo'lsa)
+  clientId    String?
+
+  /// WEBHOOK | BACKFILL — hodisa qayerdan kelgani
+  source      String    @default("WEBHOOK")
+
+  /// Graph API'dan olingan xom javob (field_data va h.k.).
+  /// Backfill'da bu allaqachon to'ldirilgan bo'ladi — qayta so'rov shart emas.
+  payload     Json?
+
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, createdAt])
+  @@index([tenantId, status])
+  @@index([pageId])
+  @@map("facebook_lead_events")
+}
