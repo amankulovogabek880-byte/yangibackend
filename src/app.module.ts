@@ -66,6 +66,10 @@ import { HealthModule } from './modules/health/health.module';
 import { ExchangeRateModule } from './modules/exchange-rate/exchange-rate.module';
 // v12: Turlar bozori (marketplace) — tur operatorlar + umumiy turlar + bron so'rovlari
 import { MarketplaceModule } from './modules/marketplace/marketplace.module';
+// v14: JONLI tur qidiruvi. MUHIM TUZATISH: bu modul fayli oldin ham mavjud edi,
+// lekin hech qayerda import qilinmagan edi — ya'ni /tour-search/* barcha
+// endpointlari production'da 404 qaytarardi, garchi kod to'liq yozilgan bo'lsa ham.
+import { TourSearchModule } from './modules/tour-search/tour-search.module';
 
 @Module({
   imports: [
@@ -141,6 +145,7 @@ import { MarketplaceModule } from './modules/marketplace/marketplace.module';
     WhatsAppModule, // BUG1 FIX
     ExchangeRateModule, // v10: CBU.uz valyuta kursi (offer/booking currency konvertatsiyasi)
     MarketplaceModule,  // v12: Turlar bozori
+    TourSearchModule,   // v14: Jonli tur qidiruvi — ← YANGI (avval ro'yxatga olinmagan edi)
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
