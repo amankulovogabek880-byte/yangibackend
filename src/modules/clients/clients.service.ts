@@ -123,9 +123,17 @@ export class ClientsService {
       ];
     }
 
+    // TUZATILDI: ilgari birinchi navbatda `lastContactAt` bo'yicha saralanardi.
+    // Yangi lead'larda (hali hech kim bilan bog'lanilmagan) bu maydon har doim
+    // bo'sh (null) bo'ladi, va "nulls: last" tufayli ular — qanchalik yangi
+    // bo'lishidan qat'iy nazar — doim ro'yxat OXIRIGA tushib qolardi.
+    // Endi birinchi navbatda `createdAt` (yaratilgan vaqt) bo'yicha saralanadi,
+    // shuning uchun yangi kelgan lead (masalan Facebook'dan) ro'yxat BOSHIDA
+    // chiqadi. `lastContactAt` ikkinchi mezon sifatida saqlanadi (bir xil
+    // vaqtda yaratilgan yozuvlar orasida tartib berish uchun).
     let orderBy: any = [
-      { lastContactAt: { sort: 'desc', nulls: 'last' } },
       { createdAt: 'desc' },
+      { lastContactAt: { sort: 'desc', nulls: 'last' } },
     ];
     if (params.sortBy === 'name') orderBy = { fullName: 'asc' };
     else if (params.sortBy === 'revenue') orderBy = { totalRevenue: 'desc' };
