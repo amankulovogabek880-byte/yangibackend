@@ -1346,6 +1346,10 @@ export class FacebookLeadsService {
       `&redirect_uri=${encodeURIComponent(redirectUri)}` +
       `&state=${encodeURIComponent(state)}` +
       `&scope=${encodeURIComponent(scope)}` +
+      // MUHIM: rerequest bo'lmasa, Facebook oldin rad etilgan/olib
+      // tashlangan ruxsatlarni qayta so'ramaydi — consent oynasi ochilsa
+      // ham eski (to'liqsiz) ruxsatlar to'plami qaytaveradi.
+      `&auth_type=rerequest` +
       `&response_type=code`;
 
     return { nonce, url };
@@ -1449,7 +1453,22 @@ export class FacebookLeadsService {
         `&fb_exchange_token=${encodeURIComponent(shortToken)}`;
       const longRes = await fetch(longUrl);
       const longJson: any = await longRes.json().catch(() => ({}));
-      const userToken: string = longJson?.access_token || shortToken;
+
+      // TUZATILDI: ilgari bu yerda muvaffaqiyatsizlik jimgina yutilib,
+      // qisqa muddatli (1-2 soatlik) tokenga qaytib ketardi. Natijada
+      // Page token ham qisqa muddatli bo'lib, ulanish bir necha soatdan
+      // keyin "o'zidan-o'zi" uzilib qolardi. Endi bu holat aniq xato va
+      // log sifatida ko'rinadi, foydalanuvchi qayta ulanishi kerakligini
+      // bilib oladi — sirli tarzda uzilib qolmaydi.
+      if (!longRes.ok || !longJson?.access_token) {
+        this.logger.error(
+          "Facebook OAuth: uzoq muddatli (60 kunlik) tokenga almashtirish MUVAFFAQIYATSIZ. " +
+            "App Secret noto'g'ri yoki App hali Live/Review holatida emas bo'lishi mumkin. " +
+            JSON.stringify(longJson),
+        );
+        return `${redirectBase}&fb=token_exchange_failed`;
+      }
+      const userToken: string = longJson.access_token;
 
       const pagesUrl =
         `https://graph.facebook.com/${GRAPH_API_VERSION}/me/accounts` +
