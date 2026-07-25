@@ -11,29 +11,32 @@ import {
  * OnlinePBX provayderi — API 2.0 (api2.onlinepbx.ru)
  * ═══════════════════════════════════════════════════════════════
  *
- * ⚠️ MUHIM TARIX: bu fayl ilgari `{domain}/Mobile/v3/Calls/originate`
- * manziliga `X-API-KEY`/`X-API-ID` header'lari bilan so'rov yuborardi.
- * Bunday endpoint OnlinePBX'da MAVJUD EMAS — kod taxmin asosida
- * yozilgan edi va hech qachon ishlamagan.
- *
- * ── TASDIQLANGAN (rasmiy hujjat bo'yicha) ──────────────────────
+ * ── TASDIQLANGAN (rasmiy hujjat, api.onlinepbx.ru, 2026-yil) ───
  *   Bazaviy manzil:  https://api2.onlinepbx.ru/{domain}/...
  *   Autentifikatsiya: POST {domain}/auth.json  →  { key_id, key }
  *   Keyingi so'rovlar header'i:  x-pbx-authentication: key_id:key
+ *   So'rov formati: application/x-www-form-urlencoded (JSON EMAS!)
  *   Qo'ng'iroqlar tarixi: POST {domain}/mongo_history/search.json
+ *   Chiquvchi qo'ng'iroq: POST {domain}/call/now.json
+ *     Body: from* (birinchi jiringlaydigan — agent), to* (mijoz)
+ *     Javob: {"status":"1","data":{"uuid":"..."}}
+ *     Cheklov: soniyasiga 5 tadan ko'p so'rov yubormaslik
  *   Eski API 1.0 (HMAC) 2020-yil 1-apreldan buyon ishlamaydi.
  *
  * ── TASDIQLANMAGAN ─────────────────────────────────────────────
- *   Qo'ng'iroq boshlash (callback/originate) endpointining ANIQ nomi
- *   va tanasi. Shu sababli u QATTIQ YOZILMAGAN — `originatePath`
- *   sozlamasi orqali o'zgartiriladi (standart: command/reverse.json).
+ *   Qo'ng'iroqni dasturiy ravishda TUGATISH (hangup) uchun HTTP
+ *   endpoint rasmiy hujjatda topilmadi — ehtimol bu faqat
+ *   WebSocket API 3.0.0 orqali ishlaydi. Hozircha hangup() eski
+ *   (tasdiqlanmagan) yo'lni sinab ko'radi, xato bo'lsa jim qoladi.
  *
- *   Aniq qiymatni bilish uchun:
- *     https://api2.onlinepbx.ru/documentation  (Swagger)
- *     yoki support@onlinepbx.ru
+ *   Yozib olingan audio (recording) uchun aniq maydon nomi ham
+ *   hujjatda ko'rinmadi — mongo_history/search.json javobida
+ *   `recording_url` kabi maydon yo'q. Hujjatda alohida `download`
+ *   parametri bor ("agar ko'rsatilsa, massiv o'rniga audio faylni
+ *   yuklab olish uchun URL qaytariladi") — getRecordingUrl() buni
+ *   ishlatadi, lekin bu ham 100% tasdiqlanmagan.
  *
- *   `testConnection()` faqat TASDIQLANGAN auth.json'ni tekshiradi —
- *   shuning uchun u ishlasa, domen va API kalit to'g'ri degani.
+ *   Aniqlik uchun: support@onlinepbx.ru yoki Telegram @techpbx_bot
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -42,7 +45,7 @@ interface OnlinePbxConfig {
   apiKey?: string;      // Kabinet → Интеграция → API
   callerId?: string;    // mijoz ko'radigan raqam
   recordingEnabled?: boolean;
-  /** Qo'ng'iroq boshlash endpointi (tasdiqlanmagan — sozlanadi) */
+  /** @deprecated endi kerak emas — endpoint tasdiqlangan (call/now.json), qattiq yozilgan */
   originatePath?: string;
   /** Eski sozlama — endi ishlatilmaydi, moslik uchun qoldirilgan */
   apiId?: string;
@@ -50,8 +53,6 @@ interface OnlinePbxConfig {
 
 /** Auth tokeni qancha vaqt keshda turadi (OnlinePBX odatda uzoqroq beradi) */
 const AUTH_TTL_MS = 20 * 60 * 1000; // 20 daqiqa
-
-const DEFAULT_ORIGINATE_PATH = 'command/reverse.json';
 
 export class OnlinePbxProvider implements IPhoneProvider {
   name = 'ONLINEPBX';
@@ -148,16 +149,30 @@ export class OnlinePbxProvider implements IPhoneProvider {
     return this.auth.header;
   }
 
-  /** Autentifikatsiyalangan so'rov. 401 bo'lsa bir marta qayta urinadi. */
+  /**
+   * Autentifikatsiyalangan so'rov. 401 bo'lsa bir marta qayta urinadi.
+   *
+   * TUZATILDI: rasmiy hujjat (api.onlinepbx.ru) aniq ko'rsatadiki, bu
+   * endpointlar `application/x-www-form-urlencoded` formatini kutadi,
+   * JSON emas. Ilgari JSON yuborilardi — bu ayniqsa `mongo_history/search.json`
+   * uchun XAVFLI edi: agar server JSON tanani forma-ma'lumot sifatida
+   * o'qiy olmasa, hujjatga ko'ra hech qanday filtr berilmagandek
+   * ishlaydi va JIMGINA "joriy kun" natijalarini qaytaradi — xato
+   * chiqarmaydi, lekin noto'g'ri (yoki to'liqsiz) ma'lumot beradi.
+   */
   private async authed(path: string, body: any, retry = true): Promise<any> {
     const header = await this.getAuthHeader();
+    const form = new URLSearchParams();
+    for (const [k, v] of Object.entries(body || {})) {
+      if (v !== undefined && v !== null) form.append(k, String(v));
+    }
     const res = await this.request(this.url(path), {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
         'x-pbx-authentication': header,
       },
-      body: JSON.stringify(body || {}),
+      body: form.toString(),
     });
 
     // Token eskirgan bo'lsa — yangilab qayta urinamiz
@@ -263,12 +278,14 @@ export class OnlinePbxProvider implements IPhoneProvider {
 
   /**
    * Callback usuli: avval AGENTNING ichki raqami jiringlaydi,
-   * u ko'targach mijozga ulanadi. OnlinePBX integratsiyalarida
-   * (RetailCRM, SalesMan va h.k.) aynan shu usul qo'llaniladi.
+   * u ko'targach mijozga ulanadi.
    *
-   * ⚠️ Endpoint nomi tasdiqlanmagan — `originatePath` orqali sozlanadi.
-   * Xato bo'lsa foydalanuvchiga TUSHUNARLI xabar qaytadi (jimgina
-   * ishlamay qolmaydi).
+   * ✅ TASDIQLANGAN (api.onlinepbx.ru rasmiy hujjati, 2026-yil):
+   *   POST /{domain}/call/now.json
+   *   Body (x-www-form-urlencoded): from* (birinchi qo'ng'iroq —
+   *   odatda agent), to* (ikkinchi qo'ng'iroq — mijoz)
+   *   Javob: {"status":"1","data":{"uuid":"..."}}
+   *   Cheklov: soniyasiga 5 tadan ko'p so'rov yubormaslik.
    */
   async initiate(options: CallInitiateOptions): Promise<CallInitiateResult> {
     if (!this.isConfigured()) {
@@ -282,44 +299,37 @@ export class OnlinePbxProvider implements IPhoneProvider {
     }
 
     const to = this.normalizePhone(options.toPhone);
-    const path = this.config?.originatePath || DEFAULT_ORIGINATE_PATH;
 
     const body: any = {
       from: options.agentExtension, // avval agent jiringlaydi
       to,                            // keyin mijozga ulanadi
     };
-    if (this.config?.callerId) body.callerid = this.config.callerId;
+    // Mijozga ko'rinadigan raqam (ixtiyoriy — hujjatdagi from_orig_number)
+    if (this.config?.callerId) body.from_orig_number = this.config.callerId;
 
-    let j: any;
-    try {
-      j = await this.authed(path, body);
-    } catch (e: any) {
-      // Endpoint topilmasa — aniq yo'l ko'rsatuvchi xabar beramiz
-      if (/HTTP 404|HTTP 400/.test(e?.message || '')) {
-        throw new Error(
-          `OnlinePBX qo'ng'iroq endpointi qabul qilmadi ("${path}"). ` +
-          `Sozlamalarda "originatePath" qiymatini OnlinePBX hujjatidagi ` +
-          `to'g'ri manzilga o'zgartiring (https://api2.onlinepbx.ru/documentation). ` +
-          `Asl xato: ${e.message}`,
-        );
-      }
-      throw e;
+    const j = await this.authed('call/now.json', body);
+
+    if (String(j?.status) !== '1') {
+      throw new Error(
+        `OnlinePBX qo'ng'iroqni boshlay olmadi. Javob: ${JSON.stringify(j).slice(0, 250)}`,
+      );
     }
 
-    const data = j?.data || j?.result || j || {};
-    const callId =
-      data.uuid || data.call_id || data.callId || data.id ||
-      // ID qaytmasa ham qo'ng'iroq ketgan bo'lishi mumkin —
-      // vaqtinchalik ID beramiz, webhook keyin moslashtiradi
-      `opbx-${Date.now()}`;
+    const callId = j?.data?.uuid || `opbx-${Date.now()}`;
 
     return {
       providerCallId: String(callId),
-      status: data.status || 'queued',
+      status: 'queued',
       raw: j,
     };
   }
 
+  /**
+   * ⚠️ TASDIQLANMAGAN: rasmiy HTTP API hujjatida `hangup` uchun
+   * endpoint topilmadi. Ehtimol bu funksiya faqat WebSocket API
+   * orqali ishlaydi. Xato chiqsa jim qoladi — shuning uchun bu
+   * ishlamasa ham asosiy oqim (qo'ng'iroq boshlash) buzilmaydi.
+   */
   async hangup(providerCallId: string): Promise<void> {
     try {
       await this.authed('command/hangup.json', { uuid: providerCallId });
@@ -375,12 +385,28 @@ export class OnlinePbxProvider implements IPhoneProvider {
     };
   }
 
+  /**
+   * ✅ TASDIQLANGAN (api.onlinepbx.ru): audio faylni olish uchun
+   * alohida endpoint YO'Q — xuddi shu `mongo_history/search.json`
+   * so'roviga `download=1` qo'shilsa, natija massiv o'rniga
+   * to'g'ridan-to'g'ri yuklab olish URL'ini qaytaradi.
+   *
+   * ⚠️ Hujjatda javobning ANIQ shakli (masalan {url: "..."} yoki
+   * oddiy matn) ko'rsatilmagan — shuning uchun bir nechta variantni
+   * tekshiramiz, lekin bu qism hali 100% tasdiqlanmagan.
+   */
   async getRecordingUrl(providerCallId: string): Promise<string | null> {
     try {
-      const j = await this.authed('mongo_history/search.json', { uuid: providerCallId });
-      const data = j?.data || j?.result || j;
-      const item = Array.isArray(data) ? data[0] : data;
-      return item?.recording_url || item?.record_url || item?.file_url || null;
+      const j = await this.authed('mongo_history/search.json', {
+        uuid: providerCallId,
+        download: 1,
+      });
+      // Javob shakli noaniq — eng ehtimoliy variantlarni tekshiramiz
+      if (typeof j === 'string' && /^https?:\/\//.test(j)) return j;
+      const url =
+        j?.data?.url || j?.data || j?.url ||
+        (Array.isArray(j?.data) ? j.data[0]?.url : undefined);
+      return typeof url === 'string' && /^https?:\/\//.test(url) ? url : null;
     } catch {
       return null;
     }
