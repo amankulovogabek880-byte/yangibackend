@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import WebSocket from 'ws';
 import {
   IPhoneProvider,
   CallInitiateOptions,
@@ -8,33 +9,36 @@ import {
 
 /**
  * ═══════════════════════════════════════════════════════════════
- * OnlinePBX provayderi — API 2.0 (api2.onlinepbx.ru)
+ * OnlinePBX provayderi — HTTP API 2.0 + WebSocket API 3.0.0
  * ═══════════════════════════════════════════════════════════════
  *
- * ── TASDIQLANGAN (rasmiy hujjat, api.onlinepbx.ru, 2026-yil) ───
- *   Bazaviy manzil:  https://api2.onlinepbx.ru/{domain}/...
+ * ── TASDIQLANGAN (rasmiy hujjat, api.onlinepbx.ru / evateam, 2026) ──
+ *   HTTP bazaviy manzil:  https://api2.onlinepbx.ru/{domain}/...
  *   Autentifikatsiya: POST {domain}/auth.json  →  { key_id, key }
  *   Keyingi so'rovlar header'i:  x-pbx-authentication: key_id:key
  *   So'rov formati: application/x-www-form-urlencoded (JSON EMAS!)
  *   Qo'ng'iroqlar tarixi: POST {domain}/mongo_history/search.json
+ *   Audio yuklab olish: yuqoridagisiga `download=1` qo'shiladi
  *   Chiquvchi qo'ng'iroq: POST {domain}/call/now.json
  *     Body: from* (birinchi jiringlaydigan — agent), to* (mijoz)
  *     Javob: {"status":"1","data":{"uuid":"..."}}
  *     Cheklov: soniyasiga 5 tadan ko'p so'rov yubormaslik
  *   Eski API 1.0 (HMAC) 2020-yil 1-apreldan buyon ishlamaydi.
  *
- * ── TASDIQLANMAGAN ─────────────────────────────────────────────
- *   Qo'ng'iroqni dasturiy ravishda TUGATISH (hangup) uchun HTTP
- *   endpoint rasmiy hujjatda topilmadi — ehtimol bu faqat
- *   WebSocket API 3.0.0 orqali ishlaydi. Hozircha hangup() eski
- *   (tasdiqlanmagan) yo'lni sinab ko'radi, xato bo'lsa jim qoladi.
+ *   WebSocket manzili: wss://{domain}:3342/?key={apiKey}
+ *   Qo'ng'iroqni tugatish: {"event":"hangup_channel","reqId":"...",
+ *     "data":{"uuid":"..."}} → javob {"event":"hangup_channel",...}
+ *     yoki xato {"event":"error_hangup_channel","message":"..."}
  *
- *   Yozib olingan audio (recording) uchun aniq maydon nomi ham
- *   hujjatda ko'rinmadi — mongo_history/search.json javobida
- *   `recording_url` kabi maydon yo'q. Hujjatda alohida `download`
- *   parametri bor ("agar ko'rsatilsa, massiv o'rniga audio faylni
- *   yuklab olish uchun URL qaytariladi") — getRecordingUrl() buni
- *   ishlatadi, lekin bu ham 100% tasdiqlanmagan.
+ * ── HALI TO'LIQ TASDIQLANMAGAN ─────────────────────────────────
+ *   1) Yozib olingan audio uchun `download=1` javobining ANIQ shakli
+ *      (URL matnmi, {url:"..."} obyektmi) — hujjatda ko'rsatilmagan.
+ *   2) HTTP webhook'ning ("веб-хуки") ANIQ payload shakli — faqat
+ *      WebSocket'ning `call_end` voqeasi ko'rilgan, ular bir xil
+ *      bo'lishi mumkin, lekin bu hali tasdiqlanmagan taxmin.
+ *   3) `hangup_channel` SEND buyrug'ida hujjat "event" maydonini
+ *      ko'rsatgan, holbuki boshqa buyruqlar "command" ishlatadi —
+ *      bu nomuvofiqlik hujjatning o'zida bor, sinab ko'rish kerak.
  *
  *   Aniqlik uchun: support@onlinepbx.ru yoki Telegram @techpbx_bot
  * ═══════════════════════════════════════════════════════════════
@@ -325,19 +329,109 @@ export class OnlinePbxProvider implements IPhoneProvider {
   }
 
   /**
-   * ⚠️ TASDIQLANMAGAN: rasmiy HTTP API hujjatida `hangup` uchun
-   * endpoint topilmadi. Ehtimol bu funksiya faqat WebSocket API
-   * orqali ishlaydi. Xato chiqsa jim qoladi — shuning uchun bu
-   * ishlamasa ham asosiy oqim (qo'ng'iroq boshlash) buzilmaydi.
+   * ✅ TASDIQLANGAN (WebSockets API 3.0.0 rasmiy hujjati, 2026-yil):
+   *   Ulanish: wss://{domain}:3342/?key={apiKey}
+   *   Yuborish: {"event":"hangup_channel","reqId":"...","data":{"uuid":"..."}}
+   *   Javob (muvaffaqiyat): {"event":"hangup_channel","reqId":"...",...}
+   *   Javob (xato): {"event":"error_hangup_channel","message":"...","reqId":"..."}
+   *
+   * ⚠️ Kichik nozik joy: hujjatdagi avtomatik generatsiya qilingan
+   * namunada bu buyruq uchun ham "event" maydoni ishlatilgan, holbuki
+   * boshqa buyruqlar (subscribe, bridge) "command" maydonidan
+   * foydalanadi. Namunada aynan shu operatsiya uchun ko'rsatilgan
+   * shaklga (`event`) qat'iy amal qilindi. Agar OnlinePBX bu
+   * qo'ng'iroqni tan olmasa, birinchi urinilib ko'rilishi kerak
+   * bo'lgan narsa — shu maydon nomini "command"ga almashtirish.
+   *
+   * Qo'ng'iroq boshlash muvaffaqiyatsiz bo'lganda ham asosiy oqim
+   * buzilmasligi uchun bu funksiya xato chiqarmaydi, faqat log yozadi.
    */
   async hangup(providerCallId: string): Promise<void> {
     try {
-      await this.authed('command/hangup.json', { uuid: providerCallId });
+      await this.wsSendAndWait('hangup_channel', { uuid: providerCallId });
     } catch (e: any) {
       // Tugatish ishlamasa ham asosiy oqim buzilmasin
       this.logger.warn(`OnlinePBX hangup xato: ${e.message}`);
     }
   }
+
+  // ─────────────────────────────────────────────────────────────
+  // WEBSOCKET (qo'ng'iroqni boshqarish — hangup, bridge va h.k.)
+  // ─────────────────────────────────────────────────────────────
+
+  /**
+   * ✅ TASDIQLANGAN ulanish manzili (WebSockets API 3.0.0 hujjati):
+   *   wss://{domain}:3342/?key={apiKey}
+   *
+   * Har chaqiruvda qisqa muddatli WebSocket ulanish ochadi, buyruqni
+   * yuboradi, mos `reqId` bilan javob kelguncha kutadi, so'ng ulanishni
+   * yopadi. Bizning ishlatilish darajamizda (bitta CRM, cheklangan
+   * miqdordagi qo'ng'iroq) doimiy ochiq ulanish shart emas — har safar
+   * yangi ulanish ochish soddaroq va xatoga chidamliroq.
+   */
+  private wsSendAndWait(
+    event: string,
+    data: Record<string, any>,
+    timeoutMs = 10000,
+  ): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConfigured()) {
+        reject(new Error('OnlinePBX sozlanmagan. Sozlamalar → Telefoniya'));
+        return;
+      }
+      const apiKey = String(this.config!.apiKey).trim();
+      const url = `wss://${this.domain}:3342/?key=${encodeURIComponent(apiKey)}`;
+      const reqId = `${event}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      let settled = false;
+      const ws = new WebSocket(url, { handshakeTimeout: timeoutMs });
+
+      const finish = (err: Error | null, result?: any) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { ws.close(); } catch { /* allaqachon yopiq bo'lishi mumkin */ }
+        if (err) reject(err); else resolve(result);
+      };
+
+      const timer = setTimeout(() => {
+        finish(new Error(`OnlinePBX WebSocket: "${event}" uchun javob ${timeoutMs}ms ichida kelmadi`));
+      }, timeoutMs);
+
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ event, reqId, data }));
+      });
+
+      ws.on('message', (raw: Buffer | string) => {
+        let msg: any;
+        try {
+          msg = JSON.parse(String(raw));
+        } catch {
+          return; // JSON bo'lmagan xabar — e'tiborsiz qoldiramiz
+        }
+        // Faqat bizning so'rovimizga tegishli javobni kutamiz
+        if (msg?.reqId && msg.reqId !== reqId) return;
+
+        if (typeof msg?.event === 'string' && msg.event.startsWith('error_')) {
+          finish(new Error(msg.message || `OnlinePBX WebSocket xatosi: ${msg.event}`));
+        } else if (msg?.event) {
+          finish(null, msg);
+        }
+      });
+
+      ws.on('error', (err: Error) => {
+        finish(new Error(`OnlinePBX WebSocket ulanish xatosi: ${err.message}`));
+      });
+
+      ws.on('close', (code: number) => {
+        if (!settled) {
+          finish(new Error(`OnlinePBX WebSocket kutilmaganda yopildi (kod: ${code})`));
+        }
+      });
+    });
+  }
+
+
 
   // ─────────────────────────────────────────────────────────────
   // WEBHOOK
@@ -346,19 +440,35 @@ export class OnlinePbxProvider implements IPhoneProvider {
   /**
    * OnlinePBX webhook'ini o'qiydi.
    *
-   * Maydon nomlari o'rnatmaga qarab farq qilishi mumkin, shuning uchun
-   * bir nechta variantni tekshiramiz. Kerakli ID topilmasa — null
-   * qaytaramiz (soxta yozuv yaratilmaydi).
+   * ⚠️ QISMAN TASDIQLANGAN: OnlinePBX'da "веб-хуки" (HTTP webhook)
+   * va WebSocket "call_end" voqeasi — ikkita ALOHIDA mexanizm. Biz
+   * faqat WebSocket'ning `call_end` payload shaklini rasmiy hujjatdan
+   * ko'rdik (maydonlar: uuid, hangup_cause, duration, user_talk_time,
+   * caller_number, destination_number). HTTP webhook'ning ANIQ shakli
+   * hali hujjatdan ko'rilmagan, shuning uchun quyida ikkala manba
+   * uchun ham eng ehtimoliy maydon nomlari tekshiriladi — birinchi
+   * navbatda WebSocket orqali TASDIQLANGAN nomlar (`uuid`,
+   * `hangup_cause`, `duration`), so'ngra qo'shimcha ehtimoliy
+   * variantlar. Kerakli ID topilmasa — null qaytaramiz (soxta
+   * yozuv yaratilmaydi).
    */
   parseWebhook(body: any): WebhookEvent | null {
     if (!body || typeof body !== 'object') return null;
 
+    // Ba'zi OnlinePBX xabarlari WebSocket'dagi kabi
+    // {"event": "call_end", "data": {...}} shaklida keladi — shu
+    // holatni ham qo'llab-quvvatlaymiz (tasdiqlangan WS payload shakli
+    // bilan bir xil).
+    const d = body.data && typeof body.data === 'object' ? body.data : body;
+
     const providerCallId =
-      body.uuid || body.call_id || body.callId || body.id || body.callUuid;
+      d.uuid || d.call_id || d.callId || d.id || d.callUuid;
     if (!providerCallId) return null;
 
+    // `hangup_cause` — WebSocket call_end orqali TASDIQLANGAN maydon,
+    // shuning uchun birinchi o'ринда tekshiriladi.
     const raw = String(
-      body.status || body.call_status || body.disposition || body.hangup_cause || '',
+      d.hangup_cause || d.status || d.call_status || d.disposition || '',
     ).toLowerCase();
 
     const status: WebhookEvent['status'] =
@@ -371,16 +481,21 @@ export class OnlinePbxProvider implements IPhoneProvider {
       : /progress|talk|bridge/.test(raw) ? 'in_progress'
       : 'completed';
 
+    // `duration` va `user_talk_time` — WebSocket call_end orqali
+    // TASDIQLANGAN maydonlar, shuning uchun birinchi o'ринда.
     const durationRaw =
-      body.duration_seconds ?? body.duration ?? body.billsec ?? body.talk_time;
+      d.duration ?? d.user_talk_time ?? d.duration_seconds ?? d.billsec ?? d.talk_time;
     const duration = Number(durationRaw);
 
     return {
       providerCallId: String(providerCallId),
       status,
       duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration) : undefined,
+      // ⚠️ Rasmiy hujjatda call_end payloadida recording maydoni
+      // umuman ko'rinmadi — bu hali taxmin. Audio uchun ishonchli
+      // yo'l getRecordingUrl() (mongo_history + download=1).
       recordingUrl:
-        body.recording_url || body.recording || body.record_url || body.file_url || undefined,
+        d.recording_url || d.recording || d.record_url || d.file_url || undefined,
       raw: body,
     };
   }

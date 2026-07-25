@@ -69,7 +69,8 @@
     "twilio": "^5.2.2",
     "ua-parser-js": "^1.0.38",
     "uuid": "^11.0.0",
-    "winston": "^3.14.2"
+    "winston": "^3.14.2",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.4.4",
@@ -84,6 +85,7 @@
     "@types/ua-parser-js": "^0.7.39",
     "@types/uuid": "^10.0.0",
     "@types/winston": "^2.4.4",
+    "@types/ws": "^8.5.12",
     "jest": "^30.4.2",
     "prisma": "^5.18.0",
     "ts-jest": "^29.4.11",
