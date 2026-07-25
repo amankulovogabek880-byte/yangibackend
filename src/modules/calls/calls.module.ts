@@ -227,6 +227,70 @@ export class CallsService {
     }
   }
 
+  /**
+   * Har 5 daqiqada — audio yozuvi hali yo'q, lekin javob berilgan
+   * (duration > 0) qo'ng'iroqlarni topib, tasdiqlangan `download=1`
+   * mexanizmi orqali qayta urinadi.
+   *
+   * Bu KIRUVCHI (agar getRecordingUrl birinchi urinishda ulgurmagan
+   * bo'lsa — masalan yozuv hali qayta ishlanayotgan bo'lsa) VA
+   * CHIQUVCHI (webhook orqali recordingUrl kelmagan yoki umuman
+   * webhook ishlamagan) qo'ng'iroqlar uchun ham ishlaydi.
+   *
+   * Faqat oxirgi 2 soatdagi qo'ng'iroqlarni tekshiradi — eskilarini
+   * abadiy qayta urinib, tizimni ortiqcha yuklamaslik uchun.
+   */
+  @Cron('*/5 * * * *')
+  async backfillMissingRecordings() {
+    const tenants = await this.prisma.tenant.findMany({
+      where: { status: 'ACTIVE', phoneProvider: 'ONLINEPBX' as any },
+      select: { id: true, phoneConfig: true },
+    }).catch(() => [] as any[]);
+
+    for (const t of tenants) {
+      const opbx: any = ((t as any).phoneConfig || {}).onlinepbx;
+      if (!opbx?.domain || !opbx?.apiKey) continue;
+      // Yozib olish yoqilmagan bo'lsa — urinishning ma'nosi yo'q
+      if (opbx?.recordingEnabled === false) continue;
+
+      try {
+        const provider: any = await this.providerFactory.getProvider(t.id);
+        if (!provider || typeof provider.getRecordingUrl !== 'function') continue;
+
+        const since = new Date(Date.now() - 2 * 3600 * 1000);
+        const candidates = await this.prisma.call.findMany({
+          where: {
+            tenantId: t.id,
+            recordingUrl: null,
+            duration: { gt: 0 },
+            providerCallId: { not: null },
+            createdAt: { gte: since },
+            status: 'COMPLETED',
+          },
+          select: { id: true, providerCallId: true },
+          take: 50,
+        });
+
+        for (const c of candidates) {
+          try {
+            const url = await provider.getRecordingUrl(c.providerCallId);
+            const safe = url ? sanitizeMediaUrl(url) : null;
+            if (safe) {
+              await this.prisma.call.update({
+                where: { id: c.id },
+                data: { recordingUrl: safe },
+              });
+            }
+          } catch {
+            // Bitta yozuv topilmasa ham davom etamiz
+          }
+        }
+      } catch (e: any) {
+        this.logger.warn(`Audio backfill xato [${t.id}]: ${e?.message}`);
+      }
+    }
+  }
+
   /** Bitta tenant uchun tarixdan kiruvchi qo'ng'iroqlarni oladi */
   async pullInboundForTenant(tenantId: string) {
     const provider: any = await this.providerFactory.getProvider(tenantId);
@@ -240,21 +304,26 @@ export class CallsService {
     let created = 0;
 
     for (const r of rows) {
-      // Faqat kiruvchi
+      // ✅ TASDIQLANGAN maydon: `accountcode` (mongo_history/search.json
+      // rasmiy hujjati). `r.direction`/`r.call_direction`/`r.type` bu
+      // endpointda mavjud emas — faqat qo'shimcha xavfsizlik uchun
+      // tekshiriladi (zarar keltirmaydi, lekin ular umuman kelmaydi).
       const dir = String(r.direction || r.call_direction || r.type || '').toLowerCase();
-      const isInbound = dir.includes('in') || r.accountcode === 'inbound';
+      const isInbound = r.accountcode === 'inbound' || dir.includes('in');
       if (!isInbound) continue;
 
       const providerCallId = String(r.uuid || r.call_id || r.id || '');
       if (!providerCallId) continue;
 
-      // Allaqachon yozilganmi?
+      // Allaqachon yozilganmi? (tenant bo'yicha ham cheklangan —
+      // turli tenantlar orasida providerCallId to'qnashuvining oldini oladi)
       const exists = await this.prisma.call.findFirst({
-        where: { providerCallId },
+        where: { providerCallId, tenantId },
         select: { id: true },
       });
       if (exists) continue;
 
+      // ✅ TASDIQLANGAN maydon: `caller_id_number`
       const fromPhone = normalizePhone(r.caller_id_number || r.from || r.src);
       if (!fromPhone) continue;
 
@@ -264,9 +333,16 @@ export class CallsService {
         select: { id: true, fullName: true, assignedAgentId: true },
       });
 
-      const durationRaw = Number(r.billsec ?? r.duration ?? 0);
+      // ✅ TASDIQLANGAN maydonlar: `duration`, `user_talk_time`.
+      // `billsec` OnlinePBX hujjatida yo'q — faqat orqaga moslik uchun
+      // pastroq ustuvorlikda qoldirilgan.
+      const durationRaw = Number(r.duration ?? r.user_talk_time ?? r.billsec ?? 0);
       const answered = durationRaw > 0;
 
+      // ⚠️ MUHIM: mongo_history/search.json javobida recording_url
+      // KABI MAYDON YO'Q (rasmiy hujjatda tasdiqlangan). Audio faqat
+      // alohida `download=1` so'rovi orqali olinadi — pastda,
+      // qo'ng'iroq yozuvi yaratilgandan KEYIN, alohida so'rov bilan.
       const call = await this.prisma.call.create({
         data: {
           tenantId,
@@ -280,13 +356,31 @@ export class CallsService {
           fromMasked: fromPhone,
           toMasked: fromPhone,
           duration: Number.isFinite(durationRaw) ? Math.round(durationRaw) : 0,
-          recordingUrl: sanitizeMediaUrl(r.recording_url || r.record_url || r.file_url),
           startedAt: r.start_stamp ? new Date(Number(r.start_stamp) * 1000) : new Date(),
         } as any,
       }).catch(() => null);
 
       if (!call) continue;
       created++;
+
+      // Audio yozuvni ALOHIDA so'rov bilan olamiz (tasdiqlangan
+      // `download=1` mexanizmi orqali) — javob bo'lgan qo'ng'iroqlar
+      // uchungina, va xato bo'lsa asosiy oqim buzilmasin.
+      if (answered && typeof provider.getRecordingUrl === 'function') {
+        provider.getRecordingUrl(providerCallId)
+          .then((url: string | null) => {
+            if (!url) return;
+            const safe = sanitizeMediaUrl(url);
+            if (!safe) return;
+            return this.prisma.call.update({
+              where: { id: call.id },
+              data: { recordingUrl: safe },
+            });
+          })
+          .catch((e: any) => {
+            this.logger.warn(`Audio yozuv olinmadi [${providerCallId}]: ${e?.message}`);
+          });
+      }
 
       // Agentga darhol ko'rsatamiz — mijoz kartochkasi ochilishi uchun
       const payload = {
