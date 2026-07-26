@@ -1,7 +1,32 @@
 import { PrismaClient } from '@prisma/client';
 import * as argon2 from 'argon2';
+import * as crypto from 'crypto';
 
 const prisma = new PrismaClient();
+
+// ─────────────────────────────────────────────────────────────
+// XAVFSIZLIK TUZATISH:
+//   Ilgari OWNER_PASSWORD / demo parollar KODDA hardcoded edi
+//   (masalan "Owner@123456!"). Bu repo public/shared bo'lsa —
+//   har kim production'dagi super-admin parolini biladi.
+//
+//   ENDI:
+//   1) Production'da OWNER_PASSWORD/OWNER_EMAIL ENV orqali MAJBURIY
+//      berilishi kerak — standart qiymat yo'q, bo'lmasa seed to'xtaydi.
+//   2) Demo (o'ynash uchun) ma'lumotlar — foydalanuvchilar, mijozlar,
+//      bookinglar — ENDI standart holatda YARATILMAYDI. Faqat
+//      SEED_DEMO_DATA=true bo'lsa va NODE_ENV !== 'production' bo'lsa
+//      yaratiladi. Production'da hech qachon, hatto flag qo'yilsa ham.
+//   3) Parollar konsolga CHIQARILMAYDI (loglar, CI screenshotlar,
+//      terminal tarixi orqali sizib chiqishining oldi olinadi).
+// ─────────────────────────────────────────────────────────────
+
+const isProd = process.env.NODE_ENV === 'production';
+
+function randomPassword(): string {
+  // Faqat demo (dev) rejimda, aniq parol berilmagan bo'lsa ishlatiladi.
+  return crypto.randomBytes(12).toString('base64url');
+}
 
 async function hashPwd(pwd: string): Promise<string> {
   return String(
@@ -16,6 +41,7 @@ async function hashPwd(pwd: string): Promise<string> {
 
 async function main() {
   console.log('\n🌱 TourCRM v4 — Seed boshlandi...\n');
+  console.log(`   Muhit: ${isProd ? 'PRODUCTION' : 'development'}\n`);
 
   // ── 1. PLATFORM tenant ─────────────────────────────────────────
   const platformTenant = await prisma.tenant.upsert({
@@ -30,10 +56,29 @@ async function main() {
   });
 
   // ── 2. PLATFORM OWNER ──────────────────────────────────────────
-  // v9-FINAL: Owner email/parol ENV'dan o'qiladi (xavfsizlik uchun)
-  const ownerEmail = process.env.OWNER_EMAIL || 'owner@omoncrm.uz';
-  const ownerPassword = process.env.OWNER_PASSWORD || 'Owner@123456!';
+  // XAVFSIZLIK: hardcoded standart parol OLIB TASHLANDI. Owner
+  // email/parol FAQAT ENV orqali beriladi — kodda hech qanday
+  // qiymat (hatto "standart/demo" ko'rinishida ham) saqlanmaydi.
+  const ownerEmail = process.env.OWNER_EMAIL;
+  const ownerPassword = process.env.OWNER_PASSWORD;
   const ownerName = process.env.OWNER_NAME || 'Platform Owner';
+
+  if (!ownerEmail || !ownerPassword) {
+    throw new Error(
+      '\n\n❌ OWNER_EMAIL va OWNER_PASSWORD ENV orqali berilishi SHART.\n' +
+      '   Kodda standart/hardcoded parol endi yo\'q (xavfsizlik).\n' +
+      '   Masalan:\n' +
+      '     OWNER_EMAIL=owner@sizningdomeningiz.uz\n' +
+      '     OWNER_PASSWORD=$(openssl rand -base64 24)\n' +
+      '   ...keyin qayta ishga tushiring: npm run db:seed\n',
+    );
+  }
+  if (ownerPassword.length < 12) {
+    throw new Error('❌ OWNER_PASSWORD kamida 12 belgidan iborat bo\'lishi kerak.');
+  }
+  if (isProd && /^(owner@123456!?|admin@123456!?|password|123456)$/i.test(ownerPassword)) {
+    throw new Error('❌ OWNER_PASSWORD juda oddiy/taxmin qilinadigan. Production uchun kuchli, tasodifiy parol tanlang.');
+  }
 
   const ownerHash = await hashPwd(ownerPassword);
   await prisma.user.upsert({
@@ -53,7 +98,25 @@ async function main() {
   });
   console.log(`   ✅ Owner: ${ownerEmail}`);
 
-  // ── 3. DEMO TENANT ─────────────────────────────────────────────
+  // ── 3. DEMO DATA (ixtiyoriy) ─────────────────────────────────────
+  // XAVFSIZLIK: demo tenant/userlar/mijozlar ENDI standart holatda
+  // yaratilmaydi. Faqat lokal/dev muhitda, ATAYLAB SEED_DEMO_DATA=true
+  // qo'yilganda ishlaydi. Production'da (NODE_ENV=production) — HECH
+  // QACHON, hatto flag qo'yilgan bo'lsa ham (pastdagi shart buni tekshiradi).
+  const seedDemo = process.env.SEED_DEMO_DATA === 'true' && !isProd;
+  if (!seedDemo) {
+    console.log(
+      isProd
+        ? '   ℹ️  Production muhit — demo ma\'lumotlar yaratilmadi (bu to\'g\'ri xatti-harakat).'
+        : '   ℹ️  Demo ma\'lumotlar o\'tkazib yuborildi (yoqish uchun: SEED_DEMO_DATA=true).',
+    );
+    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`  ✅ Owner yaratildi: ${ownerEmail}`);
+    console.log('  (Parol siz bergan OWNER_PASSWORD qiymati — konsolga chiqarilmaydi)');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+    return;
+  }
+
   const demoTenant = await prisma.tenant.upsert({
     where: { slug: 'demo-travel' },
     update: { leadAssignmentStrategy: 'ROUND_ROBIN' as any },
@@ -70,8 +133,13 @@ async function main() {
   });
 
   // ── 4. USERS ────────────────────────────────────────────────────
-  const adminHash = await hashPwd('Admin@123456!');
-  const agentHash = await hashPwd('Agent@123456!');
+  // XAVFSIZLIK: parollar endi hardcoded emas — har seed ishga
+  // tushganda tasodifiy generatsiya qilinadi va FAQAT shu terminalga
+  // bir marta chiqariladi (pastda). Bu blok faqat dev muhitda ishlaydi.
+  const adminPassword = process.env.DEMO_ADMIN_PASSWORD || randomPassword();
+  const agentPassword = process.env.DEMO_AGENT_PASSWORD || randomPassword();
+  const adminHash = await hashPwd(adminPassword);
+  const agentHash = await hashPwd(agentPassword);
 
   const admin = await prisma.user.upsert({
     where: { tenantId_email: { tenantId: demoTenant.id, email: 'admin@demo.uz' } },
@@ -343,12 +411,14 @@ async function main() {
   console.log('  ✅ TourCRM v6 — Seed yakunlandi!');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('  🔑 PLATFORM OWNER:');
-  console.log('     owner@omoncrm.uz  /  Owner@123456!');
-  console.log('  🏢 TENANT ADMIN:');
-  console.log('     admin@demo.uz     /  Admin@123456!');
-  console.log('  👤 AGENTS:');
-  console.log('     aziz@demo.uz      /  Agent@123456!');
-  console.log('     malika@demo.uz    /  Agent@123456!');
+  console.log(`     ${ownerEmail}  (parol — siz bergan OWNER_PASSWORD)`);
+  console.log("  🏢 TENANT ADMIN (faqat DEV, har seed'da yangi tasodifiy parol):");
+  console.log(`     admin@demo.uz     /  ${adminPassword}`);
+  console.log('  👤 AGENTS (faqat DEV):');
+  console.log(`     aziz@demo.uz      /  ${agentPassword}`);
+  console.log(`     malika@demo.uz    /  ${agentPassword}`);
+  console.log('  ⚠️  Bu parollar FAQAT lokal dev muhitda ishlatiladi. Hech qachon');
+  console.log('     production bazasida SEED_DEMO_DATA=true ishlatmang.');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('  📊 Demo data:');
   console.log('     - 9 klient (pipeline\'ning turli bosqichlarida)');

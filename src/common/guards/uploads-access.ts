@@ -106,7 +106,13 @@ export interface UploadsAccessOptions {
 
 export function createUploadsAccessGuard(opts: UploadsAccessOptions) {
   const { prisma, jwt } = opts;
-  const strict = opts.strict ?? process.env.UPLOADS_STRICT === 'true';
+  // XAVFSIZLIK TUZATISH: UPLOADS_STRICT env qo'yilmagan bo'lsa,
+  // production'da standart holat ENDI "qat'iy" (egasi aniqlanmagan
+  // fayl rad etiladi). Ilgari standart "yumshoq" edi — ya'ni bazada
+  // topilmagan har qanday fayl tokensiz ham ochilaverardi.
+  const explicit = process.env.UPLOADS_STRICT;
+  const defaultStrict = process.env.NODE_ENV === 'production';
+  const strict = opts.strict ?? (explicit !== undefined ? explicit === 'true' : defaultStrict);
 
   logger.log(
     `/uploads tenant tekshiruvi yoqildi — rejim: ${strict ? 'QATIY (rad etadi)' : 'YUMSHOQ (faqat log)'}`,

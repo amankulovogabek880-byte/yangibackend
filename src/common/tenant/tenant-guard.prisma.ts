@@ -43,8 +43,14 @@ const logger = new Logger('TenantGuard');
 type Mode = 'off' | 'warn' | 'enforce';
 
 function getMode(): Mode {
-  const m = (process.env.TENANT_GUARD || 'warn').toLowerCase();
-  return (['off', 'warn', 'enforce'].includes(m) ? m : 'warn') as Mode;
+  const raw = (process.env.TENANT_GUARD || '').toLowerCase();
+  if (['off', 'warn', 'enforce'].includes(raw)) return raw as Mode;
+  // XAVFSIZLIK TUZATISH: TENANT_GUARD env qo'yilmagan bo'lsa,
+  // production'da standart holat ENDI "enforce" (ilgari "warn" edi —
+  // ya'ni tenant sizishi faqat log'ga yozilib, so'rov baribir davom
+  // etardi). Dev'da hamon "warn" — log'da ko'rib, keyin xohlasangiz
+  // enforce'ga o'tasiz.
+  return process.env.NODE_ENV === 'production' ? 'enforce' : 'warn';
 }
 
 /** Natijadagi yozuvlarni tekshiradi (birinchi mos kelmaganida to'xtaydi) */
