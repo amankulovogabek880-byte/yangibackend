@@ -9,10 +9,13 @@ import {
   Param,
   Body,
   UseGuards,
+  UseInterceptors,
+  UploadedFile,
   Logger,
   BadRequestException,
   NotFoundException,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import sharp from 'sharp';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators';
@@ -71,6 +74,21 @@ export interface TourAdInput {
   overlayDarkness?: number; // 0..1 — fon suratining pastki qorong'ilashuv kuchi
   borderColor?: string; // agar berilsa, banner atrofida ramka chiziladi
   borderWidth?: number; // px, default 0 (ramka yo'q)
+
+  // ─────────────────────────────────────────────────────────────
+  // ERKIN JOYLASHTIRISH (drag & drop) — foydalanuvchi jonli
+  // preview'da har bir blokni (sarlavha guruhi, narx/sana, footer,
+  // brend logotipi) sichqoncha bilan sudrab, o'zi xohlagan joyga
+  // qo'yishi mumkin. Har biri banner o'lchamiga NISBATAN foiz (%)
+  // siljish (dx/dy) sifatida saqlanadi — standart joylashuvdan
+  // qanchalik surilganini bildiradi (0/0 = standart joy).
+  // ─────────────────────────────────────────────────────────────
+  layout?: {
+    header?: { dx: number; dy: number }; // eyebrow+chip+yulduz+nom+mehmonxona+info bloki
+    price?: { dx: number; dy: number }; // narx chip + sana (yoki mehmonxonalar ro'yxati)
+    footer?: { dx: number; dy: number }; // agentlik nomi/kontakt
+    logo?: { dx: number; dy: number }; // brend logotipi
+  };
 }
 
 export interface TourAdOutput {
@@ -108,6 +126,10 @@ export interface AdTemplate {
   // Placeholder'lar: {destination} {hotel} {stars} {nights} {meal}
   // {people} {price} {dates} {agency} {contact}
   telegramMessageTemplate?: string;
+  // Agentlik brend logotipi — bir marta yuklansa, shu tenant yaratgan
+  // HAR BIR bannerga avtomatik qo'yiladi (o'chirib qo'yish ham mumkin).
+  logoUrl?: string;
+  logoSize?: number; // px (1080x1080 banner ichida), standart 120
 }
 
 const DEFAULT_TELEGRAM_TEMPLATE =
@@ -187,6 +209,27 @@ export class AiMarketingService {
   }
 
   /**
+   * Brend logotipini (rasm fayl) doimiy saqlashga yuklaydi va shablonga
+   * (`adTemplate.logoUrl`) saqlaydi — shundan keyin har bir yangi banner
+   * avtomatik ravishda shu logotip bilan chiqadi.
+   */
+  async uploadLogo(tenantId: string, file: Express.Multer.File): Promise<AdTemplate> {
+    if (!file) throw new BadRequestException('Fayl yuklanmadi');
+    if (!file.mimetype?.startsWith('image/') || file.mimetype === 'image/svg+xml') {
+      throw new BadRequestException(
+        "Logotip faqat rasm (PNG/JPG/WEBP) bo'lishi kerak. SVG qabul qilinmaydi.",
+      );
+    }
+    const url = await uploadBufferToStorage(file.buffer, file.originalname || 'logo.png', file.mimetype);
+    return this.saveTemplate(tenantId, { logoUrl: url });
+  }
+
+  /** Bannerdan logotipni olib tashlash (shablondan o'chirish) */
+  async removeLogo(tenantId: string): Promise<AdTemplate> {
+    return this.saveTemplate(tenantId, { logoUrl: '' });
+  }
+
+  /**
    * Foydalanuvchi kiritmagan maydonlarni (agentlik nomi, kontakt,
    * valyuta) saqlangan shablondan avtomatik to'ldiradi — har safar
    * qayta yozish shart emas. Foydalanuvchi ANIQ kiritgan qiymatlar
@@ -213,18 +256,19 @@ export class AiMarketingService {
    * topadi. API kalit sozlanmagan bo'lsa — bo'sh massiv qaytaradi
    * (xato chiqarmaydi, chunki bu ixtiyoriy funksiya).
    */
-  async findImages(query: string, count = 4): Promise<string[]> {
-    if (!this.pexelsKey) {
-      this.logger.warn('PEXELS_API_KEY sozlanmagan — rasm qidirish o\'tkazib yuborildi');
-      return [];
-    }
+  /**
+   * Bitta Pexels qidiruv so'rovi (ichki yordamchi). `page` — xilma-xillik
+   * uchun (bir xil so'rov har safar bir xil natija bermasin desak, turli
+   * sahifadan olamiz).
+   */
+  private async pexelsSearch(query: string, perPage: number, page = 1): Promise<string[]> {
     try {
       const url =
         `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}` +
-        `&per_page=${Math.max(1, Math.min(count, 10))}&orientation=square`;
+        `&per_page=${Math.max(1, Math.min(perPage, 15))}&page=${Math.max(1, page)}&orientation=square`;
       const res = await fetch(url, { headers: { Authorization: this.pexelsKey } });
       if (!res.ok) {
-        this.logger.warn(`Pexels xato (HTTP ${res.status})`);
+        this.logger.warn(`Pexels xato (HTTP ${res.status}) so'rov: "${query}"`);
         return [];
       }
       const j: any = await res.json();
@@ -233,9 +277,77 @@ export class AiMarketingService {
         .map((p: any) => p?.src?.large || p?.src?.medium || p?.src?.original)
         .filter((u: any) => typeof u === 'string' && u.length > 0);
     } catch (e: any) {
-      this.logger.warn(`Rasm qidirishda xato: ${e.message}`);
+      this.logger.warn(`Rasm qidirishda xato ("${query}"): ${e.message}`);
       return [];
     }
+  }
+
+  /**
+   * TurMaker uslubida — HAR BIR yo'nalish/davlat/shahar uchun O'ZIGA XOS
+   * rasmlar to'plami qaytarishi kerak, faqat bitta statik so'rov emas.
+   * Shu sabab bitta umumiy so'rov o'rniga, kiritilgan matndan (masalan
+   * "Antalya, Turkiya") bir nechta MA'NOLI variant so'rov quramiz —
+   * mehmonxona/kurort, plyaj, shahar manzarasi, tabiat/diqqatga sazovor
+   * joy — va ularning har biridan bir nechtadan olib birlashtiramiz.
+   * Natijada rasmlar aynan shu yo'nalishga xos va xilma-xil chiqadi,
+   * har safar chaqirilganda ham (sahifa raqami tasodifiy tanlanadi
+   * tufayli) boshqacharoq to'plam ko'rsatiladi.
+   */
+  private buildImageQueryVariants(baseQuery: string): string[] {
+    const q = (baseQuery || '').trim();
+    if (!q) return ['travel destination'];
+    // "Antalya, Turkiya hotel resort travel" kabi so'rovlardan faqat
+    // haqiqiy joy nomini (birinchi bo'lak, vergulgacha) ajratib olamiz —
+    // "hotel resort travel" degan qo'shimcha so'zlar variant qidiruvlarga
+    // o'zimiz alohida qo'shamiz, shuning uchun bu yerda kerak emas.
+    const place = q.split(',')[0].replace(/\b(hotel|resort|travel)\b/gi, '').trim() || q;
+    return [
+      `${place} resort hotel`,
+      `${place} beach`,
+      `${place} city landmark`,
+      `${place} aerial view`,
+      `${place} travel`,
+    ];
+  }
+
+  async findImages(query: string, count = 4): Promise<string[]> {
+    if (!this.pexelsKey) {
+      this.logger.warn('PEXELS_API_KEY sozlanmagan — rasm qidirish o\'tkazib yuborildi');
+      return [];
+    }
+    const variants = this.buildImageQueryVariants(query);
+    const target = Math.max(1, Math.min(count, 24));
+    // Har bir variantdan nechta rasm kerakligini taqsimlaymiz (bir oz ortiqcha
+    // so'raymiz — chunki dublikatlar filtrlanadi)
+    const perVariant = Math.max(2, Math.ceil((target * 1.4) / variants.length));
+    // Xilma-xillik uchun: har chaqirilganda tasodifiy sahifadan boshlaymiz —
+    // shunda foydalanuvchi "qayta qidirish"ni bossa, doim bir xil 10 ta
+    // rasm chiqavermaydi, TurMaker'dagi kabi har safar boshqa variantlar keladi.
+    const randomPage = () => 1 + Math.floor(Math.random() * 3);
+
+    const results = await Promise.all(
+      variants.map((v) => this.pexelsSearch(v, perVariant, randomPage())),
+    );
+
+    // Birlashtiramiz, dublikatlarni olib tashlaymiz, so'ng aralashtiramiz —
+    // shunda bitta variant natijalari boshidan to oxirigacha ustma-ust
+    // to'planib qolmaydi (har xil turdagi rasmlar bir-biriga qorishiq chiqadi)
+    const seen = new Set<string>();
+    const merged: string[] = [];
+    for (const list of results) {
+      for (const url of list) {
+        if (!seen.has(url)) {
+          seen.add(url);
+          merged.push(url);
+        }
+      }
+    }
+    for (let i = merged.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [merged[i], merged[j]] = [merged[j], merged[i]];
+    }
+
+    return merged.slice(0, target);
   }
 
   /**
@@ -376,7 +488,7 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
     const [images, posts] = await Promise.all([
       input.imageUrl
         ? Promise.resolve([input.imageUrl])
-        : this.findImages(`${input.destination} hotel resort travel`, 4),
+        : this.findImages(input.destination, 16),
       this.generatePosts(input),
     ]);
 
@@ -422,7 +534,32 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
    * mehmonxona/yo'nalish nomi, yulduzchalar, narx (katta, ajratilgan
    * "chip" ichida) va sanalar joylashtiriladi.
    */
-  private buildBannerSvg(input: TourAdInput, accentColor = '#FF6A2B', size = 1080): string {
+  /**
+   * `input.layout`dagi foiz (%) siljishni (dx/dy) shu banner o'lchamiga
+   * nisbatan pikselga aylantiradi. Foydalanuvchi hech narsa sudramagan
+   * bo'lsa (layout yo'q) — {dx:0, dy:0} qaytadi, ya'ni standart joylashuv
+   * o'zgarishsiz qoladi (eski bannerlar bilan 100% moslik).
+   */
+  private resolveOffset(
+    input: TourAdInput,
+    key: 'header' | 'price' | 'footer' | 'logo',
+    size: number,
+  ): { dx: number; dy: number } {
+    const raw = input.layout?.[key];
+    if (!raw) return { dx: 0, dy: 0 };
+    const clampPct = (n: number) => Math.max(-90, Math.min(90, Number(n) || 0));
+    return {
+      dx: (clampPct(raw.dx) / 100) * size,
+      dy: (clampPct(raw.dy) / 100) * size,
+    };
+  }
+
+  private buildBannerSvg(
+    input: TourAdInput,
+    accentColor = '#FF6A2B',
+    size = 1080,
+    logo?: { dataUri: string; size: number },
+  ): string {
     const safeColor = /^#[0-9a-fA-F]{3,8}$/.test(accentColor) ? accentColor : '#FF6A2B';
     const isRu = input.adLanguage === 'ru';
     const L = isRu
@@ -525,6 +662,27 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
         ? `<rect x="${borderWidth / 2}" y="${borderWidth / 2}" width="${size - borderWidth}" height="${size - borderWidth}" fill="none" stroke="${borderColor}" stroke-width="${borderWidth}"/>`
         : '';
 
+    // ── Erkin joylashtirish: har bir guruhning standart joyidan qancha
+    // sudralganini pikselga aylantiramiz (foydalanuvchi hech narsani
+    // sudramagan bo'lsa — 0,0, ya'ni ko'rinish avvalgidek qoladi) ──
+    const headerOff = this.resolveOffset(input, 'header', size);
+    const priceOff = this.resolveOffset(input, 'price', size);
+    const footerOff = this.resolveOffset(input, 'footer', size);
+    const logoOff = this.resolveOffset(input, 'logo', size);
+
+    // ── Brend logotipi (standart: yuqori-o'ng burchak) ──
+    const logoSvg = logo?.dataUri
+      ? (() => {
+          const ls = Math.max(40, Math.min(280, logo.size || 120));
+          const lx = size - 60 - ls + logoOff.dx;
+          const ly = 60 + logoOff.dy;
+          return `<g>
+    <rect x="${lx - 10}" y="${ly - 10}" width="${ls + 20}" height="${ls + 20}" rx="18" fill="#FFFFFF" fill-opacity="0.14"/>
+    <image x="${lx}" y="${ly}" width="${ls}" height="${ls}" href="${logo.dataUri}" preserveAspectRatio="xMidYMid meet"/>
+  </g>`;
+        })()
+      : '';
+
     return `
 <svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -537,6 +695,7 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
 
   <rect x="0" y="0" width="${size}" height="${size}" fill="url(#fade)"/>
 
+  <g transform="translate(${headerOff.dx.toFixed(1)},${headerOff.dy.toFixed(1)})">
   <rect x="60" y="${size - 410}" width="${eyebrowWidth}" height="36" rx="18" fill="#FFFFFF" fill-opacity="0.14" stroke="${safeColor}" stroke-opacity="0.5"/>
   <text x="76" y="${size - 386}" font-family="${font}" font-size="16" font-weight="800" letter-spacing="1.5" fill="${safeColor}">${eyebrowText}</text>
 
@@ -561,7 +720,9 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
       ? `<text x="60" y="${size - 170}" font-family="${font}" font-size="26" fill="${textColor}" fill-opacity="0.85">${infoLine}</text>`
       : ''
   }
+  </g>
 
+  <g transform="translate(${priceOff.dx.toFixed(1)},${priceOff.dy.toFixed(1)})">
   ${
     useHotelList
       ? hotelListSvg
@@ -577,7 +738,9 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
   <text x="${60 + priceChipWidth / 2}" y="${size - 78}" font-family="${font}" font-size="38" font-weight="800" fill="#FFFFFF" text-anchor="middle">${priceText}</text>
   `
   }
+  </g>
 
+  <g transform="translate(${footerOff.dx.toFixed(1)},${footerOff.dy.toFixed(1)})">
   ${footer ? `<rect x="60" y="${size - 46}" width="${size - 120}" height="1" fill="#FFFFFF" fill-opacity="0.16"/>` : ''}
 
   ${
@@ -585,6 +748,9 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
       ? `<text x="60" y="${size - 26}" font-family="${font}" font-size="22" fill="#CFCFCF">${footer}</text>`
       : ''
   }
+  </g>
+
+  ${logoSvg}
 
   ${borderSvg}
 </svg>`.trim();
@@ -605,7 +771,7 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
     // avtomatik qidiramiz (1-bosqichdagi findImages() bilan bir xil)
     let sourceImage = input.imageUrl;
     if (!sourceImage) {
-      const found = await this.findImages(`${input.destination} hotel resort travel`, 1);
+      const found = await this.findImages(input.destination, 1);
       sourceImage = found[0];
     }
     if (!sourceImage) {
@@ -624,12 +790,34 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
       throw new BadRequestException(`Fon suratini yuklab bo'lmadi: ${e.message}`);
     }
 
+    // 2.5) Brend logotipi (agar tenant Shablon bo'limida yuklagan bo'lsa) —
+    // SVG ichiga base64 sifatida joylash uchun oldindan yuklab olamiz
+    // (librsvg tashqi URL'larni o'zi yuklay olmaydi, faqat data: URI'ni
+    // to'g'ridan-to'g'ri dekodlaydi). Logotip topilmasa yoki yuklanmasa —
+    // banner baribir logotipsiz muvaffaqiyatli yaratiladi (xato chiqmaydi).
+    let logo: { dataUri: string; size: number } | undefined;
+    if (template.logoUrl) {
+      try {
+        const lres = await fetch(template.logoUrl);
+        if (lres.ok) {
+          const lbuf = Buffer.from(await lres.arrayBuffer());
+          const ct = lres.headers.get('content-type') || 'image/png';
+          logo = {
+            dataUri: `data:${ct};base64,${lbuf.toString('base64')}`,
+            size: Math.max(40, Math.min(280, Number(template.logoSize) || 120)),
+          };
+        }
+      } catch (e: any) {
+        this.logger.warn(`Brend logotipini yuklab bo'lmadi (bannerga qo'yilmadi): ${e.message}`);
+      }
+    }
+
     // 3) 1080×1080'ga moslab kesib olamiz, ustiga (shablondagi brend
     // rangi bilan) matn qatlamini qo'shamiz
     const size = 1080;
     let pngBuffer: Buffer;
     try {
-      const svg = this.buildBannerSvg(input, template.primaryColor, size);
+      const svg = this.buildBannerSvg(input, template.primaryColor, size, logo);
       pngBuffer = await sharp(bgBuffer)
         .resize(size, size, { fit: 'cover', position: 'attention' })
         .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
@@ -902,7 +1090,7 @@ export class AiMarketingController {
   @Post('images')
   images(@CurrentUser() _u: any, @Body() body: { query: string; count?: number }) {
     if (!body?.query) throw new BadRequestException("Qidiruv so'zi (query) kerak");
-    return this.svc.findImages(body.query, body.count || 4);
+    return this.svc.findImages(body.query, body.count || 16);
   }
 
   /** Tur ma'lumotlaridan tayyor 1080×1080 banner (PNG URL) yaratadi */
@@ -929,6 +1117,19 @@ export class AiMarketingController {
   @Patch('template')
   saveTemplate(@CurrentUser() u: any, @Body() body: AdTemplate) {
     return this.svc.saveTemplate(u.tenantId, body);
+  }
+
+  /** Brend logotipini yuklash — shundan keyin har bir banner avtomatik shu bilan chiqadi */
+  @Post('logo')
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 5 * 1024 * 1024 } }))
+  uploadLogo(@CurrentUser() u: any, @UploadedFile() file: Express.Multer.File) {
+    return this.svc.uploadLogo(u.tenantId, file);
+  }
+
+  /** Bannerlardan brend logotipini olib tashlash */
+  @Delete('logo')
+  removeLogo(@CurrentUser() u: any) {
+    return this.svc.removeLogo(u.tenantId);
   }
 
   // ── YUBORISH ──
