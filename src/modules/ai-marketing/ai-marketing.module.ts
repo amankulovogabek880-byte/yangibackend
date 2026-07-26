@@ -251,20 +251,39 @@ export class AiMarketingService {
       .filter(Boolean)
       .join('\n');
 
-    const prompt = `Sen professional sayohat agentligi uchun ijtimoiy tarmoq kontent yozuvchisisan (SMM copywriter). Quyidagi tur ma'lumotlaridan foydalanib, 3 ta turdagi ijtimoiy tarmoq posti yoz — har biri o'ziga xos uslubda:
+    const system = `Sen O'zbekistondagi eng yaxshi sayohat agentliklari bilan ishlaydigan, o'nlab yillik tajribaga ega SMM copywritersan. Har doim FAQAT o'zbek tilida, lotin alifbosida yozasan. Sening postlaring doim yuqori konversiya (band qilishga chaqiruv) keltiradi, chunki ular quruq reklama emas, balki odamning his-tuyg'ulariga — dam olish orzusi, oilaviy iliqlik, yangi tajriba istagiga — murojaat qiladi.
+
+Qattiq qoidalaring:
+1. Faqat foydalanuvchi bergan FAKTLARDAN foydalanasan — narx, sana, mehmonxona nomi yoki xizmatlarni hech qachon o'zgartirmaysan, to'qib chiqarmaysan yoki "taxminan" deb yozmaysan.
+2. Har bir post BITTA aniq hissiy "ilgak" (hook) bilan boshlanadi — umumiy "Ajoyib dam olish!" kabi klişelardan qochasan, o'rniga aniq bir manzara, tuyg'u yoki savol bilan boshlaysan.
+3. Emoji tasodifiy emas — faqat matndagi ma'noga mos joyda, ortiqcha ishlatmasdan qo'yasan.
+4. Har bir post oxirida ANIQ va harakatga undovchi CTA (call-to-action) bo'ladi — masalan joy sonini cheklash, sanani eslatish yoki to'g'ridan-to'g'ri bog'lanishga chaqirish orqali.
+5. Bir xil jumla tuzilishini uch platformada takrorlamaysan — har biri boshqacha ochilish va ohangga ega bo'lishi kerak.`;
+
+    const prompt = `Quyidagi tur uchun 3 ta ijtimoiy tarmoq posti yoz. Har birini alohida braif bo'yicha qur:
 
 TUR MA'LUMOTLARI:
 ${facts}
 
-QOIDALAR:
-- O'zbek tilida yoz (lotin alifbosida)
-- Haqiqiy, ishonchli, sotuvga yo'naltirilgan ohang — haqorat yoki aldov emas
-- FAQAT yuqoridagi FAKTLARDAN foydalan, o'zingdan narx yoki xizmat qo'shma yoki o'zgartirma
-- Instagram: qisqa, hissiy, 3-5 ta mos emoji, oxirida 5-8 ta hashtag (masalan #tur #antalya #sayohat)
-- Telegram: biroz batafsilroq, tartibli (bullet/emoji bilan), aniq va tushunarli, oxirida qo'ng'iroq/murojaat uchun chaqiriq
-- Facebook: o'rtacha uzunlik, do'stona va ishonchli ohang, oilaviy auditoriyaga mos
+━━━━━━━━━━━━━━━━━━━━━━
+📸 INSTAGRAM (caption uchun)
+- Struktura: [1 qatorli kuchli hook, e'tiborni darrov tortadigan] → [2-3 qisqa jumla — hissiy, manzarali, faktlarga asoslangan] → [aniq CTA: DM/link/telefon] → bo'sh qator → 6-9 ta mos hashtag (masalan #tur #antalya2026 #dam_olish, yo'nalish va tur turiga mos)
+- Uzunligi: 60-90 so'z (hashtaglardan tashqari), qisqa va "scroll-stopping"
+- Ohang: samimiy, hayajonli, do'stona "sen" bilan murojaat
 
-Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech qanday matn (izoh, sarlavha va h.k.) qo'shma:
+━━━━━━━━━━━━━━━━━━━━━━
+✈️ TELEGRAM (kanal posti uchun)
+- Struktura: [qalin sarlavha yoki hook qatori] → bo'sh qator → tartibli ro'yxat (✅/📍/💰/📅 kabi emoji-bullet bilan har bir asosiy fakt: narx, sana, xizmatlar, mehmonxona) → bo'sh qator → 1-2 jumlali ishonch beruvchi yakun → aniq CTA (masalan: "Joylar cheklangan — hoziroq yozing 👇" + agentlik kontakti)
+- Uzunligi: 90-140 so'z, tartibli va skanerlash oson
+- Ohang: aniq, professional, lekin sovuq emas — ishonch uyg'otadigan
+
+━━━━━━━━━━━━━━━━━━━━━━
+👍 FACEBOOK (post uchun)
+- Struktura: [qisqa hikoya yoki savol bilan ochilish, masalan "Bu yozgi ta'til..."] → [tur haqida 2-3 jumla, oilaviy/do'stona auditoriyaga mos, foyda-yo'naltirilgan (nima uchun aynan bu tur yaxshi tanlov)] → aniq CTA
+- Uzunligi: 70-110 so'z
+- Ohang: iliq, ishonchli, biroz batafsilroq hikoya uslubida, ortiqcha hashtagsiz (0-2 ta, ixtiyoriy)
+
+Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki markdown belgisi (masalan \`\`\`json) qo'shma:
 {"instagram": "...", "telegram": "...", "facebook": "..."}`;
 
     let raw = '';
@@ -278,7 +297,9 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech qanday matn (izoh, sar
         },
         body: JSON.stringify({
           model: this.anthropicModel,
-          max_tokens: 1500,
+          max_tokens: 2000,
+          temperature: 1,
+          system,
           messages: [{ role: 'user', content: prompt }],
         }),
       });
@@ -399,7 +420,10 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech qanday matn (izoh, sar
     const footer = [agency, contact].filter(Boolean).join('   •   ');
 
     // Narx "chip"ining kengligini matn uzunligiga qarab taxminiy hisoblaymiz
-    const priceChipWidth = Math.min(size - 80, 140 + priceText.length * 26);
+    const priceChipWidth = Math.min(size - 120, 150 + priceText.length * 26);
+    // Sana har doim narxdan ALOHIDA qatorda, o'ngga tekislangan — shunda
+    // matn uzunligidan qat'i nazar narx bilan hech qachon ustma-ust tushmaydi
+    const datePillWidth = dateLine ? Math.min(size - 120, 70 + dateLine.length * 13) : 0;
 
     return `
 <svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
@@ -413,9 +437,12 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech qanday matn (izoh, sar
 
   <rect x="0" y="0" width="${size}" height="${size}" fill="url(#fade)"/>
 
+  <rect x="60" y="${size - 410}" width="150" height="36" rx="18" fill="#FFFFFF" fill-opacity="0.14" stroke="${safeColor}" stroke-opacity="0.5"/>
+  <text x="76" y="${size - 386}" font-family="sans-serif" font-size="16" font-weight="800" letter-spacing="1.5" fill="${safeColor}">✨ TUR TAKLIFI</text>
+
   ${
     stars
-      ? `<text x="60" y="${size - 330}" font-family="sans-serif" font-size="34" fill="#FFD54A" font-weight="700">${stars}</text>`
+      ? `<text x="60" y="${size - 330}" font-family="sans-serif" font-size="30" fill="#FFD54A" font-weight="700" letter-spacing="4">${stars}</text>`
       : ''
   }
 
@@ -433,18 +460,21 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech qanday matn (izoh, sar
       : ''
   }
 
-  <rect x="60" y="${size - 130}" width="${priceChipWidth}" height="76" rx="16" fill="${safeColor}"/>
-  <text x="${60 + priceChipWidth / 2}" y="${size - 80}" font-family="sans-serif" font-size="40" font-weight="800" fill="#FFFFFF" text-anchor="middle">${priceText}</text>
-
   ${
     dateLine
-      ? `<text x="${80 + priceChipWidth}" y="${size - 80}" font-family="sans-serif" font-size="24" fill="#FFFFFF">${dateLine}</text>`
+      ? `<rect x="${size - 60 - datePillWidth}" y="${size - 150}" width="${datePillWidth}" height="40" rx="20" fill="#FFFFFF" fill-opacity="0.14" stroke="#FFFFFF" stroke-opacity="0.2"/>
+  <text x="${size - 60 - datePillWidth / 2}" y="${size - 124}" font-family="sans-serif" font-size="22" font-weight="600" fill="#FFFFFF" text-anchor="middle">📅 ${dateLine}</text>`
       : ''
   }
 
+  <rect x="60" y="${size - 124}" width="${priceChipWidth}" height="72" rx="16" fill="${safeColor}"/>
+  <text x="${60 + priceChipWidth / 2}" y="${size - 78}" font-family="sans-serif" font-size="38" font-weight="800" fill="#FFFFFF" text-anchor="middle">${priceText}</text>
+
+  ${footer ? `<rect x="60" y="${size - 46}" width="${size - 120}" height="1" fill="#FFFFFF" fill-opacity="0.16"/>` : ''}
+
   ${
     footer
-      ? `<text x="60" y="${size - 30}" font-family="sans-serif" font-size="22" fill="#CFCFCF">${footer}</text>`
+      ? `<text x="60" y="${size - 26}" font-family="sans-serif" font-size="22" fill="#CFCFCF">${footer}</text>`
       : ''
   }
 </svg>`.trim();
