@@ -5,6 +5,8 @@ import {
   Get,
   Post,
   Patch,
+  Delete,
+  Param,
   Body,
   UseGuards,
   Logger,
@@ -17,6 +19,7 @@ import { CurrentUser } from '../../common/decorators';
 import { uploadBufferToStorage } from '../../common/utils/media-storage';
 import { PrismaService } from '../../prisma/prisma.service';
 import { TelegramModule, TelegramService } from '../telegram/telegram.module';
+import { EncryptionService } from '../../common/encryption/encryption.service';
 
 /**
  * ═══════════════════════════════════════════════════════════════
@@ -52,6 +55,8 @@ export interface TourAdInput {
   imageUrl?: string; // agar berilsa — avtomatik qidiruv shart emas
   agencyName?: string;
   agencyContact?: string; // telefon/telegram
+  adLanguage?: 'uz' | 'ru'; // reklama MATNI tili — ilova tilidan mustaqil
+  extraTexts?: string[]; // bannerga qo'shimcha urg'u/aksiya matnlari (masalan "Bepul transfer!")
 }
 
 export interface TourAdOutput {
@@ -98,6 +103,7 @@ export class AiMarketingService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly telegram: TelegramService,
+    private readonly encryption: EncryptionService,
   ) {}
 
   private get anthropicKey() {
@@ -251,7 +257,13 @@ export class AiMarketingService {
       .filter(Boolean)
       .join('\n');
 
-    const system = `Sen O'zbekistondagi eng yaxshi sayohat agentliklari bilan ishlaydigan, o'nlab yillik tajribaga ega SMM copywritersan. Har doim FAQAT o'zbek tilida, lotin alifbosida yozasan. Sening postlaring doim yuqori konversiya (band qilishga chaqiruv) keltiradi, chunki ular quruq reklama emas, balki odamning his-tuyg'ulariga — dam olish orzusi, oilaviy iliqlik, yangi tajriba istagiga — murojaat qiladi.
+    const isRu = input.adLanguage === 'ru';
+
+    const langLine = isRu
+      ? "Har doim FAQAT rus tilida yozasan (kirill alifbosida)."
+      : "Har doim FAQAT o'zbek tilida, lotin alifbosida yozasan.";
+
+    const system = `Sen O'zbekistondagi eng yaxshi sayohat agentliklari bilan ishlaydigan, o'nlab yillik tajribaga ega SMM copywritersan. ${langLine} Sening postlaring doim yuqori konversiya (band qilishga chaqiruv) keltiradi, chunki ular quruq reklama emas, balki odamning his-tuyg'ulariga — dam olish orzusi, oilaviy iliqlik, yangi tajriba istagiga — murojaat qiladi.
 
 Qattiq qoidalaring:
 1. Faqat foydalanuvchi bergan FAKTLARDAN foydalanasan — narx, sana, mehmonxona nomi yoki xizmatlarni hech qachon o'zgartirmaysan, to'qib chiqarmaysan yoki "taxminan" deb yozmaysan.
@@ -259,6 +271,7 @@ Qattiq qoidalaring:
 3. Emoji tasodifiy emas — faqat matndagi ma'noga mos joyda, ortiqcha ishlatmasdan qo'yasan.
 4. Har bir post oxirida ANIQ va harakatga undovchi CTA (call-to-action) bo'ladi — masalan joy sonini cheklash, sanani eslatish yoki to'g'ridan-to'g'ri bog'lanishga chaqirish orqali.
 5. Bir xil jumla tuzilishini uch platformada takrorlamaysan — har biri boshqacha ochilish va ohangga ega bo'lishi kerak.`;
+
 
     const prompt = `Quyidagi tur uchun 3 ta ijtimoiy tarmoq posti yoz. Har birini alohida braif bo'yicha qur:
 
@@ -389,6 +402,11 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
    */
   private buildBannerSvg(input: TourAdInput, accentColor = '#FF6A2B', size = 1080): string {
     const safeColor = /^#[0-9a-fA-F]{3,8}$/.test(accentColor) ? accentColor : '#FF6A2B';
+    const isRu = input.adLanguage === 'ru';
+    const L = isRu
+      ? { nights: 'ночей', adults: 'взрослых', child: 'ребёнок', offer: 'ТУР ПРЕДЛОЖЕНИЕ' }
+      : { nights: 'kecha', adults: 'kattalar', child: 'bola', offer: 'TUR TAKLIFI' };
+
     const destination = this.escapeSvg(this.truncate(input.destination, 34));
     const hotel = input.hotelName ? this.escapeSvg(this.truncate(input.hotelName, 30)) : '';
     const stars = input.hotelStars
@@ -396,11 +414,11 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
       : '';
 
     const infoParts: string[] = [];
-    if (input.nights) infoParts.push(`${input.nights} kecha`);
+    if (input.nights) infoParts.push(`${input.nights} ${L.nights}`);
     if (input.mealPlan) infoParts.push(this.escapeSvg(this.truncate(input.mealPlan, 20)));
     if (input.adults || input.children) {
       infoParts.push(
-        `${input.adults || 1} kattalar${input.children ? ` + ${input.children} bola` : ''}`,
+        `${input.adults || 1} ${L.adults}${input.children ? ` + ${input.children} ${L.child}` : ''}`,
       );
     }
     const infoLine = this.escapeSvg(infoParts.join('  •  '));
@@ -425,6 +443,30 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
     // matn uzunligidan qat'i nazar narx bilan hech qachon ustma-ust tushmaydi
     const datePillWidth = dateLine ? Math.min(size - 120, 70 + dateLine.length * 13) : 0;
 
+    const eyebrowText = `✨ ${L.offer}`;
+    const eyebrowWidth = Math.min(size - 120, 40 + eyebrowText.length * 9.5);
+
+    // Qo'shimcha urg'u matnlari (masalan "Bepul transfer!", "Cheklangan joy")
+    // — TurMaker uslubidagi kichik "chip"lar qatorida, sig'guncha chiqadi
+    const extraChips = (input.extraTexts || [])
+      .map((t) => (t || '').trim())
+      .filter(Boolean)
+      .slice(0, 4)
+      .map((t) => this.escapeSvg(this.truncate(t, 24)));
+    let chipX = 60;
+    const chipY = size - 364;
+    const chipParts: string[] = [];
+    for (const chip of extraChips) {
+      const w = Math.min(320, 40 + chip.length * 11);
+      if (chipX + w > size - 60) break;
+      chipParts.push(
+        `<rect x="${chipX}" y="${chipY}" width="${w}" height="32" rx="16" fill="${safeColor}"/>` +
+          `<text x="${chipX + w / 2}" y="${chipY + 22}" font-family="sans-serif" font-size="16" font-weight="700" fill="#FFFFFF" text-anchor="middle">${chip}</text>`,
+      );
+      chipX += w + 8;
+    }
+    const extraChipsSvg = chipParts.join('\n  ');
+
     return `
 <svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -437,8 +479,10 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
 
   <rect x="0" y="0" width="${size}" height="${size}" fill="url(#fade)"/>
 
-  <rect x="60" y="${size - 410}" width="150" height="36" rx="18" fill="#FFFFFF" fill-opacity="0.14" stroke="${safeColor}" stroke-opacity="0.5"/>
-  <text x="76" y="${size - 386}" font-family="sans-serif" font-size="16" font-weight="800" letter-spacing="1.5" fill="${safeColor}">✨ TUR TAKLIFI</text>
+  <rect x="60" y="${size - 410}" width="${eyebrowWidth}" height="36" rx="18" fill="#FFFFFF" fill-opacity="0.14" stroke="${safeColor}" stroke-opacity="0.5"/>
+  <text x="76" y="${size - 386}" font-family="sans-serif" font-size="16" font-weight="800" letter-spacing="1.5" fill="${safeColor}">${eyebrowText}</text>
+
+  ${extraChipsSvg}
 
   ${
     stars
@@ -592,6 +636,151 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
         "Rasmni yuklab oling va ushbu matn bilan qo'lda joylang.",
     };
   }
+
+  // ─────────────────────────────────────────────────────────────
+  // TARIX (History) — har bir tayyorlangan reklamani saqlab, keyin
+  // ochib qayta tahrirlash/qayta yuborish uchun. `AdTemplate` bilan
+  // bir xil yondashuv: `Tenant.settings.adHistory` JSON massivi
+  // ichida — yangi migratsiya SHART EMAS. Oxirgi 40 tasi saqlanadi.
+  // ─────────────────────────────────────────────────────────────
+  private static readonly MAX_HISTORY = 40;
+
+  async saveAdHistory(
+    tenantId: string,
+    entry: { input: TourAdInput; bannerUrl?: string; images?: string[]; posts?: TourAdOutput['posts'] },
+  ): Promise<{ id: string; createdAt: string }> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    if (!tenant) throw new NotFoundException('Tenant topilmadi');
+
+    const currentSettings = (tenant.settings as any) || {};
+    const history: any[] = Array.isArray(currentSettings.adHistory) ? currentSettings.adHistory : [];
+
+    const record = {
+      id: `ad_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      input: entry.input,
+      bannerUrl: entry.bannerUrl || null,
+      images: entry.images || [],
+      posts: entry.posts || null,
+      createdAt: new Date().toISOString(),
+    };
+
+    const updated = [record, ...history].slice(0, AiMarketingService.MAX_HISTORY);
+
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: { settings: { ...currentSettings, adHistory: updated } as any },
+    });
+
+    return { id: record.id, createdAt: record.createdAt };
+  }
+
+  async listAdHistory(tenantId: string): Promise<any[]> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const history = ((tenant?.settings as any) || {}).adHistory;
+    return Array.isArray(history) ? history : [];
+  }
+
+  async getAdHistoryItem(tenantId: string, id: string): Promise<any> {
+    const history = await this.listAdHistory(tenantId);
+    const found = history.find((h: any) => h.id === id);
+    if (!found) throw new NotFoundException("Tarixdan yozuv topilmadi");
+    return found;
+  }
+
+  async deleteAdHistory(tenantId: string, id: string): Promise<{ deleted: boolean }> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    if (!tenant) throw new NotFoundException('Tenant topilmadi');
+    const currentSettings = (tenant.settings as any) || {};
+    const history: any[] = Array.isArray(currentSettings.adHistory) ? currentSettings.adHistory : [];
+    const updated = history.filter((h: any) => h.id !== id);
+
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: { settings: { ...currentSettings, adHistory: updated } as any },
+    });
+
+    return { deleted: updated.length !== history.length };
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // ✅ FACEBOOK: Sahifaga (Page) avtomatik joylash.
+  //
+  // Instagram'dan farqli o'laroq, bu texnik jihatdan mumkin —
+  // oddiy Page fotosini joylash uchun Meta App Review SHART EMAS
+  // (faqat `pages_manage_posts` ruxsati kerak). Tenant Sozlamalar →
+  // Facebook Ads bo'limida sahifasini ulagan bo'lishi kerak (o'sha
+  // ulanish `facebook-leads` moduli orqali allaqachon mavjud —
+  // shu yerda faqat saqlangan Page Access Token qayta ishlatiladi).
+  //
+  // MUHIM: agar tenant sahifani ESKI ruxsatlar bilan ulagan bo'lsa
+  // (`pages_manage_posts` so'ralmasdan), shu Page Access Token bilan
+  // post qo'yish Meta tomonidan rad etiladi — bunday holda tenant
+  // Sozlamalar → Facebook Ads'da sahifani QAYTA ulashi kerak bo'ladi.
+  // ─────────────────────────────────────────────────────────────
+  async sendToFacebookPage(
+    tenantId: string,
+    data: { photoUrl: string; caption: string },
+  ): Promise<{ postId: string }> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true, facebookPageId: true },
+    });
+    const s: any = tenant?.settings || {};
+    const pageId = tenant?.facebookPageId || s.facebookPageId;
+    const encToken = s.facebookPageAccessToken;
+
+    if (!pageId || !encToken) {
+      throw new BadRequestException(
+        "Facebook sahifasi ulanmagan. Avval Sozlamalar → Facebook Ads bo'limida sahifangizni ulang.",
+      );
+    }
+
+    const accessToken = this.encryption.decrypt(encToken);
+    if (!accessToken) {
+      throw new BadRequestException(
+        "Facebook tokeni o'qib bo'lmadi — Sozlamalar → Facebook Ads'da sahifani qaytadan ulang.",
+      );
+    }
+
+    try {
+      const url = `https://graph.facebook.com/v23.0/${pageId}/photos`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: data.photoUrl,
+          caption: data.caption,
+          access_token: accessToken,
+        }),
+      });
+      const j: any = await res.json().catch(() => ({}));
+      if (!res.ok || !j?.post_id) {
+        const msg = j?.error?.message || `HTTP ${res.status}`;
+        // `pages_manage_posts` ruxsati yo'q bo'lsa Meta odatda shu turdagi
+        // xatoni qaytaradi — foydalanuvchiga aniq nima qilish kerakligini aytamiz
+        if (/permission|scope|OAuthException/i.test(msg)) {
+          throw new Error(
+            `${msg}. Ehtimol sahifa "pages_manage_posts" ruxsatisiz ulangan — Sozlamalar → ` +
+              `Facebook Ads'da sahifani qaytadan ulang.`,
+          );
+        }
+        throw new Error(msg);
+      }
+      return { postId: j.post_id };
+    } catch (e: any) {
+      this.logger.error(`Facebook'ga yuborishda xato: ${e.message}`);
+      throw new BadRequestException(`Facebook'ga yuborib bo'lmadi: ${e.message}`);
+    }
+  }
 }
 
 @Controller('ai-marketing')
@@ -671,6 +860,44 @@ export class AiMarketingController {
     if (!body?.caption) throw new BadRequestException('Post matni (caption) kerak');
     if (!body?.bannerUrl) throw new BadRequestException("Banner URL'i kerak");
     return this.svc.prepareForInstagramManualPost(body.caption, body.bannerUrl);
+  }
+
+  /** Tayyor bannerni Facebook sahifasiga (Page) avtomatik joylaydi */
+  @Post('send/facebook')
+  sendFacebook(@CurrentUser() u: any, @Body() body: { photoUrl: string; caption: string }) {
+    if (!body?.photoUrl) throw new BadRequestException("Rasm URL'i kerak");
+    if (!body?.caption) throw new BadRequestException('Post matni (caption) kerak');
+    return this.svc.sendToFacebookPage(u.tenantId, body);
+  }
+
+  // ── TARIX (History) ──
+
+  /** Tayyorlangan reklamani tarixga saqlaydi (keyin qayta ochish/tahrirlash uchun) */
+  @Post('history')
+  saveHistory(
+    @CurrentUser() u: any,
+    @Body() body: { input: TourAdInput; bannerUrl?: string; images?: string[]; posts?: TourAdOutput['posts'] },
+  ) {
+    if (!body?.input?.destination) throw new BadRequestException("Tur ma'lumotlari (input) kerak");
+    return this.svc.saveAdHistory(u.tenantId, body);
+  }
+
+  /** So'nggi saqlangan reklamalar ro'yxati (eng yangisi birinchi) */
+  @Get('history')
+  listHistory(@CurrentUser() u: any) {
+    return this.svc.listAdHistory(u.tenantId);
+  }
+
+  /** Bitta saqlangan reklamani olish (formani qayta to'ldirish uchun) */
+  @Get('history/:id')
+  getHistoryItem(@CurrentUser() u: any, @Param('id') id: string) {
+    return this.svc.getAdHistoryItem(u.tenantId, id);
+  }
+
+  /** Tarixdan bitta yozuvni o'chirish */
+  @Delete('history/:id')
+  deleteHistoryItem(@CurrentUser() u: any, @Param('id') id: string) {
+    return this.svc.deleteAdHistory(u.tenantId, id);
   }
 }
 
