@@ -1086,6 +1086,61 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * AI Marketing (TurMaker-uslubidagi reklama) uchun: tayyor banner +
+   * matnni tenant'ning Telegram BOT'i orqali istalgan kanalga (yoki
+   * chatga) yuboradi. Suhbat (Conversation) bilan bog'liq EMAS — bu
+   * mijoz bilan yozishmalar emas, ommaviy reklama e'loni.
+   *
+   * MUHIM: bot kanalga xabar yuborishi uchun kanalning
+   * ADMINISTRATORI bo'lishi shart (Telegram cheklovi — buni
+   * boshqacha qilib bo'lmaydi). `chatId` — kanal username'i
+   * (masalan "@mening_kanalim") yoki raqamli chat ID.
+   */
+  async sendAdToChannel(
+    tenantId: string,
+    chatId: string,
+    photoUrl: string,
+    caption: string,
+    accountId?: string,
+  ): Promise<{ messageId: number }> {
+    if (!chatId?.trim()) throw new BadRequestException('Kanal ID/username kerak');
+    if (!photoUrl?.trim()) throw new BadRequestException("Rasm URL'i kerak");
+
+    const account = await this.prisma.telegramAccount.findFirst({
+      where: accountId
+        ? { id: accountId, tenantId }
+        : { tenantId, isActive: true, botToken: { not: null } },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (!account) {
+      throw new BadRequestException(
+        "Telegram bot ulanmagan. Sozlamalar → Telegram bo'limidan bot tokeningizni qo'shing",
+      );
+    }
+
+    const bot = this.bots.get(account.id);
+    if (!bot) throw new BadRequestException('Bot ishlamayapti (qayta ulanishi kerak bo\'lishi mumkin)');
+
+    try {
+      // Telegram caption cheklovi — 1024 belgi
+      const safeCaption = String(caption || '').slice(0, 1024);
+      const sent = await bot.sendPhoto(chatId.trim(), photoUrl, { caption: safeCaption });
+      return { messageId: sent.message_id };
+    } catch (e: any) {
+      const raw = String(e?.message || e);
+      // Telegram'ning eng ko'p uchraydigan xatosi — bot kanalga admin
+      // qilib qo'yilmagan bo'lsa, tushunarli xabar beramiz
+      if (/chat not found|not enough rights|CHAT_ADMIN_REQUIRED/i.test(raw)) {
+        throw new BadRequestException(
+          `Kanalga yuborib bo'lmadi: bot "${chatId}" kanalining administratori emas, ` +
+            'yoki kanal ID noto\'g\'ri. Botni kanalga admin sifatida qo\'shing.',
+        );
+      }
+      throw new BadRequestException(`Telegram'ga yuborishda xato: ${raw}`);
+    }
+  }
+
+  /**
    * v8: Yangi suhbat boshlash (agent o'zi yozadi).
    * Telegram bot chat_id orqali xabar yuborish — chat_id avval bot bilan
    * gaplashgan bo'lishi kerak (Telegram cheklovi).

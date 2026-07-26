@@ -28,6 +28,7 @@ import { TenantsModule } from './modules/tenants/tenants.module';
 import { ClientsModule } from './modules/clients/clients.module';
 import { PipelineModule } from './modules/pipeline/pipeline.module';
 import { OffersModule } from './modules/offers/offers.module';
+import { AiMarketingModule } from './modules/ai-marketing/ai-marketing.module';
 import { InstagramModule } from './modules/instagram/instagram.module';
 import { FacebookLeadsModule } from './modules/facebook-leads/facebook-leads.module';   // ← YANGI
 import { BookingsModule } from './modules/bookings/bookings.module';
@@ -113,6 +114,7 @@ import { TourSearchModule } from './modules/tour-search/tour-search.module';
     ClientsModule,
     PipelineModule,
     OffersModule,
+    AiMarketingModule,
     InstagramModule,
     FacebookLeadsModule,   // ← YANGI
     BookingsModule,
