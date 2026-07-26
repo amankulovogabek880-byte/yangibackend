@@ -57,6 +57,20 @@ export interface TourAdInput {
   agencyContact?: string; // telefon/telegram
   adLanguage?: 'uz' | 'ru'; // reklama MATNI tili — ilova tilidan mustaqil
   extraTexts?: string[]; // bannerga qo'shimcha urg'u/aksiya matnlari (masalan "Bepul transfer!")
+
+  // Bir nechta mehmonxona/narx solishtirish (TurMaker uslubida). Bo'lsa
+  // va showHotelList=true bo'lsa, banner bitta narx o'rniga shu ro'yxatni
+  // ko'rsatadi (hotelName/hotelStars/price yagona qiymatlari e'tiborga olinmaydi).
+  hotels?: Array<{ name: string; stars?: number; price: number }>;
+  showHotelList?: boolean;
+
+  // Qo'lda dizayn moslashtirish (TurMaker'dagi tahrirlagichning "form" versiyasi —
+  // erkin joylashtirish emas, lekin rang/shrift/fon qorong'iligini boshqarish)
+  textColor?: string; // masalan "#FFFFFF"
+  fontFamily?: string; // "sans-serif" | "serif" | "monospace" | Google Font nomi
+  overlayDarkness?: number; // 0..1 — fon suratining pastki qorong'ilashuv kuchi
+  borderColor?: string; // agar berilsa, banner atrofida ramka chiziladi
+  borderWidth?: number; // px, default 0 (ramka yo'q)
 }
 
 export interface TourAdOutput {
@@ -89,7 +103,15 @@ export interface AdTemplate {
   defaultCurrency?: string;
   telegramChatId?: string; // reklama yuboriladigan standart kanal
   telegramAccountId?: string; // bir nechta bot ulangan bo'lsa, qaysi biri
+  // TurMaker uslubidagi Telegram xabar andozasi — Claude yozgan matn
+  // o'rniga, agentlik o'zi belgilagan qat'iy formatda yuborish uchun.
+  // Placeholder'lar: {destination} {hotel} {stars} {nights} {meal}
+  // {people} {price} {dates} {agency} {contact}
+  telegramMessageTemplate?: string;
 }
+
+const DEFAULT_TELEGRAM_TEMPLATE =
+  "🌴 {destination}\n{hotel}\n\n📅 {dates} ({nights} kecha)\n👥 {people}\n🍽 {meal}\n\n💰 Narx: {price}\n\n📞 {agency} — {contact}";
 
 const DEFAULT_TEMPLATE: Required<Pick<AdTemplate, 'primaryColor' | 'defaultCurrency'>> = {
   primaryColor: '#FF6A2B',
@@ -407,6 +429,16 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
       ? { nights: 'ночей', adults: 'взрослых', child: 'ребёнок', offer: 'ТУР ПРЕДЛОЖЕНИЕ' }
       : { nights: 'kecha', adults: 'kattalar', child: 'bola', offer: 'TUR TAKLIFI' };
 
+    // ── Qo'lda dizayn moslashtirish (TurMaker'dagi "forma" uslubidagi
+    // tahrirlagich — erkin joylashtirish emas, lekin rang/shrift/qorong'ilik) ──
+    const font = /^[a-zA-Z0-9 ,'"-]{2,40}$/.test(input.fontFamily || '')
+      ? input.fontFamily!
+      : 'sans-serif';
+    const textColor = /^#[0-9a-fA-F]{3,8}$/.test(input.textColor || '') ? input.textColor! : '#FFFFFF';
+    const darkness = Math.max(0.3, Math.min(0.95, Number(input.overlayDarkness) || 0.82));
+    const borderWidth = Math.max(0, Math.min(40, Number(input.borderWidth) || 0));
+    const borderColor = /^#[0-9a-fA-F]{3,8}$/.test(input.borderColor || '') ? input.borderColor! : safeColor;
+
     const destination = this.escapeSvg(this.truncate(input.destination, 34));
     const hotel = input.hotelName ? this.escapeSvg(this.truncate(input.hotelName, 30)) : '';
     const stars = input.hotelStars
@@ -437,6 +469,27 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
     const contact = input.agencyContact ? this.escapeSvg(this.truncate(input.agencyContact, 24)) : '';
     const footer = [agency, contact].filter(Boolean).join('   •   ');
 
+    // ── Bir nechta mehmonxona/narx solishtirish (TurMaker uslubida) ──
+    const useHotelList = !!(input.showHotelList && input.hotels && input.hotels.length > 1);
+    const hotelRows = useHotelList ? input.hotels!.slice(0, 3) : [];
+    const rowH = 50;
+    const rowGap = 10;
+    const listTop = size - 350;
+    const hotelListParts: string[] = [];
+    hotelRows.forEach((h, i) => {
+      const rowY = listTop + i * (rowH + rowGap);
+      const hName = this.escapeSvg(this.truncate(h.name || '—', 26));
+      const hStars = h.stars ? ' ' + '★'.repeat(Math.max(0, Math.min(5, Math.round(h.stars)))) : '';
+      const hPrice = this.escapeSvg(`${Math.round(h.price).toLocaleString('ru-RU')} ${input.currency || 'USD'}`);
+      const pillW = Math.min(240, 60 + hPrice.length * 13);
+      hotelListParts.push(`
+  <rect x="60" y="${rowY}" width="${size - 120}" height="${rowH}" rx="12" fill="#FFFFFF" fill-opacity="0.10"/>
+  <text x="78" y="${rowY + 32}" font-family="${font}" font-size="22" font-weight="700" fill="${textColor}">${hName}<tspan fill="#FFD54A">${hStars}</tspan></text>
+  <rect x="${size - 76 - pillW}" y="${rowY + 8}" width="${pillW}" height="34" rx="17" fill="${safeColor}"/>
+  <text x="${size - 76 - pillW / 2}" y="${rowY + 31}" font-family="${font}" font-size="18" font-weight="800" fill="#FFFFFF" text-anchor="middle">${hPrice}</text>`);
+    });
+    const hotelListSvg = hotelListParts.join('\n');
+
     // Narx "chip"ining kengligini matn uzunligiga qarab taxminiy hisoblaymiz
     const priceChipWidth = Math.min(size - 120, 150 + priceText.length * 26);
     // Sana har doim narxdan ALOHIDA qatorda, o'ngga tekislangan — shunda
@@ -461,66 +514,79 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
       if (chipX + w > size - 60) break;
       chipParts.push(
         `<rect x="${chipX}" y="${chipY}" width="${w}" height="32" rx="16" fill="${safeColor}"/>` +
-          `<text x="${chipX + w / 2}" y="${chipY + 22}" font-family="sans-serif" font-size="16" font-weight="700" fill="#FFFFFF" text-anchor="middle">${chip}</text>`,
+          `<text x="${chipX + w / 2}" y="${chipY + 22}" font-family="${font}" font-size="16" font-weight="700" fill="#FFFFFF" text-anchor="middle">${chip}</text>`,
       );
       chipX += w + 8;
     }
     const extraChipsSvg = chipParts.join('\n  ');
+
+    const borderSvg =
+      borderWidth > 0
+        ? `<rect x="${borderWidth / 2}" y="${borderWidth / 2}" width="${size - borderWidth}" height="${size - borderWidth}" fill="none" stroke="${borderColor}" stroke-width="${borderWidth}"/>`
+        : '';
 
     return `
 <svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="fade" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#000000" stop-opacity="0"/>
-      <stop offset="55%" stop-color="#000000" stop-opacity="0.15"/>
-      <stop offset="100%" stop-color="#000000" stop-opacity="0.82"/>
+      <stop offset="55%" stop-color="#000000" stop-opacity="${(darkness * 0.18).toFixed(2)}"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="${darkness.toFixed(2)}"/>
     </linearGradient>
   </defs>
 
   <rect x="0" y="0" width="${size}" height="${size}" fill="url(#fade)"/>
 
   <rect x="60" y="${size - 410}" width="${eyebrowWidth}" height="36" rx="18" fill="#FFFFFF" fill-opacity="0.14" stroke="${safeColor}" stroke-opacity="0.5"/>
-  <text x="76" y="${size - 386}" font-family="sans-serif" font-size="16" font-weight="800" letter-spacing="1.5" fill="${safeColor}">${eyebrowText}</text>
+  <text x="76" y="${size - 386}" font-family="${font}" font-size="16" font-weight="800" letter-spacing="1.5" fill="${safeColor}">${eyebrowText}</text>
 
   ${extraChipsSvg}
 
   ${
     stars
-      ? `<text x="60" y="${size - 330}" font-family="sans-serif" font-size="30" fill="#FFD54A" font-weight="700" letter-spacing="4">${stars}</text>`
+      ? `<text x="60" y="${size - 330}" font-family="${font}" font-size="30" fill="#FFD54A" font-weight="700" letter-spacing="4">${stars}</text>`
       : ''
   }
 
-  <text x="60" y="${size - 280}" font-family="sans-serif" font-size="52" font-weight="800" fill="#FFFFFF">${destination}</text>
+  <text x="60" y="${size - 280}" font-family="${font}" font-size="52" font-weight="800" fill="${textColor}">${destination}</text>
 
   ${
-    hotel
-      ? `<text x="60" y="${size - 220}" font-family="sans-serif" font-size="32" font-weight="600" fill="#F1F1F1">${hotel}</text>`
+    hotel && !useHotelList
+      ? `<text x="60" y="${size - 220}" font-family="${font}" font-size="32" font-weight="600" fill="${textColor}" fill-opacity="0.94">${hotel}</text>`
       : ''
   }
 
   ${
     infoLine
-      ? `<text x="60" y="${size - 170}" font-family="sans-serif" font-size="26" fill="#E0E0E0">${infoLine}</text>`
+      ? `<text x="60" y="${size - 170}" font-family="${font}" font-size="26" fill="${textColor}" fill-opacity="0.85">${infoLine}</text>`
       : ''
   }
 
   ${
+    useHotelList
+      ? hotelListSvg
+      : `
+  ${
     dateLine
       ? `<rect x="${size - 60 - datePillWidth}" y="${size - 150}" width="${datePillWidth}" height="40" rx="20" fill="#FFFFFF" fill-opacity="0.14" stroke="#FFFFFF" stroke-opacity="0.2"/>
-  <text x="${size - 60 - datePillWidth / 2}" y="${size - 124}" font-family="sans-serif" font-size="22" font-weight="600" fill="#FFFFFF" text-anchor="middle">📅 ${dateLine}</text>`
+  <text x="${size - 60 - datePillWidth / 2}" y="${size - 124}" font-family="${font}" font-size="22" font-weight="600" fill="${textColor}" text-anchor="middle">📅 ${dateLine}</text>`
       : ''
   }
 
   <rect x="60" y="${size - 124}" width="${priceChipWidth}" height="72" rx="16" fill="${safeColor}"/>
-  <text x="${60 + priceChipWidth / 2}" y="${size - 78}" font-family="sans-serif" font-size="38" font-weight="800" fill="#FFFFFF" text-anchor="middle">${priceText}</text>
+  <text x="${60 + priceChipWidth / 2}" y="${size - 78}" font-family="${font}" font-size="38" font-weight="800" fill="#FFFFFF" text-anchor="middle">${priceText}</text>
+  `
+  }
 
   ${footer ? `<rect x="60" y="${size - 46}" width="${size - 120}" height="1" fill="#FFFFFF" fill-opacity="0.16"/>` : ''}
 
   ${
     footer
-      ? `<text x="60" y="${size - 26}" font-family="sans-serif" font-size="22" fill="#CFCFCF">${footer}</text>`
+      ? `<text x="60" y="${size - 26}" font-family="${font}" font-size="22" fill="#CFCFCF">${footer}</text>`
       : ''
   }
+
+  ${borderSvg}
 </svg>`.trim();
   }
 
@@ -585,6 +651,38 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
   // ─────────────────────────────────────────────────────────────
   // TAYYOR REKLAMANI YUBORISH
   // ─────────────────────────────────────────────────────────────
+
+  // ─────────────────────────────────────────────────────────────
+  // TELEGRAM XABAR ANDOZASI (TurMaker uslubida) — Claude yozgan
+  // erkin matn o'rniga, agentlik o'zi belgilagan qat'iy formatda
+  // yuborish uchun. Andoza `AdTemplate.telegramMessageTemplate`da
+  // saqlanadi, bo'lmasa DEFAULT_TELEGRAM_TEMPLATE ishlatiladi.
+  // ─────────────────────────────────────────────────────────────
+  private renderTemplateString(tpl: string, input: TourAdInput, template: AdTemplate): string {
+    const people = `${input.adults || 1} kattalar${input.children ? `, ${input.children} bola` : ''}`;
+    const stars = input.hotelStars ? '★'.repeat(Math.max(0, Math.min(5, Math.round(input.hotelStars)))) : '';
+    const map: Record<string, string> = {
+      destination: input.destination || '',
+      hotel: input.hotelName || '',
+      stars,
+      nights: input.nights ? String(input.nights) : '',
+      meal: input.mealPlan || '',
+      people,
+      price: `${Math.round(input.price || 0).toLocaleString('ru-RU')} ${input.currency || 'USD'}`,
+      dates: input.departureDate
+        ? `${input.departureDate}${input.returnDate ? ` — ${input.returnDate}` : ''}`
+        : '',
+      agency: input.agencyName || template.agencyName || '',
+      contact: input.agencyContact || template.agencyContact || '',
+    };
+    return tpl.replace(/\{(\w+)\}/g, (_m, key: string) => map[key] ?? '').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  async renderTelegramTemplate(tenantId: string, rawInput: TourAdInput): Promise<{ text: string }> {
+    const { input, template } = await this.mergeWithTemplate(tenantId, rawInput);
+    const tpl = template.telegramMessageTemplate?.trim() || DEFAULT_TELEGRAM_TEMPLATE;
+    return { text: this.renderTemplateString(tpl, input, template) };
+  }
 
   /**
    * ✅ TELEGRAM: to'liq ishlaydi. Tenant'ning mavjud Telegram botidan
@@ -834,6 +932,13 @@ export class AiMarketingController {
   }
 
   // ── YUBORISH ──
+
+  /** Telegram uchun qat'iy formatdagi andozani (shablonni) tur ma'lumotlari bilan to'ldirib ko'rsatadi */
+  @Post('telegram/render-template')
+  renderTelegramTemplate(@CurrentUser() u: any, @Body() body: TourAdInput) {
+    if (!body?.destination) throw new BadRequestException("Yo'nalish (destination) kiritilishi shart");
+    return this.svc.renderTelegramTemplate(u.tenantId, body);
+  }
 
   /** Tayyor bannerni Telegram kanaliga yuboradi (bot kanalga admin bo'lishi shart) */
   @Post('send/telegram')
