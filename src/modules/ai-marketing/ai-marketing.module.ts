@@ -77,15 +77,23 @@ export interface TourAdInput {
 
   // ─────────────────────────────────────────────────────────────
   // ERKIN JOYLASHTIRISH (drag & drop) — foydalanuvchi jonli
-  // preview'da har bir blokni (sarlavha guruhi, narx/sana, footer,
-  // brend logotipi) sichqoncha bilan sudrab, o'zi xohlagan joyga
-  // qo'yishi mumkin. Har biri banner o'lchamiga NISBATAN foiz (%)
-  // siljish (dx/dy) sifatida saqlanadi — standart joylashuvdan
-  // qanchalik surilganini bildiradi (0/0 = standart joy).
+  // preview'da HAR BIR alohida elementni (eyebrow, urg'u chiplari,
+  // yulduzlar, sarlavha, mehmonxona nomi, info qatori, narx, sana,
+  // footer, brend logotipi) BIR-BIRIDAN MUSTAQIL sichqoncha bilan
+  // sudrab, o'zi xohlagan joyga qo'yishi mumkin — hech biri boshqa
+  // elementga "yopishtirilgan" emas. Har biri banner o'lchamiga
+  // NISBATAN foiz (%) siljish (dx/dy) sifatida saqlanadi — standart
+  // joylashuvdan qanchalik surilganini bildiradi (0/0 = standart joy).
   // ─────────────────────────────────────────────────────────────
   layout?: {
-    header?: { dx: number; dy: number }; // eyebrow+chip+yulduz+nom+mehmonxona+info bloki
-    price?: { dx: number; dy: number }; // narx chip + sana (yoki mehmonxonalar ro'yxati)
+    badge?: { dx: number; dy: number }; // "✨ TUR TAKLIFI" yorlig'i
+    chips?: { dx: number; dy: number }; // qo'shimcha urg'u matnlari qatori
+    stars?: { dx: number; dy: number }; // mehmonxona yulduzchalari
+    title?: { dx: number; dy: number }; // yo'nalish nomi (sarlavha)
+    hotel?: { dx: number; dy: number }; // mehmonxona nomi
+    info?: { dx: number; dy: number }; // kecha/ovqatlanish/kishilar qatori
+    price?: { dx: number; dy: number }; // narx chip (yoki mehmonxonalar ro'yxati)
+    date?: { dx: number; dy: number }; // sana pill'i
     footer?: { dx: number; dy: number }; // agentlik nomi/kontakt
     logo?: { dx: number; dy: number }; // brend logotipi
   };
@@ -158,6 +166,9 @@ export class AiMarketingService {
   }
   private get pexelsKey() {
     return (process.env.PEXELS_API_KEY || '').trim();
+  }
+  private get unsplashKey() {
+    return (process.env.UNSPLASH_ACCESS_KEY || '').trim();
   }
 
   isConfigured(): boolean {
@@ -252,9 +263,9 @@ export class AiMarketingService {
   }
 
   /**
-   * Pexels (bepul stok-foto xizmati) orqali mavzuga mos rasmlarni
-   * topadi. API kalit sozlanmagan bo'lsa — bo'sh massiv qaytaradi
-   * (xato chiqarmaydi, chunki bu ixtiyoriy funksiya).
+   * Pexels/Unsplash (bepul stok-foto xizmatlari) orqali mavzuga mos
+   * rasmlarni topadi. API kalit sozlanmagan bo'lsa — bo'sh massiv
+   * qaytaradi (xato chiqarmaydi, chunki bu ixtiyoriy funksiya).
    */
   /**
    * Bitta Pexels qidiruv so'rovi (ichki yordamchi). `page` — xilma-xillik
@@ -262,6 +273,7 @@ export class AiMarketingService {
    * sahifadan olamiz).
    */
   private async pexelsSearch(query: string, perPage: number, page = 1): Promise<string[]> {
+    if (!this.pexelsKey) return [];
     try {
       const url =
         `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}` +
@@ -277,42 +289,122 @@ export class AiMarketingService {
         .map((p: any) => p?.src?.large || p?.src?.medium || p?.src?.original)
         .filter((u: any) => typeof u === 'string' && u.length > 0);
     } catch (e: any) {
-      this.logger.warn(`Rasm qidirishda xato ("${query}"): ${e.message}`);
+      this.logger.warn(`Pexels'dan rasm qidirishda xato ("${query}"): ${e.message}`);
       return [];
     }
   }
 
   /**
-   * TurMaker uslubida — HAR BIR yo'nalish/davlat/shahar uchun O'ZIGA XOS
-   * rasmlar to'plami qaytarishi kerak, faqat bitta statik so'rov emas.
-   * Shu sabab bitta umumiy so'rov o'rniga, kiritilgan matndan (masalan
-   * "Antalya, Turkiya") bir nechta MA'NOLI variant so'rov quramiz —
-   * mehmonxona/kurort, plyaj, shahar manzarasi, tabiat/diqqatga sazovor
-   * joy — va ularning har biridan bir nechtadan olib birlashtiramiz.
-   * Natijada rasmlar aynan shu yo'nalishga xos va xilma-xil chiqadi,
-   * har safar chaqirilganda ham (sahifa raqami tasodifiy tanlanadi
-   * tufayli) boshqacharoq to'plam ko'rsatiladi.
+   * Unsplash — Pexels bilan bir qatorda ikkinchi manba sifatida
+   * ishlatiladi (ixtiyoriy: `UNSPLASH_ACCESS_KEY` sozlansa yoqiladi).
+   * Ikki manbani birlashtirish natijalarni ko'proq va xilma-xil qiladi.
+   */
+  private async unsplashSearch(query: string, perPage: number, page = 1): Promise<string[]> {
+    if (!this.unsplashKey) return [];
+    try {
+      const url =
+        `https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}` +
+        `&per_page=${Math.max(1, Math.min(perPage, 15))}&page=${Math.max(1, page)}&orientation=squarish`;
+      const res = await fetch(url, { headers: { Authorization: `Client-ID ${this.unsplashKey}` } });
+      if (!res.ok) {
+        this.logger.warn(`Unsplash xato (HTTP ${res.status}) so'rov: "${query}"`);
+        return [];
+      }
+      const j: any = await res.json();
+      const photos = Array.isArray(j?.results) ? j.results : [];
+      return photos
+        .map((p: any) => p?.urls?.regular || p?.urls?.small)
+        .filter((u: any) => typeof u === 'string' && u.length > 0);
+    } catch (e: any) {
+      this.logger.warn(`Unsplash'dan rasm qidirishda xato ("${query}"): ${e.message}`);
+      return [];
+    }
+  }
+
+  /**
+   * TurMaker'dagi kabi — mashhur yo'nalishlar davlat bo'yicha bo'lingan,
+   * har biri o'ziga xos, aniq nomlangan joy. Foydalanuvchi "Antalya"
+   * yozganda umumiy "hotel resort" so'zlariga tayanib noaniq natija
+   * olish o'rniga, shu ro'yxatdagi TANISH joy nomi topilsa — qidiruvga
+   * uning davlat/mintaqa nomi ham avtomatik qo'shiladi (masalan
+   * "Antalya" → "Antalya Turkey"), bu esa Pexels/Unsplash'dan AYNAN
+   * o'sha joyga oid rasm chiqish ehtimolini sezilarli oshiradi.
+   * Ro'yxat frontendda "Mashhur yo'nalishlar" tanlagichi sifatida ham
+   * ko'rsatiladi (`GET /ai-marketing/destinations`).
+   */
+  static readonly POPULAR_DESTINATIONS: Array<{ country: string; countryUz: string; places: string[] }> = [
+    { country: 'Turkey', countryUz: 'Turkiya', places: ['Antalya', 'Alanya', 'Side', 'Kemer', 'Bodrum', 'Marmaris', 'Istanbul', 'Fethiye'] },
+    { country: 'UAE', countryUz: 'BAA (Dubay)', places: ['Dubai', 'Abu Dhabi', 'Sharjah', 'Ras Al Khaimah', 'Ajman'] },
+    { country: 'Egypt', countryUz: 'Misr', places: ['Hurghada', 'Sharm El Sheikh', 'Marsa Alam', 'Cairo'] },
+    { country: 'Thailand', countryUz: 'Tailand', places: ['Phuket', 'Pattaya', 'Bangkok', 'Krabi', 'Koh Samui'] },
+    { country: 'Maldives', countryUz: 'Maldiv orollari', places: ['Male', 'Maldives resort island'] },
+    { country: 'Georgia', countryUz: 'Gruziya', places: ['Tbilisi', 'Batumi', 'Kazbegi', 'Bakuriani'] },
+    { country: 'Azerbaijan', countryUz: 'Ozarbayjon', places: ['Baku', 'Gabala'] },
+    { country: 'Malaysia', countryUz: 'Malayziya', places: ['Kuala Lumpur', 'Langkawi', 'Penang'] },
+    { country: 'Indonesia', countryUz: 'Indoneziya', places: ['Bali', 'Jakarta'] },
+    { country: 'Vietnam', countryUz: 'Vyetnam', places: ['Nha Trang', 'Phu Quoc', 'Da Nang', 'Hanoi'] },
+    { country: 'Sri Lanka', countryUz: 'Shri-Lanka', places: ['Colombo', 'Bentota', 'Kandy'] },
+    { country: 'Saudi Arabia', countryUz: 'Saudiya Arabistoni', places: ['Mecca', 'Medina', 'Jeddah'] },
+    { country: 'Europe', countryUz: 'Yevropa', places: ['Paris', 'Rome', 'Prague', 'Barcelona', 'Milan', 'Vienna'] },
+    { country: 'Russia', countryUz: 'Rossiya', places: ['Moscow', 'Sochi', 'Saint Petersburg'] },
+    { country: 'Kazakhstan', countryUz: 'Qozog\u2019iston', places: ['Almaty', 'Astana'] },
+    { country: 'South Korea', countryUz: 'Janubiy Koreya', places: ['Seoul', 'Busan'] },
+    { country: 'Singapore', countryUz: 'Singapur', places: ['Singapore'] },
+  ];
+
+  /** Frontenddagi "Mashhur yo'nalishlar" tanlagichi uchun. */
+  getPopularDestinations() {
+    return AiMarketingService.POPULAR_DESTINATIONS;
+  }
+
+  /** Kiritilgan matn ichidan ro'yxatdagi tanish joy nomini (bo'lsa) topadi. */
+  private matchKnownPlace(text: string): { place: string; country: string } | null {
+    const t = (text || '').toLowerCase();
+    for (const group of AiMarketingService.POPULAR_DESTINATIONS) {
+      for (const place of group.places) {
+        if (t.includes(place.toLowerCase())) {
+          return { place, country: group.country };
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * HAR BIR yo'nalish/davlat/shahar uchun O'ZIGA XOS rasmlar to'plami
+   * qaytarishi kerak, faqat bitta statik so'rov emas. Shu sabab bitta
+   * umumiy so'rov o'rniga, kiritilgan matndan bir nechta MA'NOLI
+   * variant so'rov quramiz — TO'LIQ kiritilgan matn (eng aniq moslik),
+   * ro'yxatdan topilgan tanish joy + davlati (bo'lsa), keyin
+   * mehmonxona/kurort, plyaj, shahar manzarasi, tabiat/diqqatga
+   * sazovor joy variantlari. Bularning har biridan bir nechtadan olib
+   * birlashtiramiz — natijada rasmlar aynan shu yo'nalishga xos va
+   * xilma-xil chiqadi.
    */
   private buildImageQueryVariants(baseQuery: string): string[] {
     const q = (baseQuery || '').trim();
     if (!q) return ['travel destination'];
-    // "Antalya, Turkiya hotel resort travel" kabi so'rovlardan faqat
-    // haqiqiy joy nomini (birinchi bo'lak, vergulgacha) ajratib olamiz —
-    // "hotel resort travel" degan qo'shimcha so'zlar variant qidiruvlarga
-    // o'zimiz alohida qo'shamiz, shuning uchun bu yerda kerak emas.
-    const place = q.split(',')[0].replace(/\b(hotel|resort|travel)\b/gi, '').trim() || q;
-    return [
+    const place = q.split(',')[0].trim() || q;
+    const known = this.matchKnownPlace(q);
+
+    const variants = [
+      q, // foydalanuvchi TO'LIQ kiritgan matn — eng aniq moslik birinchi navbatda
+      place,
+      known ? `${known.place} ${known.country}` : `${place} ${q.split(',')[1]?.trim() || ''}`.trim(),
       `${place} resort hotel`,
       `${place} beach`,
       `${place} city landmark`,
       `${place} aerial view`,
-      `${place} travel`,
     ];
+    // Bo'sh yoki takrorlanuvchi variantlarni tozalaymiz
+    return Array.from(new Set(variants.map((v) => v.trim()).filter(Boolean)));
   }
 
   async findImages(query: string, count = 4): Promise<string[]> {
-    if (!this.pexelsKey) {
-      this.logger.warn('PEXELS_API_KEY sozlanmagan — rasm qidirish o\'tkazib yuborildi');
+    if (!this.pexelsKey && !this.unsplashKey) {
+      this.logger.warn(
+        "PEXELS_API_KEY yoki UNSPLASH_ACCESS_KEY sozlanmagan — rasm qidirish o'tkazib yuborildi",
+      );
       return [];
     }
     const variants = this.buildImageQueryVariants(query);
@@ -321,12 +413,15 @@ export class AiMarketingService {
     // so'raymiz — chunki dublikatlar filtrlanadi)
     const perVariant = Math.max(2, Math.ceil((target * 1.4) / variants.length));
     // Xilma-xillik uchun: har chaqirilganda tasodifiy sahifadan boshlaymiz —
-    // shunda foydalanuvchi "qayta qidirish"ni bossa, doim bir xil 10 ta
-    // rasm chiqavermaydi, TurMaker'dagi kabi har safar boshqa variantlar keladi.
+    // shunda foydalanuvchi "qayta qidirish"ni bossa, doim bir xil rasmlar
+    // chiqavermaydi, har safar boshqa variantlar keladi.
     const randomPage = () => 1 + Math.floor(Math.random() * 3);
 
     const results = await Promise.all(
-      variants.map((v) => this.pexelsSearch(v, perVariant, randomPage())),
+      variants.flatMap((v) => [
+        this.pexelsSearch(v, perVariant, randomPage()),
+        this.unsplashSearch(v, perVariant, randomPage()),
+      ]),
     );
 
     // Birlashtiramiz, dublikatlarni olib tashlaymiz, so'ng aralashtiramiz —
@@ -542,7 +637,7 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
    */
   private resolveOffset(
     input: TourAdInput,
-    key: 'header' | 'price' | 'footer' | 'logo',
+    key: 'badge' | 'chips' | 'stars' | 'title' | 'hotel' | 'info' | 'price' | 'date' | 'footer' | 'logo',
     size: number,
   ): { dx: number; dy: number } {
     const raw = input.layout?.[key];
@@ -665,8 +760,14 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
     // ── Erkin joylashtirish: har bir guruhning standart joyidan qancha
     // sudralganini pikselga aylantiramiz (foydalanuvchi hech narsani
     // sudramagan bo'lsa — 0,0, ya'ni ko'rinish avvalgidek qoladi) ──
-    const headerOff = this.resolveOffset(input, 'header', size);
+    const badgeOff = this.resolveOffset(input, 'badge', size);
+    const chipsOff = this.resolveOffset(input, 'chips', size);
+    const starsOff = this.resolveOffset(input, 'stars', size);
+    const titleOff = this.resolveOffset(input, 'title', size);
+    const hotelOff = this.resolveOffset(input, 'hotel', size);
+    const infoOff = this.resolveOffset(input, 'info', size);
     const priceOff = this.resolveOffset(input, 'price', size);
+    const dateOff = this.resolveOffset(input, 'date', size);
     const footerOff = this.resolveOffset(input, 'footer', size);
     const logoOff = this.resolveOffset(input, 'logo', size);
 
@@ -695,50 +796,54 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
 
   <rect x="0" y="0" width="${size}" height="${size}" fill="url(#fade)"/>
 
-  <g transform="translate(${headerOff.dx.toFixed(1)},${headerOff.dy.toFixed(1)})">
+  <g transform="translate(${badgeOff.dx.toFixed(1)},${badgeOff.dy.toFixed(1)})">
   <rect x="60" y="${size - 410}" width="${eyebrowWidth}" height="36" rx="18" fill="#FFFFFF" fill-opacity="0.14" stroke="${safeColor}" stroke-opacity="0.5"/>
   <text x="76" y="${size - 386}" font-family="${font}" font-size="16" font-weight="800" letter-spacing="1.5" fill="${safeColor}">${eyebrowText}</text>
+  </g>
 
+  <g transform="translate(${chipsOff.dx.toFixed(1)},${chipsOff.dy.toFixed(1)})">
   ${extraChipsSvg}
+  </g>
 
   ${
     stars
-      ? `<text x="60" y="${size - 330}" font-family="${font}" font-size="30" fill="#FFD54A" font-weight="700" letter-spacing="4">${stars}</text>`
+      ? `<g transform="translate(${starsOff.dx.toFixed(1)},${starsOff.dy.toFixed(1)})"><text x="60" y="${size - 330}" font-family="${font}" font-size="30" fill="#FFD54A" font-weight="700" letter-spacing="4">${stars}</text></g>`
       : ''
   }
 
+  <g transform="translate(${titleOff.dx.toFixed(1)},${titleOff.dy.toFixed(1)})">
   <text x="60" y="${size - 280}" font-family="${font}" font-size="52" font-weight="800" fill="${textColor}">${destination}</text>
+  </g>
 
   ${
     hotel && !useHotelList
-      ? `<text x="60" y="${size - 220}" font-family="${font}" font-size="32" font-weight="600" fill="${textColor}" fill-opacity="0.94">${hotel}</text>`
+      ? `<g transform="translate(${hotelOff.dx.toFixed(1)},${hotelOff.dy.toFixed(1)})"><text x="60" y="${size - 220}" font-family="${font}" font-size="32" font-weight="600" fill="${textColor}" fill-opacity="0.94">${hotel}</text></g>`
       : ''
   }
 
   ${
     infoLine
-      ? `<text x="60" y="${size - 170}" font-family="${font}" font-size="26" fill="${textColor}" fill-opacity="0.85">${infoLine}</text>`
+      ? `<g transform="translate(${infoOff.dx.toFixed(1)},${infoOff.dy.toFixed(1)})"><text x="60" y="${size - 170}" font-family="${font}" font-size="26" fill="${textColor}" fill-opacity="0.85">${infoLine}</text></g>`
       : ''
   }
-  </g>
 
   <g transform="translate(${priceOff.dx.toFixed(1)},${priceOff.dy.toFixed(1)})">
   ${
     useHotelList
       ? hotelListSvg
-      : `
-  ${
-    dateLine
-      ? `<rect x="${size - 60 - datePillWidth}" y="${size - 150}" width="${datePillWidth}" height="40" rx="20" fill="#FFFFFF" fill-opacity="0.14" stroke="#FFFFFF" stroke-opacity="0.2"/>
-  <text x="${size - 60 - datePillWidth / 2}" y="${size - 124}" font-family="${font}" font-size="22" font-weight="600" fill="${textColor}" text-anchor="middle">📅 ${dateLine}</text>`
-      : ''
-  }
-
-  <rect x="60" y="${size - 124}" width="${priceChipWidth}" height="72" rx="16" fill="${safeColor}"/>
-  <text x="${60 + priceChipWidth / 2}" y="${size - 78}" font-family="${font}" font-size="38" font-weight="800" fill="#FFFFFF" text-anchor="middle">${priceText}</text>
-  `
+      : `<rect x="60" y="${size - 124}" width="${priceChipWidth}" height="72" rx="16" fill="${safeColor}"/>
+  <text x="${60 + priceChipWidth / 2}" y="${size - 78}" font-family="${font}" font-size="38" font-weight="800" fill="#FFFFFF" text-anchor="middle">${priceText}</text>`
   }
   </g>
+
+  ${
+    dateLine && !useHotelList
+      ? `<g transform="translate(${dateOff.dx.toFixed(1)},${dateOff.dy.toFixed(1)})">
+  <rect x="${size - 60 - datePillWidth}" y="${size - 150}" width="${datePillWidth}" height="40" rx="20" fill="#FFFFFF" fill-opacity="0.14" stroke="#FFFFFF" stroke-opacity="0.2"/>
+  <text x="${size - 60 - datePillWidth / 2}" y="${size - 124}" font-family="${font}" font-size="22" font-weight="600" fill="${textColor}" text-anchor="middle">📅 ${dateLine}</text>
+  </g>`
+      : ''
+  }
 
   <g transform="translate(${footerOff.dx.toFixed(1)},${footerOff.dy.toFixed(1)})">
   ${footer ? `<rect x="60" y="${size - 46}" width="${size - 120}" height="1" fill="#FFFFFF" fill-opacity="0.16"/>` : ''}
@@ -1091,6 +1196,12 @@ export class AiMarketingController {
   images(@CurrentUser() _u: any, @Body() body: { query: string; count?: number }) {
     if (!body?.query) throw new BadRequestException("Qidiruv so'zi (query) kerak");
     return this.svc.findImages(body.query, body.count || 16);
+  }
+
+  /** TurMaker uslubidagi "davlat → mashhur joylar" ro'yxati (tanlagich uchun) */
+  @Get('destinations')
+  destinations(@CurrentUser() _u: any) {
+    return this.svc.getPopularDestinations();
   }
 
   /** Tur ma'lumotlaridan tayyor 1080×1080 banner (PNG URL) yaratadi */
