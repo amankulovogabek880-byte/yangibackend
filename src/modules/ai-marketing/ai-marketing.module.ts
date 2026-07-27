@@ -175,6 +175,11 @@ export class AiMarketingService {
     return !!this.anthropicKey;
   }
 
+  /** Rasm qidirish uchun kamida bitta manba (Pexels yoki Unsplash) sozlanganmi. */
+  imagesConfigured(): boolean {
+    return !!this.pexelsKey || !!this.unsplashKey;
+  }
+
   // ─────────────────────────────────────────────────────────────
   // SHABLON (Template) — agentlik brendi/kontaktini bir marta
   // kiritib, har safar qayta ishlatish uchun
@@ -405,6 +410,11 @@ export class AiMarketingService {
       this.logger.warn(
         "PEXELS_API_KEY yoki UNSPLASH_ACCESS_KEY sozlanmagan — rasm qidirish o'tkazib yuborildi",
       );
+      // Ichki chaqiruvchilar (generateTourAd, generateBanner) bo'sh
+      // massiv bilan yumshoq (graceful) davom etadi, shu sabab bu yerda
+      // xato tashlamaymiz — lekin foydalanuvchi TO'G'RIDAN-TO'G'RI
+      // "🔍 Rasm topish" tugmasini bosganda aniq sabab ko'rsatilishi
+      // uchun controller darajasida (`imagesForUser`) alohida tekshiruv bor.
       return [];
     }
     const variants = this.buildImageQueryVariants(query);
@@ -1195,6 +1205,16 @@ export class AiMarketingController {
   @Post('images')
   images(@CurrentUser() _u: any, @Body() body: { query: string; count?: number }) {
     if (!body?.query) throw new BadRequestException("Qidiruv so'zi (query) kerak");
+    // Bu yerda (foydalanuvchi "🔍 Rasm topish"ni to'g'ridan-to'g'ri bosganda)
+    // sabab ANIQ ko'rsatilishi kerak — aks holda "rasm topilmadi" umuman
+    // noaniq bo'lib qoladi, admin muammoni tushuna olmaydi.
+    if (!this.svc.imagesConfigured()) {
+      throw new BadRequestException(
+        "Rasm qidirish yoqilmagan: serverda PEXELS_API_KEY yoki UNSPLASH_ACCESS_KEY " +
+          "o'rnatilmagan. Bepul kalitni pexels.com/api yoki unsplash.com/developers'dan " +
+          "olib, backend serveridagi .env fayliga qo'shing va serverni qayta ishga tushiring.",
+      );
+    }
     return this.svc.findImages(body.query, body.count || 16);
   }
 
