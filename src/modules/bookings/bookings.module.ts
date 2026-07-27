@@ -78,15 +78,6 @@ export class BookingsService {
       },
     });
     if (!booking) throw new NotFoundException('Booking topilmadi');
-    // BUG2 FIX: booking.created event
-    try {
-      this.eventEmitter.emit('booking.created', {
-        tenantId: booking.tenantId,
-        clientId: booking.clientId,
-        bookingId: booking.id,
-        assignedAgentId: booking.agentId,
-      });
-    } catch {}
     return booking;
   }
 
@@ -258,6 +249,22 @@ export class BookingsService {
 
     // Recalc client stats
     await this.clients.recalcStats(client.id);
+
+    // v14 XATO TUZATISH: bu hodisa avval xato joyda — findOne() ichida,
+    // ya'ni HAR BIR marta booking sahifasi ochilganda yoki yangilanganda
+    // — chaqirilardi. Natijada "BOOKING_CREATED" avtomatlashtirish
+    // (masalan, mijozga WhatsApp/SMS tasdiqlash xabari) booking shunchaki
+    // KO'RILGANDA yoki TAHRIRLANGANDA ham qayta-qayta ishga tushib,
+    // mijozga bir xil xabar bir necha marta ketishi mumkin edi.
+    // Endi bu hodisa FAQAT haqiqiy yaratilish paytida, bir marta chiqadi.
+    try {
+      this.eventEmitter.emit('booking.created', {
+        tenantId: booking.tenantId,
+        clientId: booking.clientId,
+        bookingId: booking.id,
+        assignedAgentId: booking.agentId,
+      });
+    } catch {}
 
     // Notify agent
     if (agentId && agentId !== userId) {

@@ -7,6 +7,7 @@ import {
   Patch,
   Delete,
   Param,
+  Query,
   Body,
   UseGuards,
   UseInterceptors,
@@ -74,6 +75,16 @@ export interface TourAdInput {
   overlayDarkness?: number; // 0..1 — fon suratining pastki qorong'ilashuv kuchi
   borderColor?: string; // agar berilsa, banner atrofida ramka chiziladi
   borderWidth?: number; // px, default 0 (ramka yo'q)
+
+  // Banner o'lchami — "square" (1080×1080, Instagram post/Facebook) yoki
+  // "story" (1080×1920, Instagram/Telegram Story). Berilmasa "square".
+  bannerFormat?: 'square' | 'story';
+  // Tayyor dizayn uslubi (TurMaker'dagi "bir nechta shablon" g'oyasi):
+  // "classic" — standart (nishon + urg'u chiplari + narx chip'i),
+  // "minimal" — sodda, kamroq element, yumshoqroq qorong'ilashuv,
+  // "bold" — pastda to'liq kenglikdagi rangli chiziq, yirik narx.
+  // Berilmasa "classic".
+  bannerTheme?: 'classic' | 'minimal' | 'bold';
 
   // ─────────────────────────────────────────────────────────────
   // ERKIN JOYLASHTIRISH (drag & drop) — foydalanuvchi jonli
@@ -243,6 +254,99 @@ export class AiMarketingService {
   /** Bannerdan logotipni olib tashlash (shablondan o'chirish) */
   async removeLogo(tenantId: string): Promise<AdTemplate> {
     return this.saveTemplate(tenantId, { logoUrl: '' });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // MEHMONXONA RASM KUTUBXONASI — agentlik biror mehmonxonaning
+  // O'ZINING haqiqiy suratini bir marta yuklasa, keyingi safar o'sha
+  // mehmonxona nomi kiritilganda avtomatik taklif qilinadi (stok-foto
+  // o'rniga). `Tenant.settings.hotelPhotoLibrary` JSON ustunida
+  // saqlanadi — yangi migratsiya (schema o'zgarishi) SHART EMAS,
+  // aynan `adTemplate` bilan bir xil yondashuv.
+  // Kalit — mehmonxona nomi kichik harfda va bo'sh joylarsiz
+  // ("Rixos Premium" → "rixospremium"), shunda "Rixos premium" va
+  // "rixos Premium" bir xil kutubxonaga tushadi.
+  // ─────────────────────────────────────────────────────────────
+  private normalizeHotelKey(hotelName: string): string {
+    return (hotelName || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+
+  /** Berilgan mehmonxona uchun avval saqlangan rasmlar ro'yxati (eng yangisi birinchi). */
+  async getHotelPhotos(tenantId: string, hotelName: string): Promise<string[]> {
+    const key = this.normalizeHotelKey(hotelName);
+    if (!key) return [];
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const library = ((tenant?.settings as any) || {}).hotelPhotoLibrary || {};
+    const list = Array.isArray(library[key]) ? library[key] : [];
+    return list;
+  }
+
+  /** Barcha mehmonxonalar ro'yxati (nom → nechta rasm saqlangan) — kelajakda "kutubxona" sahifasi uchun. */
+  async listHotelPhotoLibrary(tenantId: string): Promise<Array<{ hotelName: string; photos: string[] }>> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const library = ((tenant?.settings as any) || {}).hotelPhotoLibrary || {};
+    return Object.entries(library).map(([hotelName, photos]) => ({
+      hotelName,
+      photos: Array.isArray(photos) ? (photos as string[]) : [],
+    }));
+  }
+
+  /** Mehmonxona uchun yangi rasm (fayl) kutubxonaga yuklab qo'shadi. */
+  async saveHotelPhoto(tenantId: string, hotelName: string, file: Express.Multer.File): Promise<string[]> {
+    if (!hotelName?.trim()) throw new BadRequestException('Mehmonxona nomi kerak');
+    if (!file) throw new BadRequestException('Fayl yuklanmadi');
+    if (!file.mimetype?.startsWith('image/') || file.mimetype === 'image/svg+xml') {
+      throw new BadRequestException("Rasm faqat PNG/JPG/WEBP bo'lishi kerak. SVG qabul qilinmaydi.");
+    }
+    const key = this.normalizeHotelKey(hotelName);
+    const url = await uploadBufferToStorage(file.buffer, file.originalname || 'hotel.jpg', file.mimetype);
+
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    if (!tenant) throw new NotFoundException('Tenant topilmadi');
+    const currentSettings = (tenant.settings as any) || {};
+    const library = { ...(currentSettings.hotelPhotoLibrary || {}) };
+    // Eng yangisi ro'yxat boshida chiqishi uchun oldiga qo'shamiz, mehmonxona
+    // uchun ko'p bo'lib ketmasligi uchun ko'pi bilan 12 tasini saqlaymiz
+    const existing: string[] = Array.isArray(library[key]) ? library[key] : [];
+    library[key] = [url, ...existing.filter((u) => u !== url)].slice(0, 12);
+
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: { settings: { ...currentSettings, hotelPhotoLibrary: library } as any },
+    });
+
+    return library[key];
+  }
+
+  /** Kutubxonadan bitta rasmni o'chirish. */
+  async deleteHotelPhoto(tenantId: string, hotelName: string, url: string): Promise<string[]> {
+    const key = this.normalizeHotelKey(hotelName);
+    if (!key) throw new BadRequestException('Mehmonxona nomi kerak');
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    if (!tenant) throw new NotFoundException('Tenant topilmadi');
+    const currentSettings = (tenant.settings as any) || {};
+    const library = { ...(currentSettings.hotelPhotoLibrary || {}) };
+    const existing: string[] = Array.isArray(library[key]) ? library[key] : [];
+    library[key] = existing.filter((u) => u !== url);
+
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: { settings: { ...currentSettings, hotelPhotoLibrary: library } as any },
+    });
+
+    return library[key];
   }
 
   /**
@@ -590,14 +694,21 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
   async generateTourAd(tenantId: string, rawInput: TourAdInput): Promise<TourAdOutput> {
     const { input } = await this.mergeWithTemplate(tenantId, rawInput);
 
-    const [images, posts] = await Promise.all([
+    const [libraryPhotos, images, posts] = await Promise.all([
+      input.hotelName ? this.getHotelPhotos(tenantId, input.hotelName) : Promise.resolve([]),
       input.imageUrl
         ? Promise.resolve([input.imageUrl])
         : this.findImages(input.destination, 16),
       this.generatePosts(input),
     ]);
 
-    return { images, posts };
+    // Kutubxonadagi (agentlik o'zi yuklagan, haqiqiy) suratlar stok-fotodan
+    // OLDIN ko'rsatiladi — chunki bular aynan shu mehmonxonaga tegishli.
+    const mergedImages = input.imageUrl
+      ? images
+      : Array.from(new Set([...libraryPhotos, ...images]));
+
+    return { images: mergedImages, posts };
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -648,22 +759,39 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
   private resolveOffset(
     input: TourAdInput,
     key: 'badge' | 'chips' | 'stars' | 'title' | 'hotel' | 'info' | 'price' | 'date' | 'footer' | 'logo',
-    size: number,
+    width: number,
+    height: number,
   ): { dx: number; dy: number } {
     const raw = input.layout?.[key];
     if (!raw) return { dx: 0, dy: 0 };
     const clampPct = (n: number) => Math.max(-90, Math.min(90, Number(n) || 0));
     return {
-      dx: (clampPct(raw.dx) / 100) * size,
-      dy: (clampPct(raw.dy) / 100) * size,
+      dx: (clampPct(raw.dx) / 100) * width,
+      dy: (clampPct(raw.dy) / 100) * height,
     };
   }
 
+  /**
+   * `width`/`height` — banner o'lchami: "square" uchun 1080×1080,
+   * "story" uchun 1080×1920 (ikkalasi ham chaqiruvchidan keladi).
+   * Matn blokining HAMMASI pastki chetdan hisoblangan masofa bilan
+   * joylashtirilgan (`height - N`) — shu sabab "story" formatida
+   * xuddi shu blok pastda, xuddi shunday o'lchamda turadi, faqat
+   * ustida ko'proq bo'sh joy (fon surati) qoladi — bu Instagram
+   * Story'larning odatiy ko'rinishi.
+   *
+   * `theme` — TurMaker uslubidagi "bir nechta tayyor shablon"dan
+   * biri: "classic" (standart, avvalgi ko'rinish bilan 100% bir xil),
+   * "minimal" (nishon/chiplarsiz, yumshoqroq qorong'ilashuv) yoki
+   * "bold" (pastda to'liq kenglikdagi rangli chiziq, yirikroq narx).
+   */
   private buildBannerSvg(
     input: TourAdInput,
     accentColor = '#FF6A2B',
-    size = 1080,
+    width = 1080,
+    height = width,
     logo?: { dataUri: string; size: number },
+    theme: 'classic' | 'minimal' | 'bold' = 'classic',
   ): string {
     const safeColor = /^#[0-9a-fA-F]{3,8}$/.test(accentColor) ? accentColor : '#FF6A2B';
     const isRu = input.adLanguage === 'ru';
@@ -677,7 +805,9 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
       ? input.fontFamily!
       : 'sans-serif';
     const textColor = /^#[0-9a-fA-F]{3,8}$/.test(input.textColor || '') ? input.textColor! : '#FFFFFF';
-    const darkness = Math.max(0.3, Math.min(0.95, Number(input.overlayDarkness) || 0.82));
+    const baseDarkness = Math.max(0.3, Math.min(0.95, Number(input.overlayDarkness) || 0.82));
+    // "minimal" temasi yumshoqroq (kamroq qorong'i) fon beradi
+    const darkness = theme === 'minimal' ? Math.min(baseDarkness, 0.7) : baseDarkness;
     const borderWidth = Math.max(0, Math.min(40, Number(input.borderWidth) || 0));
     const borderColor = /^#[0-9a-fA-F]{3,8}$/.test(input.borderColor || '') ? input.borderColor! : safeColor;
 
@@ -716,7 +846,7 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
     const hotelRows = useHotelList ? input.hotels!.slice(0, 3) : [];
     const rowH = 50;
     const rowGap = 10;
-    const listTop = size - 350;
+    const listTop = height - 350;
     const hotelListParts: string[] = [];
     hotelRows.forEach((h, i) => {
       const rowY = listTop + i * (rowH + rowGap);
@@ -725,35 +855,43 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
       const hPrice = this.escapeSvg(`${Math.round(h.price).toLocaleString('ru-RU')} ${input.currency || 'USD'}`);
       const pillW = Math.min(240, 60 + hPrice.length * 13);
       hotelListParts.push(`
-  <rect x="60" y="${rowY}" width="${size - 120}" height="${rowH}" rx="12" fill="#FFFFFF" fill-opacity="0.10"/>
+  <rect x="60" y="${rowY}" width="${width - 120}" height="${rowH}" rx="12" fill="#FFFFFF" fill-opacity="0.10"/>
   <text x="78" y="${rowY + 32}" font-family="${font}" font-size="22" font-weight="700" fill="${textColor}">${hName}<tspan fill="#FFD54A">${hStars}</tspan></text>
-  <rect x="${size - 76 - pillW}" y="${rowY + 8}" width="${pillW}" height="34" rx="17" fill="${safeColor}"/>
-  <text x="${size - 76 - pillW / 2}" y="${rowY + 31}" font-family="${font}" font-size="18" font-weight="800" fill="#FFFFFF" text-anchor="middle">${hPrice}</text>`);
+  <rect x="${width - 76 - pillW}" y="${rowY + 8}" width="${pillW}" height="34" rx="17" fill="${safeColor}"/>
+  <text x="${width - 76 - pillW / 2}" y="${rowY + 31}" font-family="${font}" font-size="18" font-weight="800" fill="#FFFFFF" text-anchor="middle">${hPrice}</text>`);
     });
     const hotelListSvg = hotelListParts.join('\n');
 
+    // "bold" temasida narx chip'i yiriqroq va to'la kenglikka yaqinroq chiqadi
+    const priceFontSize = theme === 'bold' ? 46 : 38;
+    const priceChipHeight = theme === 'bold' ? 86 : 72;
     // Narx "chip"ining kengligini matn uzunligiga qarab taxminiy hisoblaymiz
-    const priceChipWidth = Math.min(size - 120, 150 + priceText.length * 26);
+    const priceChipWidth = Math.min(width - 120, (theme === 'bold' ? 180 : 150) + priceText.length * (theme === 'bold' ? 30 : 26));
     // Sana har doim narxdan ALOHIDA qatorda, o'ngga tekislangan — shunda
     // matn uzunligidan qat'i nazar narx bilan hech qachon ustma-ust tushmaydi
-    const datePillWidth = dateLine ? Math.min(size - 120, 70 + dateLine.length * 13) : 0;
+    const datePillWidth = dateLine ? Math.min(width - 120, 70 + dateLine.length * 13) : 0;
 
     const eyebrowText = `✨ ${L.offer}`;
-    const eyebrowWidth = Math.min(size - 120, 40 + eyebrowText.length * 9.5);
+    const eyebrowWidth = Math.min(width - 120, 40 + eyebrowText.length * 9.5);
+    // "minimal" temasida nishon (badge) umuman ko'rsatilmaydi — sodda ko'rinish uchun
+    const showBadge = theme !== 'minimal';
 
     // Qo'shimcha urg'u matnlari (masalan "Bepul transfer!", "Cheklangan joy")
-    // — TurMaker uslubidagi kichik "chip"lar qatorida, sig'guncha chiqadi
-    const extraChips = (input.extraTexts || [])
-      .map((t) => (t || '').trim())
-      .filter(Boolean)
-      .slice(0, 4)
-      .map((t) => this.escapeSvg(this.truncate(t, 24)));
+    // — TurMaker uslubidagi kichik "chip"lar qatorida, sig'guncha chiqadi.
+    // "minimal" temasida bu qator ham ko'rsatilmaydi (sodda ko'rinish uchun).
+    const extraChips = theme === 'minimal'
+      ? []
+      : (input.extraTexts || [])
+          .map((t) => (t || '').trim())
+          .filter(Boolean)
+          .slice(0, 4)
+          .map((t) => this.escapeSvg(this.truncate(t, 24)));
     let chipX = 60;
-    const chipY = size - 364;
+    const chipY = height - 364;
     const chipParts: string[] = [];
     for (const chip of extraChips) {
       const w = Math.min(320, 40 + chip.length * 11);
-      if (chipX + w > size - 60) break;
+      if (chipX + w > width - 60) break;
       chipParts.push(
         `<rect x="${chipX}" y="${chipY}" width="${w}" height="32" rx="16" fill="${safeColor}"/>` +
           `<text x="${chipX + w / 2}" y="${chipY + 22}" font-family="${font}" font-size="16" font-weight="700" fill="#FFFFFF" text-anchor="middle">${chip}</text>`,
@@ -764,28 +902,31 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
 
     const borderSvg =
       borderWidth > 0
-        ? `<rect x="${borderWidth / 2}" y="${borderWidth / 2}" width="${size - borderWidth}" height="${size - borderWidth}" fill="none" stroke="${borderColor}" stroke-width="${borderWidth}"/>`
+        ? `<rect x="${borderWidth / 2}" y="${borderWidth / 2}" width="${width - borderWidth}" height="${height - borderWidth}" fill="none" stroke="${borderColor}" stroke-width="${borderWidth}"/>`
         : '';
+
+    // "bold" temasi — banner tagida to'liq kenglikdagi rangli chiziq (urg'u uchun)
+    const boldBarSvg = theme === 'bold' ? `<rect x="0" y="${height - 8}" width="${width}" height="8" fill="${safeColor}"/>` : '';
 
     // ── Erkin joylashtirish: har bir guruhning standart joyidan qancha
     // sudralganini pikselga aylantiramiz (foydalanuvchi hech narsani
     // sudramagan bo'lsa — 0,0, ya'ni ko'rinish avvalgidek qoladi) ──
-    const badgeOff = this.resolveOffset(input, 'badge', size);
-    const chipsOff = this.resolveOffset(input, 'chips', size);
-    const starsOff = this.resolveOffset(input, 'stars', size);
-    const titleOff = this.resolveOffset(input, 'title', size);
-    const hotelOff = this.resolveOffset(input, 'hotel', size);
-    const infoOff = this.resolveOffset(input, 'info', size);
-    const priceOff = this.resolveOffset(input, 'price', size);
-    const dateOff = this.resolveOffset(input, 'date', size);
-    const footerOff = this.resolveOffset(input, 'footer', size);
-    const logoOff = this.resolveOffset(input, 'logo', size);
+    const badgeOff = this.resolveOffset(input, 'badge', width, height);
+    const chipsOff = this.resolveOffset(input, 'chips', width, height);
+    const starsOff = this.resolveOffset(input, 'stars', width, height);
+    const titleOff = this.resolveOffset(input, 'title', width, height);
+    const hotelOff = this.resolveOffset(input, 'hotel', width, height);
+    const infoOff = this.resolveOffset(input, 'info', width, height);
+    const priceOff = this.resolveOffset(input, 'price', width, height);
+    const dateOff = this.resolveOffset(input, 'date', width, height);
+    const footerOff = this.resolveOffset(input, 'footer', width, height);
+    const logoOff = this.resolveOffset(input, 'logo', width, height);
 
     // ── Brend logotipi (standart: yuqori-o'ng burchak) ──
     const logoSvg = logo?.dataUri
       ? (() => {
           const ls = Math.max(40, Math.min(280, logo.size || 120));
-          const lx = size - 60 - ls + logoOff.dx;
+          const lx = width - 60 - ls + logoOff.dx;
           const ly = 60 + logoOff.dy;
           return `<g>
     <rect x="${lx - 10}" y="${ly - 10}" width="${ls + 20}" height="${ls + 20}" rx="18" fill="#FFFFFF" fill-opacity="0.14"/>
@@ -794,22 +935,31 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
         })()
       : '';
 
+    // "minimal" temasida gradient yuqoriroqdan (kamroq maydonda) boshlanadi,
+    // boshqa temalarda avvalgidek (100% bir xil, mavjud bannerlar buzilmasin)
+    const gradMidStop = theme === 'minimal' ? 70 : 55;
+    const gradMidOpacity = theme === 'minimal' ? darkness * 0.1 : darkness * 0.18;
+
     return `
-<svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="fade" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#000000" stop-opacity="0"/>
-      <stop offset="55%" stop-color="#000000" stop-opacity="${(darkness * 0.18).toFixed(2)}"/>
+      <stop offset="${gradMidStop}%" stop-color="#000000" stop-opacity="${gradMidOpacity.toFixed(2)}"/>
       <stop offset="100%" stop-color="#000000" stop-opacity="${darkness.toFixed(2)}"/>
     </linearGradient>
   </defs>
 
-  <rect x="0" y="0" width="${size}" height="${size}" fill="url(#fade)"/>
+  <rect x="0" y="0" width="${width}" height="${height}" fill="url(#fade)"/>
 
-  <g transform="translate(${badgeOff.dx.toFixed(1)},${badgeOff.dy.toFixed(1)})">
-  <rect x="60" y="${size - 410}" width="${eyebrowWidth}" height="36" rx="18" fill="#FFFFFF" fill-opacity="0.14" stroke="${safeColor}" stroke-opacity="0.5"/>
-  <text x="76" y="${size - 386}" font-family="${font}" font-size="16" font-weight="800" letter-spacing="1.5" fill="${safeColor}">${eyebrowText}</text>
-  </g>
+  ${
+    showBadge
+      ? `<g transform="translate(${badgeOff.dx.toFixed(1)},${badgeOff.dy.toFixed(1)})">
+  <rect x="60" y="${height - 410}" width="${eyebrowWidth}" height="36" rx="18" fill="${theme === 'bold' ? safeColor : '#FFFFFF'}" fill-opacity="${theme === 'bold' ? 1 : 0.14}" stroke="${safeColor}" stroke-opacity="0.5"/>
+  <text x="76" y="${height - 386}" font-family="${font}" font-size="16" font-weight="800" letter-spacing="1.5" fill="${theme === 'bold' ? '#FFFFFF' : safeColor}">${eyebrowText}</text>
+  </g>`
+      : ''
+  }
 
   <g transform="translate(${chipsOff.dx.toFixed(1)},${chipsOff.dy.toFixed(1)})">
   ${extraChipsSvg}
@@ -817,23 +967,23 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
 
   ${
     stars
-      ? `<g transform="translate(${starsOff.dx.toFixed(1)},${starsOff.dy.toFixed(1)})"><text x="60" y="${size - 330}" font-family="${font}" font-size="30" fill="#FFD54A" font-weight="700" letter-spacing="4">${stars}</text></g>`
+      ? `<g transform="translate(${starsOff.dx.toFixed(1)},${starsOff.dy.toFixed(1)})"><text x="60" y="${height - 330}" font-family="${font}" font-size="30" fill="#FFD54A" font-weight="700" letter-spacing="4">${stars}</text></g>`
       : ''
   }
 
   <g transform="translate(${titleOff.dx.toFixed(1)},${titleOff.dy.toFixed(1)})">
-  <text x="60" y="${size - 280}" font-family="${font}" font-size="52" font-weight="800" fill="${textColor}">${destination}</text>
+  <text x="60" y="${height - 280}" font-family="${font}" font-size="52" font-weight="800" fill="${textColor}">${destination}</text>
   </g>
 
   ${
     hotel && !useHotelList
-      ? `<g transform="translate(${hotelOff.dx.toFixed(1)},${hotelOff.dy.toFixed(1)})"><text x="60" y="${size - 220}" font-family="${font}" font-size="32" font-weight="600" fill="${textColor}" fill-opacity="0.94">${hotel}</text></g>`
+      ? `<g transform="translate(${hotelOff.dx.toFixed(1)},${hotelOff.dy.toFixed(1)})"><text x="60" y="${height - 220}" font-family="${font}" font-size="32" font-weight="600" fill="${textColor}" fill-opacity="0.94">${hotel}</text></g>`
       : ''
   }
 
   ${
     infoLine
-      ? `<g transform="translate(${infoOff.dx.toFixed(1)},${infoOff.dy.toFixed(1)})"><text x="60" y="${size - 170}" font-family="${font}" font-size="26" fill="${textColor}" fill-opacity="0.85">${infoLine}</text></g>`
+      ? `<g transform="translate(${infoOff.dx.toFixed(1)},${infoOff.dy.toFixed(1)})"><text x="60" y="${height - 170}" font-family="${font}" font-size="26" fill="${textColor}" fill-opacity="0.85">${infoLine}</text></g>`
       : ''
   }
 
@@ -841,31 +991,33 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
   ${
     useHotelList
       ? hotelListSvg
-      : `<rect x="60" y="${size - 124}" width="${priceChipWidth}" height="72" rx="16" fill="${safeColor}"/>
-  <text x="${60 + priceChipWidth / 2}" y="${size - 78}" font-family="${font}" font-size="38" font-weight="800" fill="#FFFFFF" text-anchor="middle">${priceText}</text>`
+      : `<rect x="60" y="${height - (priceChipHeight === 86 ? 138 : 124)}" width="${priceChipWidth}" height="${priceChipHeight}" rx="16" fill="${safeColor}"/>
+  <text x="${60 + priceChipWidth / 2}" y="${height - (priceChipHeight === 86 ? 84 : 78)}" font-family="${font}" font-size="${priceFontSize}" font-weight="800" fill="#FFFFFF" text-anchor="middle">${priceText}</text>`
   }
   </g>
 
   ${
     dateLine && !useHotelList
       ? `<g transform="translate(${dateOff.dx.toFixed(1)},${dateOff.dy.toFixed(1)})">
-  <rect x="${size - 60 - datePillWidth}" y="${size - 150}" width="${datePillWidth}" height="40" rx="20" fill="#FFFFFF" fill-opacity="0.14" stroke="#FFFFFF" stroke-opacity="0.2"/>
-  <text x="${size - 60 - datePillWidth / 2}" y="${size - 124}" font-family="${font}" font-size="22" font-weight="600" fill="${textColor}" text-anchor="middle">📅 ${dateLine}</text>
+  <rect x="${width - 60 - datePillWidth}" y="${height - 150}" width="${datePillWidth}" height="40" rx="20" fill="#FFFFFF" fill-opacity="0.14" stroke="#FFFFFF" stroke-opacity="0.2"/>
+  <text x="${width - 60 - datePillWidth / 2}" y="${height - 124}" font-family="${font}" font-size="22" font-weight="600" fill="${textColor}" text-anchor="middle">📅 ${dateLine}</text>
   </g>`
       : ''
   }
 
   <g transform="translate(${footerOff.dx.toFixed(1)},${footerOff.dy.toFixed(1)})">
-  ${footer ? `<rect x="60" y="${size - 46}" width="${size - 120}" height="1" fill="#FFFFFF" fill-opacity="0.16"/>` : ''}
+  ${footer ? `<rect x="60" y="${height - 46}" width="${width - 120}" height="1" fill="${theme === 'bold' ? safeColor : '#FFFFFF'}" fill-opacity="${theme === 'bold' ? 0.6 : 0.16}"/>` : ''}
 
   ${
     footer
-      ? `<text x="60" y="${size - 26}" font-family="${font}" font-size="22" fill="#CFCFCF">${footer}</text>`
+      ? `<text x="60" y="${height - 26}" font-family="${font}" font-size="22" fill="#CFCFCF">${footer}</text>`
       : ''
   }
   </g>
 
   ${logoSvg}
+
+  ${boldBarSvg}
 
   ${borderSvg}
 </svg>`.trim();
@@ -882,9 +1034,16 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
     }
     const { input, template } = await this.mergeWithTemplate(tenantId, rawInput);
 
-    // 1) Fon surati — foydalanuvchi bergan bo'lsa o'shani, aks holda
-    // avtomatik qidiramiz (1-bosqichdagi findImages() bilan bir xil)
+    // 1) Fon surati — foydalanuvchi bergan bo'lsa o'shani, aks holda avval
+    // agentlikning O'ZI yuklagan mehmonxona rasm kutubxonasidan (agar shu
+    // mehmonxona uchun avval rasm saqlangan bo'lsa — bu haqiqiy, tanish
+    // surat bo'lgani uchun stok-fotoga qaraganda afzal), topilmasa —
+    // avtomatik stok-foto qidiruviga o'tamiz (1-bosqichdagi findImages()).
     let sourceImage = input.imageUrl;
+    if (!sourceImage && input.hotelName) {
+      const libraryPhotos = await this.getHotelPhotos(tenantId, input.hotelName);
+      sourceImage = libraryPhotos[0];
+    }
     if (!sourceImage) {
       const found = await this.findImages(input.destination, 1);
       sourceImage = found[0];
@@ -927,14 +1086,18 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
       }
     }
 
-    // 3) 1080×1080'ga moslab kesib olamiz, ustiga (shablondagi brend
-    // rangi bilan) matn qatlamini qo'shamiz
-    const size = 1080;
+    // 3) Kerakli o'lchamga (kvadrat 1080×1080 yoki Story 1080×1920) moslab
+    // kesib olamiz, ustiga (shablondagi brend rangi va tanlangan dizayn
+    // uslubi bilan) matn qatlamini qo'shamiz
+    const width = 1080;
+    const height = input.bannerFormat === 'story' ? 1920 : 1080;
+    const theme: 'classic' | 'minimal' | 'bold' =
+      input.bannerTheme === 'minimal' || input.bannerTheme === 'bold' ? input.bannerTheme : 'classic';
     let pngBuffer: Buffer;
     try {
-      const svg = this.buildBannerSvg(input, template.primaryColor, size, logo);
+      const svg = this.buildBannerSvg(input, template.primaryColor, width, height, logo, theme);
       pngBuffer = await sharp(bgBuffer)
-        .resize(size, size, { fit: 'cover', position: 'attention' })
+        .resize(width, height, { fit: 'cover', position: 'attention' })
         .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
         .png({ quality: 90 })
         .toBuffer();
@@ -1203,19 +1366,65 @@ export class AiMarketingController {
 
   /** Faqat rasm qidirish (masalan foydalanuvchi natijani yoqtirmasa, qayta qidirish uchun) */
   @Post('images')
-  images(@CurrentUser() _u: any, @Body() body: { query: string; count?: number }) {
+  async images(
+    @CurrentUser() u: any,
+    @Body() body: { query: string; count?: number; hotelName?: string },
+  ) {
     if (!body?.query) throw new BadRequestException("Qidiruv so'zi (query) kerak");
+    // Agentlikning o'zi yuklagan mehmonxona rasmlari (bo'lsa) — stok-fotodan
+    // OLDIN ko'rsatiladi, chunki bular haqiqiy, tanish surat.
+    const libraryPhotos = body.hotelName
+      ? await this.svc.getHotelPhotos(u.tenantId, body.hotelName)
+      : [];
     // Bu yerda (foydalanuvchi "🔍 Rasm topish"ni to'g'ridan-to'g'ri bosganda)
     // sabab ANIQ ko'rsatilishi kerak — aks holda "rasm topilmadi" umuman
-    // noaniq bo'lib qoladi, admin muammoni tushuna olmaydi.
-    if (!this.svc.imagesConfigured()) {
+    // noaniq bo'lib qoladi, admin muammoni tushuna olmaydi. Agar kutubxonada
+    // kamida bitta rasm bo'lsa, kalit sozlanmagan bo'lsa ham xato tashlamaymiz
+    // (chunki foydalanuvchiga hali ham ko'rsatadigan narsamiz bor).
+    if (!this.svc.imagesConfigured() && !libraryPhotos.length) {
       throw new BadRequestException(
         "Rasm qidirish yoqilmagan: serverda PEXELS_API_KEY yoki UNSPLASH_ACCESS_KEY " +
           "o'rnatilmagan. Bepul kalitni pexels.com/api yoki unsplash.com/developers'dan " +
           "olib, backend serveridagi .env fayliga qo'shing va serverni qayta ishga tushiring.",
       );
     }
-    return this.svc.findImages(body.query, body.count || 16);
+    const stockPhotos = this.svc.imagesConfigured()
+      ? await this.svc.findImages(body.query, body.count || 16)
+      : [];
+    return Array.from(new Set([...libraryPhotos, ...stockPhotos]));
+  }
+
+  // ── MEHMONXONA RASM KUTUBXONASI ──
+
+  /** Berilgan mehmonxona uchun avval saqlangan (agentlikning o'zi yuklagan) rasmlar */
+  @Get('hotel-photos')
+  getHotelPhotos(@CurrentUser() u: any, @Query('hotelName') hotelName: string) {
+    if (!hotelName?.trim()) throw new BadRequestException('Mehmonxona nomi (hotelName) kerak');
+    return this.svc.getHotelPhotos(u.tenantId, hotelName);
+  }
+
+  /** Barcha mehmonxonalar ro'yxati va nechta rasm saqlanganini ko'rsatadi */
+  @Get('hotel-photos/all')
+  listHotelPhotoLibrary(@CurrentUser() u: any) {
+    return this.svc.listHotelPhotoLibrary(u.tenantId);
+  }
+
+  /** Mehmonxona uchun yangi (haqiqiy) rasm yuklaydi — keyingi safar avtomatik taklif qilinadi */
+  @Post('hotel-photos')
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 8 * 1024 * 1024 } }))
+  uploadHotelPhoto(
+    @CurrentUser() u: any,
+    @Body('hotelName') hotelName: string,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    return this.svc.saveHotelPhoto(u.tenantId, hotelName, file);
+  }
+
+  /** Kutubxonadan bitta rasmni o'chirish */
+  @Delete('hotel-photos')
+  deleteHotelPhoto(@CurrentUser() u: any, @Body() body: { hotelName: string; url: string }) {
+    if (!body?.hotelName || !body?.url) throw new BadRequestException("hotelName va url kerak");
+    return this.svc.deleteHotelPhoto(u.tenantId, body.hotelName, body.url);
   }
 
   /** TurMaker uslubidagi "davlat → mashhur joylar" ro'yxati (tanlagich uchun) */

@@ -36,6 +36,14 @@ export class PaymentsService {
     if (params.method) where.method = params.method as PaymentMethod;
     if (params.bookingId) where.bookingId = params.bookingId;
     if (params.clientId) where.clientId = params.clientId;
+    // v14 XATO TUZATISH: /payments/export 'from'/'to' parametrlarini
+    // qabul qilardi, lekin ular hech qayerda ishlatilmasdi — export
+    // har doim SANA FILTRISIZ, tenantning barcha to'lovlarini qaytarardi.
+    if (params.from || params.to) {
+      where.paidAt = {};
+      if (params.from) where.paidAt.gte = new Date(params.from);
+      if (params.to) where.paidAt.lte = new Date(params.to);
+    }
     if (role === 'AGENT') {
       where.booking = { agentId: userId };
     }
@@ -248,7 +256,7 @@ export class PaymentsController {
     @Query('to') to?: string,
   ) {
     const result = await this.svc.findAll(u.tenantId, u.sub, u.role, {
-      method, page: 1, limit: 10000,
+      method, from, to, page: 1, limit: 10000,
     });
     const rows = result.data || [];
     const headers = ['Sana', 'Booking', 'Klient', 'Summa', 'Valyuta', 'Usul', 'Holat', 'Izoh'];

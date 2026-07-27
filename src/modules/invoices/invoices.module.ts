@@ -100,8 +100,17 @@ export class InvoicesService {
   }
 
   async create(tenantId: string, userId: string, role: string, data: any) {
-    // bookingId ixtiyoriy - client invoicesi uchun
-    // salePrice yoki amount qabul qilamiz
+    // v14 XATO TUZATISH: avval bu yerda "bookingId ixtiyoriy" deb yozilgan
+    // edi va agar bookingId berilmasa `booking` null bo'lib qolib,
+    // pastda `booking.id` / `booking.currency`ga murojaat qilinganda
+    // "Cannot read properties of null" xatosi bilan CRASH bo'lardi.
+    // Prisma sxemasida Invoice.bookingId MAJBURIY (booking bilan bog'liq
+    // bo'lmagan invoice sxema darajasida qo'llab-quvvatlanmaydi), shuning
+    // uchun buni servis darajasida ham aniq talab qilamiz — foydalanuvchi
+    // tushunarli xato xabarini oladi, server esa yiqilmaydi.
+    if (!data.bookingId) {
+      throw new BadRequestException('bookingId majburiy — invoice faqat bookingga bog\'langan holda yaratiladi');
+    }
     const sale = Number(data.salePrice || data.amount || data.totalAmount);
     if (!Number.isFinite(sale) || sale <= 0) {
       throw new BadRequestException("Summa (amount) musbat bo'lishi kerak");
@@ -110,20 +119,17 @@ export class InvoicesService {
     data.salePrice = sale;
 
     // Booking mavjudligini va agentga tegishliligini tekshiramiz
-    // Booking ixtiyoriy
-    let booking: any = null;
-    if (data.bookingId) {
-      booking = await this.prisma.booking.findFirst({
-        where: { id: data.bookingId, tenantId },
-        include: { client: true },
-      });
-      if (booking && role === 'AGENT' && booking.agentId !== userId) {
-        throw new ForbiddenException("Bu booking sizga tegishli emas");
-      }
+    const booking = await this.prisma.booking.findFirst({
+      where: { id: data.bookingId, tenantId },
+      include: { client: true },
+    });
+    if (!booking) throw new NotFoundException('Booking topilmadi');
+    if (role === 'AGENT' && booking.agentId !== userId) {
+      throw new ForbiddenException("Bu booking sizga tegishli emas");
     }
 
     // clientId topish
-    const clientId = data.clientId || booking?.clientId;
+    const clientId = data.clientId || booking.clientId;
     if (!clientId) throw new BadRequestException('clientId yoki bookingId majburiy');
 
     const invoiceNumber = await this.generateNumber(tenantId);
@@ -138,7 +144,7 @@ export class InvoicesService {
         invoiceNumber,
         bookingId: booking.id,
         clientId: clientId,
-        agentId: (booking?.agentId) || userId,
+        agentId: booking.agentId || userId,
         providerCost: Number(data.providerCost) || 0,
         salePrice: sale,
         discount,
