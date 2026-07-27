@@ -1,6 +1,6 @@
 import {
   Module, Injectable, Controller,
-  Get, Post, Put, Param, Body, UseGuards, NotFoundException, BadRequestException, Logger,
+  Get, Post, Put, Delete, Param, Body, UseGuards, NotFoundException, BadRequestException, Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -334,6 +334,87 @@ export class OffersService {
     return updated;
   }
 
+  // ─── v29: Taklif shablonlari ────────────────────────────────────────────
+  // Agent bir xil turlarni (masalan "Antalya, Rixos 5*") kuniga o'nlab
+  // marta qo'lda qayta terib chiqmasin deb, tayyor taklifni "shablon"
+  // sifatida saqlab qo'yadi va keyingi mijozlarga bor-yo'g'i 2 marta
+  // bosib (shablon tanlash + narx/sana tekshirish) taklif yuboradi.
+  // Prisma migratsiya kerak emas — Tenant.settings JSON ichida saqlanadi
+  // (xuddi AI Marketing shablon tizimi kabi bir xil andoza bo'yicha).
+  private static readonly MAX_OFFER_TEMPLATES = 60;
+
+  async listTemplates(tenantId: string) {
+    const tenant = await this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { settings: true } });
+    const settings: any = tenant?.settings || {};
+    const list = Array.isArray(settings.offerTemplates) ? settings.offerTemplates : [];
+    return [...list].reverse();
+  }
+
+  async saveTemplate(tenantId: string, agentId: string, data: any) {
+    const name = (data.name || data.tourName || '').toString().trim();
+    if (!name) throw new BadRequestException("Shablon nomi kerak");
+
+    const tenant = await this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { settings: true } });
+    const settings: any = tenant?.settings || {};
+    const list = Array.isArray(settings.offerTemplates) ? settings.offerTemplates : [];
+
+    // v29: shablonda FORM qiymatlari (frontend `f` state bilan bir xil shakl)
+    // saqlanadi — shunda "shablonni qo'llash" bor-yo'g'i setF(template) bo'ladi,
+    // qayta konvertatsiya/hisoblash shart emas.
+    const template = {
+      id: Date.now().toString(),
+      name,
+      agentId,
+      createdAt: new Date().toISOString(),
+      tourName: data.tourName || '',
+      destination: data.destination || '',
+      pax: data.pax ?? 1,
+      children: data.children ?? 0,
+      departFlightTime: data.departFlightTime || '',
+      returnFlightTime: data.returnFlightTime || '',
+      actualPrice: data.actualPrice ?? '',
+      markup: data.markup ?? '',
+      childActualPrice: data.childActualPrice ?? '',
+      childMarkup: data.childMarkup ?? '',
+      currency: data.currency || 'USD',
+      bookingLink: data.bookingLink || '',
+      hotels: Array.isArray(data.hotels) ? data.hotels.slice(0, 5) : [],
+      mealPlan: data.mealPlan || 'NONE',
+      includesVisa: !!data.includesVisa,
+      includesFlight: data.includesFlight !== false,
+      includesHotel: data.includesHotel !== false,
+      includesTransfer: !!data.includesTransfer,
+      includesInsurance: !!data.includesInsurance,
+      notes: data.notes || '',
+    };
+
+    list.push(template);
+    // Eskirgan shablonlarni tozalab boramiz — cheksiz o'sib ketmasin
+    while (list.length > OffersService.MAX_OFFER_TEMPLATES) list.shift();
+
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: { settings: { ...settings, offerTemplates: list } },
+    });
+
+    return template;
+  }
+
+  async deleteTemplate(tenantId: string, templateId: string) {
+    const tenant = await this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { settings: true } });
+    const settings: any = tenant?.settings || {};
+    const list = Array.isArray(settings.offerTemplates) ? settings.offerTemplates : [];
+    const next = list.filter((t: any) => t.id !== templateId);
+    if (next.length === list.length) throw new NotFoundException('Shablon topilmadi');
+
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: { settings: { ...settings, offerTemplates: next } },
+    });
+
+    return { success: true };
+  }
+
   /**
    * v11: Taklifni endi shunchaki "SENT" deb belgilab qo'ymaymiz — chiroyli
    * shablon asosida HAQIQATDA Telegram orqali yuboramiz:
@@ -536,6 +617,24 @@ export class OffersService {
 @UseGuards(JwtAuthGuard)
 export class OffersController {
   constructor(private svc: OffersService) {}
+
+  // v29: Taklif shablonlari — /offers/client/:clientId dan OLDIN turishi
+  // shart, aks holda Nest 'templates' so'zini :clientId parametri deb
+  // qabul qilib qo'yishi mumkin edi (aniq path avval tekshirilsin).
+  @Get('templates')
+  listTemplates(@CurrentUser() u: any) {
+    return this.svc.listTemplates(u.tenantId);
+  }
+
+  @Post('templates')
+  saveTemplate(@CurrentUser() u: any, @Body() body: any) {
+    return this.svc.saveTemplate(u.tenantId, u.id || u.sub, body);
+  }
+
+  @Delete('templates/:id')
+  deleteTemplate(@CurrentUser() u: any, @Param('id') id: string) {
+    return this.svc.deleteTemplate(u.tenantId, id);
+  }
 
   @Get('client/:clientId')
   list(@CurrentUser() u: any, @Param('clientId') id: string) {
