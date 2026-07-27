@@ -342,6 +342,7 @@ export class PipelineService {
       const prefs = (client as any).preferences || {};
       prefs.noContactAttempts = 0;
       prefs.nextCallAt = new Date(Date.now() + 24 * 3600000).toISOString();
+      prefs.callReminded = false; // yangi muddat — eslatma qayta yuborilishi mumkin
       updateData.preferences = prefs;
     }
 
@@ -385,6 +386,7 @@ export class PipelineService {
 
     prefs.noContactAttempts = attempts;
     prefs.nextCallAt = nextCallAt;
+    prefs.callReminded = false; // yangi muddat — eslatma qayta yuborilishi mumkin
     prefs.lastCallOutcome = data.outcome;
     if (!prefs.callHistory) prefs.callHistory = [];
     prefs.callHistory.push({ attemptNo: attempts, outcome: data.outcome, note: data.note, at: new Date().toISOString() });
@@ -565,6 +567,11 @@ export class PipelineService {
       for (const c of noContactClients) {
         const prefs: any = (c as any).preferences || {};
         if (!prefs.nextCallAt || !(c as any).assignedAgentId) continue;
+        // v12.9: eslatma faqat BIR MARTA yuboriladi — agent yangi urinish
+        // qayd etib (recordCallAttempt) yoki bosqichni qayta INTERESTED
+        // qilib nextCallAt yangilagunicha qayta yuborilmaydi. Aks holda
+        // har soat bir xil eslatma cheksiz takrorlanaverar edi.
+        if (prefs.callReminded) continue;
         if (new Date(prefs.nextCallAt) <= now) {
           await this.prisma.notification.create({
             data: {
@@ -575,6 +582,10 @@ export class PipelineService {
               link: `/clients/${c.id}`, metadata: {},
             } as any,
           }).catch(swallow('bildirishnoma'));
+          await this.prisma.client.update({
+            where: { id: c.id },
+            data: { preferences: { ...prefs, callReminded: true } } as any,
+          }).catch(swallow('yangilash'));
         }
       }
       });
@@ -587,12 +598,16 @@ export class PipelineService {
     // qulfni birinchi olgan instans bajaradi, qolganlari o'tkazadi.
     await this.cronLock.runOnce('task-reminders', 280, async () => {
       const now = new Date();
-      const in15 = new Date(now.getTime() + 15 * 60000);
-      // v12.8: 15 daqiqalik oyna odatda kichik, lekin ommaviy import
-      // qilingan vazifalar bir vaqtga to'g'ri kelsa minglab bo'lishi
-      // mumkin. Cheklov qo'yamiz — qolganlari keyingi ishga qoladi.
+      // v12.9: oyna cron chastotasiga (5 daqiqa) TENG qilindi — avval 15
+      // daqiqalik oyna bilan bir xil vazifa 3 marta (15/10/5 daqiqa oldin)
+      // takroriy bildirishnoma olayotgan edi. Endi har bir vazifa faqat
+      // bitta ishga to'g'ri keladi va faqat bitta bildirishnoma yuboriladi.
+      const in5 = new Date(now.getTime() + 5 * 60000);
+      // v12.8: oyna odatda kichik, lekin ommaviy import qilingan vazifalar
+      // bir vaqtga to'g'ri kelsa minglab bo'lishi mumkin. Cheklov qo'yamiz —
+      // qolganlari keyingi ishga qoladi.
       const tasks = await this.prisma.task.findMany({
-        where: { status: { in: ['TODO', 'IN_PROGRESS'] }, dueAt: { gte: now, lte: in15 } } as any,
+        where: { status: { in: ['TODO', 'IN_PROGRESS'] }, dueAt: { gte: now, lte: in5 } } as any,
         include: { client: { select: { fullName: true } } } as any,
         take: 500,
       });
@@ -602,7 +617,7 @@ export class PipelineService {
           data: {
             tenantId: t.tenantId, userId: t.assigneeId, type: 'TASK_DUE' as any,
             title: `Vazifa: ${t.title}`,
-            body: t.client ? `Klient: ${t.client.fullName}` : '15 daqiqa qoldi',
+            body: t.client ? `Klient: ${t.client.fullName}` : '5 daqiqa qoldi',
             link: t.clientId ? `/clients/${t.clientId}` : '/tasks', metadata: {},
           } as any,
         }).catch(swallow('bildirishnoma'));

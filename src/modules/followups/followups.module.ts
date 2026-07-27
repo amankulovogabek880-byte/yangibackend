@@ -138,13 +138,13 @@ export class FollowUpsController {
       tenantId: u.tenantId,
       dueAt: { gte: fromDate, lte: toDate },
     };
-    if (u.role === 'AGENT') where.assigneeId = u.sub;
+    if (u.role === 'AGENT') where.agentId = u.sub;
 
     const items = await (this.svc as any).prisma.followUp.findMany({
       where,
       include: {
         client: { select: { id: true, fullName: true, phone: true } },
-        assignee: { select: { id: true, name: true } },
+        agent: { select: { id: true, name: true } },
       },
       orderBy: { dueAt: 'asc' },
     });
