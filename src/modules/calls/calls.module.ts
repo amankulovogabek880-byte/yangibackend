@@ -20,6 +20,7 @@ import { EncryptionService } from '../../common/encryption/encryption.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { PhoneProvidersModule, PhoneProviderFactory } from '../phone-providers/phone-providers.module';
+import type { WebhookEvent } from '../phone-providers/provider.interface';
 import { CallDirection, CallStatus } from '../../prisma-types';;
 
 @Injectable()
@@ -513,8 +514,74 @@ export class CallsService {
       this.logger.warn(`MoiZvonki webhook: tanib bo'lmadi — ${JSON.stringify(body).slice(0, 200)}`);
       return { ok: true };
     }
-    const details = provider.parseWebhookDetails(body);
+    return this.processMoiZvonkiEvent(tenantId, event as any);
+  }
 
+  /**
+   * ✅ ASOSIY sinxronizatsiya yo'li: `calls.get_crm_event` orqali
+   * navbatdagi YANGI qo'ng'iroq hodisalarini muntazam so'rab turadi
+   * (bu — moizvonki.ru rasmiy integratsiya kodida tasdiqlangan,
+   * mavjud amal). Har 3 daqiqada barcha MOIZVONKI ulangan
+   * tenantlar uchun ishga tushadi — xuddi OnlinePBX uchun
+   * `syncInboundCalls` qanday ishlasa, shunday.
+   */
+  @Cron('*/3 * * * *')
+  async pullMoiZvonkiEvents() {
+    const tenants = await this.prisma.tenant.findMany({
+      where: { phoneProvider: 'MOIZVONKI' as any },
+      select: { id: true, phoneConfig: true },
+    });
+    if (!tenants.length) return;
+
+    const { MoiZvonkiProvider } = await import('../phone-providers/moizvonki.provider');
+    let total = 0;
+
+    for (const tenant of tenants) {
+      try {
+        const cfg: any = ((tenant as any).phoneConfig || {}).moizvonki || {};
+        if (!cfg.subdomain || !cfg.apiKey || !cfg.adminEmail) continue;
+
+        const provider = new MoiZvonkiProvider(cfg);
+        const rawEvents = await provider.fetchCrmEvents(50);
+
+        for (const raw of rawEvents) {
+          const event = provider.parseEvent(raw);
+          if (!event) continue;
+          const result = await this.processMoiZvonkiEvent(tenant.id, event).catch((e) => {
+            this.logger.warn(`MoiZvonki hodisa xatosi [${tenant.id}]: ${e.message}`);
+            return null;
+          });
+          if (result?.mode === 'created') total++;
+        }
+      } catch (e: any) {
+        this.logger.warn(`MoiZvonki sinxronizatsiya xatosi [${tenant.id}]: ${e.message}`);
+      }
+    }
+
+    if (total) this.logger.log(`Мои Звонки: +${total} yangi qo'ng'iroq`);
+  }
+
+  /**
+   * Bitta MoiZvonki hodisasini (webhook orqali kelgan yoki
+   * `calls.get_crm_event` orqali navbatdan olingan — ikkalasi ham
+   * bir xil unifikatsiya qilingan shaklda keladi) CRM'ga yozadi.
+   *
+   * Oqim:
+   *   1) providerCallId bo'yicha mavjud Call qidiriladi (agar CRM'dan
+   *      initiate() orqali boshlangan bo'lsa — topiladi, yangilanadi).
+   *   2) Topilmasa — bu YANGI (odatda kiruvchi) qo'ng'iroq deb
+   *      hisoblab, YANGI Call yozuvi yaratiladi, mijoz raqami
+   *      bo'yicha qidiriladi (pullInboundForTenant bilan bir xil mantiq).
+   */
+  private async processMoiZvonkiEvent(
+    tenantId: string,
+    event: WebhookEvent & {
+      direction?: 'INBOUND' | 'OUTBOUND';
+      fromPhone?: string;
+      toPhone?: string;
+      employeeEmail?: string;
+    },
+  ) {
     const statusMap: Record<string, CallStatus> = {
       queued: 'QUEUED', initiated: 'INITIATED', ringing: 'RINGING',
       in_progress: 'IN_PROGRESS', completed: 'COMPLETED',
@@ -529,6 +596,12 @@ export class CallsService {
     });
 
     if (existing) {
+      // Allaqachon to'liq qayta ishlangan hodisani qayta yangilamaymiz
+      // (get_crm_event xuddi shu hodisani ikkinchi marta qaytarishi mumkin)
+      if (existing.status === 'COMPLETED' && existing.recordingUrl) {
+        return { ok: true, callId: existing.id, mode: 'skipped' as const };
+      }
+
       const updateData: any = { status: newStatus };
       if (event.duration && event.duration > 0) updateData.duration = event.duration;
       if (safeRecording) updateData.recordingUrl = safeRecording;
@@ -542,14 +615,14 @@ export class CallsService {
           callId: existing.id, status: newStatus, duration: event.duration, recordingUrl: safeRecording,
         });
       }
-      return { ok: true, callId: existing.id, mode: 'updated' };
+      return { ok: true, callId: existing.id, mode: 'updated' as const };
     }
 
     // 2) Topilmasa — bu YANGI (odatda kiruvchi) qo'ng'iroq
-    const fromPhone = normalizePhone(details.fromPhone || details.toPhone || '');
+    const fromPhone = normalizePhone(event.fromPhone || event.toPhone || '');
     if (!fromPhone) {
-      this.logger.warn(`MoiZvonki webhook: telefon raqami topilmadi — ${JSON.stringify(body).slice(0, 200)}`);
-      return { ok: true };
+      this.logger.warn(`MoiZvonki: telefon raqami topilmadi — ${JSON.stringify(event.raw).slice(0, 200)}`);
+      return { ok: true, mode: 'skipped' as const };
     }
 
     const client = await this.prisma.client.findFirst({
@@ -559,15 +632,15 @@ export class CallsService {
 
     // Qaysi agent gaplashgani — xodim email'i orqali (bizning User.email bilan mos)
     let agentId: string | null = client?.assignedAgentId || null;
-    if (details.employeeEmail) {
+    if (event.employeeEmail) {
       const byEmail = await this.prisma.user.findFirst({
-        where: { tenantId, email: details.employeeEmail },
+        where: { tenantId, email: event.employeeEmail },
         select: { id: true },
       });
       if (byEmail) agentId = byEmail.id;
     }
 
-    const direction = details.direction || 'INBOUND';
+    const direction = event.direction || 'INBOUND';
     const answered = (event.duration || 0) > 0 || newStatus === 'COMPLETED';
 
     const call = await this.prisma.call.create({
@@ -607,7 +680,7 @@ export class CallsService {
       }).catch(() => {});
     }
 
-    return { ok: true, callId: call.id, mode: 'created' };
+    return { ok: true, callId: call.id, mode: 'created' as const };
   }
 
   async getActive(userId: string) {

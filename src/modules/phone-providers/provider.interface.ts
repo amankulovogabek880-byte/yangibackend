@@ -142,5 +142,7 @@ export interface PhoneConfig {
      * Kalit — bizning User.email, qiymat — moizvonki.ru'dagi email.
      */
     employeeEmailMap?: Record<string, string>;
+    /** CRM sinxronizatsiya navbati (calls.get_crm_event) uchun integratsiya nomi — bo'sh bo'lsa "crm" ishlatiladi */
+    appName?: string;
   };
 }

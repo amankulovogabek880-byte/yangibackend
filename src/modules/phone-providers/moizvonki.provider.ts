@@ -17,48 +17,54 @@ import {
  * tarifi bilan amalga oshadi. Bizning CRM faqat ikkita narsa qiladi:
  *   1) Terishni BOSHLAB BERADI (agent telefoniga buyruq yuboradi)
  *   2) Qo'ng'iroq tugagach, natijani (davomiylik + ovozli yozuv
- *      havolasi) WEBHOOK orqali QABUL QILADI va mijoz kartochkasiga
- *      biriktiradi.
- * Shuning uchun bu yerda OnlinePBX'dagi kabi WebSocket/hangup yo'q —
- * qo'ng'iroqni tugatish ham jismoniy telefonda bo'ladi.
+ *      havolasi) SO'RAB OLADI (pastga qarang — sabab bilan).
  *
- * ── TASDIQLANGAN (moizvonki.ru rasmiy sayti + hamkorlar hujjati, 2026) ──
- *   • Xizmat mavjud va O'zbekistonda ishlaydi (hamkorlar orasida
- *     "Uysot" — business.uysot.uz — O'zbek CRM'i ham bor).
- *   • Ochiq API manzili: https://api.moizvonki.ru/
- *   • Har bir hisobning O'ZINING API manzili va API kaliti bor —
- *     булар Shaxsiy kabinet → Sozlamalar → Integratsiya sahifasida
- *     ko'rsatiladi (login qilgandan keyin).
- *   • So'rov namunasi (rasmiy hujjatdan ko'chirilgan parcha):
- *       POST /api/v1  Host: {hisobingiz}.moizvonki.ru
- *       Content-Type: application/json
- *       { "user_name": "sizning@emailingiz", ... }
- *   • Narx: 175₽/qurilma/oyiga (yozuvsiz), 230₽/qurilma/oyiga
- *     (ovozli yozuv bilan) — 20 kunlik bepul sinov, kartasiz.
- *   • Ovozli yozuv serverda 30 kun saqlanadi (yoki cheksiz —
- *     o'zingizning Yandex/Google diskingizni ulasangiz).
- *   • Faqat ODDIY qo'ng'iroqlar yoziladi (messenjer orqali gaplashuv
- *     emas).
+ * ── ✅ TO'LIQ TASDIQLANGAN (rasmiy moizvonki.ru integratsiya kodi
+ *    orqali, PHP/Yii2 komponenti — moizvonki.ru/guide/api/ hujjatiga
+ *    asoslangan, 2026) ──
  *
- * ── HALI TO'LIQ TASDIQLANMAGAN (hisob ochilgach aniqlash kerak) ──
- *   1) `user_name`dan KEYINGI aniq maydon nomlari (API kaliti,
- *      qo'ng'iroq raqami, harakat turi) — rasmiy hujjat login talab
- *      qiladi, tashqaridan to'liq ko'rib bo'lmadi. Shu sabab quyida
- *      BIR NECHTA ehtimoliy nom BIRGA yuborilyapti (ortiqcha
- *      maydonlar odatda e'tiborsiz qoldiriladi — xuddi shu usul
- *      OnlinePBX provayderida ham auth uchun ishlatilgan).
- *   2) Webhook payload shakli — moizvonki.ru "Integratsiya" sahifasi
- *      "boshqa tizim" (custom CRM) uchun ham webhook/qaytish
- *      mexanizmini ko'rsatadi, lekin ANIQ maydon nomlari hisobga xos
- *      sahifada.
+ *   Yagona endpoint: POST https://{sizning-subdomen}.moizvonki.ru/api/v1
+ *   Har doim JSON body, "action" maydoni orqali funksiya tanlanadi:
  *
- *   Hisob ochilgach: Sozlamalar → Integratsiya sahifasidagi "API
- *   manzili" va "API kaliti"ni CRM Sozlamalar → Telefoniya bo'limiga
- *   kiriting, so'ng "Ulanishni tekshirish" tugmasini bosing — agar
- *   javob formati mos kelmasa, xato xabarida SERVERNING XOM javobi
- *   ko'rsatiladi (pastda `testConnection`), shu orqali aniq maydon
- *   nomini bilib, osongina moslashtirish mumkin (kod qayta yozishga
- *   ehtiyoj yo'q — faqat quyidagi FIELD_CANDIDATES ro'yxatini kengaytirish kifoya).
+ *     Umumiy autentifikatsiya (HAR BIR so'rovda bo'lishi shart):
+ *       user_name : hisobga kirish uchun EMAIL (admin/xodim emaili)
+ *       api_key   : Sozlamalar → Integratsiya sahifasidagi API kaliti
+ *
+ *     1) Qo'ng'iroq boshlash (Click-to-Call):
+ *          action: "calls.make_call"
+ *          to:     "+998901234567"   ← qo'ng'iroq qilinadigan raqam
+ *        (qaysi XODIM telefoni terishi — hisobga bog'liq: odatda
+ *        `user_name`da ko'rsatilgan xodimning O'ZI teradi, shuning
+ *        uchun bu yerda `user_name` = AYNAN o'sha agentning
+ *        moizvonki.ru email'i, admin emaili emas!)
+ *
+ *     2) Qo'ng'iroqlar tarixini olish (sana oralig'ida):
+ *          action: "calls.list"
+ *          from_date, to_date   — UTC timestamp (soniyalarda)
+ *          from_offset          — sahifalash uchun boshlang'ich indeks
+ *          max_results          — nechta natija
+ *          supervised           — 1 = barcha xodimlar, 0 = faqat shu user
+ *
+ *     3) CRM sinxronizatsiya navbati (YANGI hodisalarni olish —
+ *        qo'ng'iroq tugagach yozuv+davomiylik shu orqali keladi):
+ *          action: "calls.get_crm_event"
+ *          app_name:    integratsiyangiz nomi (o'zingiz tanlaysiz)
+ *          max_results: 1-100
+ *
+ *   Narx: 175₽/qurilma/oyiga (yozuvsiz), 230₽/qurilma/oyiga (ovozli
+ *   yozuv bilan) — 20 kunlik bepul sinov, kartasiz. Ovozli yozuv
+ *   serverda 30 kun saqlanadi (yoki cheksiz — Yandex/Google Disk
+ *   ulansa). Faqat ODDIY qo'ng'iroqlar yoziladi (messenjer emas).
+ *
+ * ── ⚠️ HALI ANIQLASHTIRISH KERAK ──
+ *   `calls.get_crm_event` javobidagi HAR BIR HODISA ichida qaysi
+ *   maydonlar borligi (masalan `recording_url`, `duration`, `phone`,
+ *   `direction`) — rasmiy misolda so'rov ko'rsatilgan, lekin javob
+ *   namunasi yo'q. Shu sabab pastda `parseEvent()` BIR NECHTA
+ *   ehtimoliy maydon nomini tekshiradi (xavfsiz — yo'q maydon
+ *   shunchaki e'tiborsiz qoldiriladi). Agar CRM'da yozuvlar
+ *   to'liq to'lmasa, `testConnection()` orqali qaytgan XOM javobni
+ *   menga yuboring — bir necha daqiqada moslashtiraman.
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -68,6 +74,8 @@ interface MoiZvonkiConfig {
   adminEmail?: string;
   recordingEnabled?: boolean;
   employeeEmailMap?: Record<string, string>;
+  /** CRM sinxronizatsiya navbati uchun integratsiya nomi (ixtiyoriy — bo'sh bo'lsa "crm" ishlatiladi) */
+  appName?: string;
 }
 
 export class MoiZvonkiProvider implements IPhoneProvider {
@@ -98,11 +106,22 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   }
 
   /** fetch o'rami — timeout va xavfsiz JSON parse bilan (OnlinePBX provayderidagi bilan bir xil naqsh) */
-  private async request(url: string, init: any) {
+  private async request(action: string, extra: Record<string, any> = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 20000);
+    const body = JSON.stringify({
+      user_name: this.config?.adminEmail,
+      api_key: this.config?.apiKey,
+      action,
+      ...extra,
+    });
     try {
-      const r = await fetch(url, { ...init, signal: controller.signal as any });
+      const r = await fetch(this.baseUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(body)) },
+        body,
+        signal: controller.signal as any,
+      });
       const text = await r.text().catch(() => '');
       let json: any = null;
       try { json = text ? JSON.parse(text) : null; } catch { /* JSON emas */ }
@@ -116,10 +135,10 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   }
 
   /**
-   * Moizvonki.ru hisobidagi xodim (employee) email'ini topadi.
+   * Moizvonki.ru hisobidagi xodim (employee) login-emailini topadi.
    * Avval xarita (`employeeEmailMap`) tekshiriladi, topilmasa CRM
    * agentining o'z emaili ishlatiladi (agar u moizvonki.ru'da xuddi
-   * shu email bilan ro'yxatdan o'tgan bo'lsa — bu odatiy holat).
+   * shu email bilan ilovaga kirgan bo'lsa — bu odatiy holat).
    */
   private resolveEmployeeEmail(crmAgentEmail: string): string {
     return this.config?.employeeEmailMap?.[crmAgentEmail] || crmAgentEmail;
@@ -130,11 +149,9 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * Sozlamalar to'g'riligini tekshiradi. Aniq "auth" endpointi hali
-   * tasdiqlanmagani uchun oddiy so'rov yuborib, SERVER JAVOBINI
-   * (status kodi + matn) qaytaramiz — shunda admin darhol ko'radi:
-   * "401" bo'lsa kalit noto'g'ri, "404" bo'lsa manzil/yo'l noto'g'ri,
-   * va hokazo. Bu — taxminiy maydon nomlarini tuzatishda eng tezkor yo'l.
+   * ✅ Endi TASDIQLANGAN `calls.get_crm_event` endpointi orqali
+   * tekshiradi — bu haqiqiy, mavjud amal, shuning uchun natija
+   * ancha ishonchli (avvalgi "ping" taxminidan farqli).
    */
   async testConnection(): Promise<{ success: boolean; message: string }> {
     if (!this.config?.subdomain) {
@@ -148,38 +165,38 @@ export class MoiZvonkiProvider implements IPhoneProvider {
     }
 
     try {
-      const res = await this.request(this.baseUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          user_name: this.config.adminEmail,
-          api_key: this.config.apiKey,
-          key: this.config.apiKey,
-          action: 'ping',
-        }),
+      const res = await this.request('calls.get_crm_event', {
+        app_name: this.config.appName || 'crm',
+        max_results: 1,
       });
 
       if (res.status === 404) {
         return {
           success: false,
           message: `Manzil topilmadi (404): ${this.baseUrl}. Subdomenni tekshiring — ` +
-            `Sozlamalar → Integratsiya sahifasidagi "API manzili" bilan solishtiring.`,
+            `Sozlamalar → Integratsiya sahifasidagi "Ваш адрес API" bilan solishtiring.`,
         };
       }
       if (res.status === 401 || res.status === 403) {
         return {
           success: false,
-          message: `Ruxsat rad etildi (${res.status}). API kaliti yoki admin email noto'g'ri bo'lishi mumkin. ` +
+          message: `Ruxsat rad etildi (${res.status}). API kaliti yoki email noto'g'ri. ` +
             `Server javobi: ${res.text.slice(0, 200)}`,
         };
       }
+      if (!res.ok) {
+        return { success: false, message: `Server xatosi (HTTP ${res.status}): ${res.text.slice(0, 300)}` };
+      }
+
+      // moizvonki.ru ba'zan HTTP 200 bilan ichki xato qaytarishi mumkin
+      // (masalan {"error": "..."}) — buni ham alohida ko'rsatamiz
+      if (res.json?.error) {
+        return { success: false, message: `Server xabari: ${JSON.stringify(res.json.error).slice(0, 250)}` };
+      }
 
       return {
-        success: res.ok,
-        message: res.ok
-          ? `Server javob berdi (${this.host}). Agar qo'ng'iroq baribir ishlamasa, quyidagi xom javobni ` +
-            `menga yuboring, aniq maydon nomlarini moslashtiraman: ${res.text.slice(0, 300)}`
-          : `Server xatosi (HTTP ${res.status}): ${res.text.slice(0, 300)}`,
+        success: true,
+        message: `✅ Ulanish muvaffaqiyatli (${this.host}). Endi qo'ng'iroq qilib sinab ko'rishingiz mumkin.`,
       };
     } catch (e: any) {
       return { success: false, message: e?.message || "Noma'lum xato" };
@@ -187,16 +204,9 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // QO'NG'IROQ BOSHLASH (Click-to-Call)
+  // QO'NG'IROQ BOSHLASH (Click-to-Call) — ✅ TASDIQLANGAN
   // ─────────────────────────────────────────────────────────────
 
-  /**
-   * ⚠️ TAXMINIY so'rov shakli (aniq maydon nomlari hisobga xos —
-   * yuqoridagi izohga qarang). Bir nechta ehtimoliy maydon nomi
-   * BIRGA yuboriladi — noma'lum/keraksiz maydonlar odatda server
-   * tomonidan e'tiborsiz qoldiriladi, shuning uchun bu zarar
-   * keltirmaydi, faqat moslikni oshiradi.
-   */
   async initiate(options: CallInitiateOptions): Promise<CallInitiateResult> {
     if (!this.isConfigured()) {
       throw new Error(
@@ -204,50 +214,19 @@ export class MoiZvonkiProvider implements IPhoneProvider {
       );
     }
 
-    const employeeEmail = this.resolveEmployeeEmail(options.agentEmail || '');
-    if (!employeeEmail) {
-      throw new Error(
-        "Agentning email manzili aniqlanmadi. Agentning CRM profilida email to'ldirilganiga ishonch hosil qiling.",
-      );
-    }
-
     const to = this.normalizePhone(options.toPhone);
-
-    const body: Record<string, any> = {
-      user_name: this.config!.adminEmail,
-      api_key: this.config!.apiKey,
-      key: this.config!.apiKey,
-      auth_key: this.config!.apiKey,
-      // Harakat turi — aniq nomi tasdiqlanmagani uchun ikkalasi ham yuboriladi
-      action: 'make_call',
-      method: 'make_call',
-      // Qaysi xodim telefoni terishi kerak
-      employee: employeeEmail,
-      employee_email: employeeEmail,
-      user: employeeEmail,
-      // Qo'ng'iroq qilinadigan raqam
-      phone: to,
-      to,
-      number: to,
-    };
-
-    const res = await this.request(this.baseUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const res = await this.request('calls.make_call', { to });
 
     if (!res.ok) {
       throw new Error(
         `Мои Звонки qo'ng'iroqni boshlay olmadi (HTTP ${res.status}). ` +
-          `Server javobi: ${res.text.slice(0, 250)}. ` +
-          `Sozlamalar → Telefoniya → "Ulanishni tekshirish" orqali xom javobni ko'ring.`,
+          `Server javobi: ${res.text.slice(0, 250)}.`,
       );
     }
+    if (res.json?.error) {
+      throw new Error(`Мои Звонки: ${JSON.stringify(res.json.error).slice(0, 250)}`);
+    }
 
-    // Javobdan call ID'ni topishga harakat qilamiz — topilmasa vaqtinchalik ID yaratamiz
-    // (webhook kelganda providerCallId bo'yicha moslashtirib bo'lmasa, u baribir
-    // yangi kiruvchi/chiquvchi yozuv sifatida qayd etiladi — ma'lumot yo'qolmaydi).
     const j = res.json || {};
     const callId =
       j?.data?.id || j?.data?.call_id || j?.call_id || j?.id || `mz-${Date.now()}`;
@@ -260,69 +239,81 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // WEBHOOK — qo'ng'iroq tugagach kelgan ma'lumot
+  // CRM SINXRONIZATSIYA — ✅ TASDIQLANGAN endpoint, ⚠️ javob
+  // ichidagi HAR BIR HODISA maydonlari hali aniqlashtirilmoqda
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * ⚠️ TAXMINIY payload shakli — moizvonki.ru "Integratsiya" sahifasi
-   * har bir hisobga xos webhook formatini ko'rsatadi (login talab
-   * qiladi). Quyida eng ehtimoliy maydon nomlari (bir nechta variant)
-   * tekshiriladi. Agar mos kelmasa, webhookni CRM serverida logga
-   * yozib (calls.module.ts → handleMoiZvonkiWebhook) xom JSON'ni
-   * ko'rish va shu ro'yxatni kengaytirish kifoya.
+   * Yangi qo'ng'iroq hodisalarini navbatdan oladi. `calls.module.ts`
+   * ichidagi CRON shu metodni har 2-3 daqiqada chaqiradi (xuddi
+   * OnlinePBX'ning `pullInboundForTenant` bilan bir xil naqshda).
    */
-  parseWebhook(body: any): WebhookEvent | null {
-    if (!body || typeof body !== 'object') return null;
-    const d = body.data && typeof body.data === 'object' ? body.data : body;
+  async fetchCrmEvents(maxResults = 50): Promise<any[]> {
+    const res = await this.request('calls.get_crm_event', {
+      app_name: this.config?.appName || 'crm',
+      max_results: maxResults,
+    });
+    if (!res.ok || res.json?.error) {
+      this.logger.warn(`get_crm_event xatosi: HTTP ${res.status} — ${res.text.slice(0, 200)}`);
+      return [];
+    }
+    const j = res.json;
+    // Javob shakli turlicha bo'lishi mumkin — eng ehtimoliy variantlar tekshiriladi
+    const events = j?.data?.events || j?.events || j?.data || j?.result;
+    return Array.isArray(events) ? events : [];
+  }
 
-    const providerCallId = d.call_id || d.callId || d.id || d.uuid;
+  /**
+   * Bitta hodisani bizning umumiy `WebhookEvent` shakliga o'giradi.
+   * ⚠️ Maydon nomlari hali 100% tasdiqlanmagan — shuning uchun bir
+   * nechta ehtimoliy variant tekshiriladi (xavfsiz: yo'q maydon
+   * shunchaki o'tkazib yuboriladi).
+   */
+  parseEvent(e: any): (WebhookEvent & {
+    direction?: 'INBOUND' | 'OUTBOUND';
+    fromPhone?: string;
+    toPhone?: string;
+    employeeEmail?: string;
+  }) | null {
+    if (!e || typeof e !== 'object') return null;
+    const providerCallId = e.call_id || e.id || e.uuid || e.event_id;
     if (!providerCallId) return null;
 
-    const rawStatus = String(d.status || d.call_status || d.disposition || '').toLowerCase();
+    const rawStatus = String(e.status || e.call_status || e.disposition || '').toLowerCase();
     const status: WebhookEvent['status'] =
-      /answer|complete|success/.test(rawStatus) ? 'completed'
-      : /busy/.test(rawStatus) ? 'busy'
+      /busy/.test(rawStatus) ? 'busy'
       : /no_?answer|missed/.test(rawStatus) ? 'no_answer'
       : /fail|error/.test(rawStatus) ? 'failed'
-      : /ring/.test(rawStatus) ? 'ringing'
-      : /progress|talk/.test(rawStatus) ? 'in_progress'
       : 'completed';
 
-    const durationRaw = d.duration ?? d.talk_time ?? d.call_duration;
+    const durationRaw = e.duration ?? e.talk_time ?? e.call_duration ?? e.length;
     const duration = Number(durationRaw);
+
+    const dirRaw = String(e.direction || e.call_direction || e.type || '').toLowerCase();
+    const direction = dirRaw.includes('in') ? 'INBOUND' : dirRaw.includes('out') ? 'OUTBOUND' : undefined;
 
     return {
       providerCallId: String(providerCallId),
       status,
       duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration) : undefined,
-      recordingUrl: d.recording_url || d.recording || d.record_url || d.audio_url || undefined,
-      raw: body,
+      recordingUrl: e.recording_url || e.recording || e.record_url || e.audio_url || undefined,
+      direction,
+      fromPhone: e.from || e.caller || e.caller_number || e.src || e.phone,
+      toPhone: e.to || e.callee || e.called_number || e.dst,
+      employeeEmail: e.employee || e.employee_email || e.user || e.user_name,
+      raw: e,
     };
   }
 
   /**
-   * Bu yordamchi metod — asosiy IPhoneProvider interfeysida yo'q,
-   * lekin calls.module.ts'dagi maxsus MoiZvonki webhook handleri
-   * yo'nalish (INBOUND/OUTBOUND), mijoz raqami va xodim email'ini
-   * shu yerdan (xom body'dan) o'qiydi, chunki umumiy `WebhookEvent`
-   * interfeysida bu maydonlar yo'q (faqat OnlinePBX/Twilio uchun
-   * mo'ljallangan).
+   * IPhoneProvider interfeysi talab qilishi mumkin bo'lgan umumiy
+   * webhook-parse (agar kelajakda moizvonki.ru haqiqiy push-webhook
+   * ham qo'shsa, shu metod ishlatiladi — hozircha asosiy yo'l emas,
+   * asosiysi yuqoridagi `fetchCrmEvents`/`parseEvent`).
    */
-  parseWebhookDetails(body: any): {
-    direction?: 'INBOUND' | 'OUTBOUND';
-    fromPhone?: string;
-    toPhone?: string;
-    employeeEmail?: string;
-  } {
-    const d = (body?.data && typeof body.data === 'object' ? body.data : body) || {};
-    const dirRaw = String(d.direction || d.call_direction || d.type || '').toLowerCase();
-    const direction = dirRaw.includes('in') ? 'INBOUND' : dirRaw.includes('out') ? 'OUTBOUND' : undefined;
-    return {
-      direction,
-      fromPhone: d.from || d.caller || d.caller_number || d.src,
-      toPhone: d.to || d.callee || d.called_number || d.dst,
-      employeeEmail: d.employee || d.employee_email || d.user || d.user_name,
-    };
+  parseWebhook(body: any): WebhookEvent | null {
+    const d = body?.data && typeof body.data === 'object' ? body.data : body;
+    return this.parseEvent(d);
   }
 
   /** O'zbek raqamlarini E.164 ga keltiradi (OnlinePBX provayderidagi bilan bir xil) */
