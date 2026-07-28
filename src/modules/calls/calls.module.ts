@@ -739,9 +739,17 @@ export class CallsService {
   async list(tenantId: string, userId: string, role: string, params: any) {
     const where: any = { tenantId };
     if (role === 'AGENT') where.agentId = userId;
+    // v14.2: admin/manager — Hisobotlar → Qo'ng'iroqlar bo'limidan
+    // muayyan agentning qo'ng'iroqlarini (yozuvlari bilan) ko'rish uchun
+    else if (params.agentId) where.agentId = params.agentId;
     if (params.clientId) where.clientId = params.clientId;
     if (params.status) where.status = params.status;
     if (params.direction) where.direction = params.direction;
+    if (params.from || params.to) {
+      where.createdAt = {};
+      if (params.from) where.createdAt.gte = new Date(params.from);
+      if (params.to) where.createdAt.lte = new Date(params.to);
+    }
 
     const limit = Number(params.limit) || 50;
     const skip = ((Number(params.page) || 1) - 1) * limit;
@@ -802,8 +810,11 @@ export class CallsController {
     @Query('direction') direction?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('agentId') agentId?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
   ) {
-    return this.svc.list(u.tenantId, u.sub, u.role, { clientId, status, direction, page, limit });
+    return this.svc.list(u.tenantId, u.sub, u.role, { clientId, status, direction, page, limit, agentId, from, to });
   }
 
   @ApiOperation({ summary: "Joriy faol qo'ng'iroq" })

@@ -1519,9 +1519,42 @@ export class ReportsService {
       byDayMap[date].total++;
       if ((c as any).status === 'COMPLETED') byDayMap[date].answered++;
     }
+
+    // v14.2: har bir agent qancha VAQT gaplashgani (jami suhbat davomiyligi)
+    // va nechta qo'ng'iroqda YOZUV borligi — faqat bitta agentga filtr
+    // qilinmagan bo'lsa (ya'ni admin/manager BARCHASINI ko'rayotganda) hisoblanadi.
+    let byAgent: any[] | undefined;
+    if (!agentId) {
+      const rows = await this.prisma.call.findMany({
+        where,
+        select: {
+          agentId: true, status: true, duration: true, recordingUrl: true,
+          agent: { select: { id: true, name: true } },
+        },
+      });
+      const agentMap: Record<string, {
+        agentId: string; agentName: string; totalCalls: number; answered: number;
+        totalDurationSec: number; recordingsCount: number;
+      }> = {};
+      for (const c of rows) {
+        const aId = c.agentId || 'unassigned';
+        const aName = c.agent?.name || "Agentsiz";
+        if (!agentMap[aId]) {
+          agentMap[aId] = { agentId: aId, agentName: aName, totalCalls: 0, answered: 0, totalDurationSec: 0, recordingsCount: 0 };
+        }
+        const entry = agentMap[aId];
+        entry.totalCalls++;
+        if (c.status === 'COMPLETED') entry.answered++;
+        entry.totalDurationSec += c.duration || 0;
+        if (c.recordingUrl) entry.recordingsCount++;
+      }
+      byAgent = Object.values(agentMap).sort((a, b) => b.totalDurationSec - a.totalDurationSec);
+    }
+
     return {
       summary: { total, answered, noAnswer: total - answered, conversionRate: total > 0 ? Math.round(answered / total * 100) : 0 },
       byDay: Object.values(byDayMap),
+      ...(byAgent ? { byAgent } : {}),
     };
   }
 
