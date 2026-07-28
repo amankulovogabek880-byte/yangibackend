@@ -88,7 +88,7 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   }
 
   isConfigured(): boolean {
-    return Boolean(this.config?.subdomain && this.config?.apiKey && this.config?.adminEmail);
+    return Boolean(this.host && this.apiKey && this.adminEmail);
   }
 
   /** "kompaniya" yoki "https://kompaniya.moizvonki.ru/" → "kompaniya.moizvonki.ru" */
@@ -111,6 +111,22 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   }
 
   /**
+   * 🩹 MUHIM TUZATISH: sozlamalar formasidan (frontend) yoki
+   * moizvonki.ru shaxsiy kabinetidan copy-paste qilinganda, oxiriga
+   * yoki boshiga ko'rinmas probel/enter belgisi qo'shilib qolishi
+   * odatiy hol — bunday holda API "Username or password is invalid"
+   * (403) qaytaradi, garchi qiymat ko'zga to'g'ri ko'ringan taqdirda
+   * ham. Shu sabab HAR DOIM trim() qilinadi (avval bu yo'q edi).
+   */
+  private get apiKey(): string {
+    return String(this.config?.apiKey || '').trim();
+  }
+
+  private get adminEmail(): string {
+    return String(this.config?.adminEmail || '').trim();
+  }
+
+  /**
    * fetch o'rami — timeout va xavfsiz JSON parse bilan (OnlinePBX
    * provayderidagi bilan bir xil naqsh).
    *
@@ -126,8 +142,8 @@ export class MoiZvonkiProvider implements IPhoneProvider {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 20000);
     const body = JSON.stringify({
-      user_name: userNameOverride || this.config?.adminEmail,
-      api_key: this.config?.apiKey,
+      user_name: (userNameOverride && userNameOverride.trim()) || this.adminEmail,
+      api_key: this.apiKey,
       action,
       ...extra,
     });
@@ -157,7 +173,8 @@ export class MoiZvonkiProvider implements IPhoneProvider {
    * shu email bilan ilovaga kirgan bo'lsa — bu odatiy holat).
    */
   private resolveEmployeeEmail(crmAgentEmail: string): string {
-    return this.config?.employeeEmailMap?.[crmAgentEmail] || crmAgentEmail;
+    const mapped = this.config?.employeeEmailMap?.[crmAgentEmail];
+    return String(mapped || crmAgentEmail || '').trim();
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -170,13 +187,13 @@ export class MoiZvonkiProvider implements IPhoneProvider {
    * ancha ishonchli (avvalgi "ping" taxminidan farqli).
    */
   async testConnection(): Promise<{ success: boolean; message: string }> {
-    if (!this.config?.subdomain) {
+    if (!this.host) {
       return { success: false, message: "Hisob subdomeni kiritilmagan (masalan: 'kompaniya')" };
     }
-    if (!this.config?.apiKey) {
+    if (!this.apiKey) {
       return { success: false, message: 'API kaliti kiritilmagan' };
     }
-    if (!this.config?.adminEmail) {
+    if (!this.adminEmail) {
       return { success: false, message: 'Admin email (hisob egasi) kiritilmagan' };
     }
     if (String(this.config.subdomain).includes('@')) {
@@ -204,10 +221,27 @@ export class MoiZvonkiProvider implements IPhoneProvider {
         };
       }
       if (res.status === 401 || res.status === 403) {
+        const maskedEmail = this.adminEmail.replace(/(?<=.).(?=[^@]*@)/g, '*');
+        const keyLen = this.apiKey.length;
         return {
           success: false,
-          message: `Ruxsat rad etildi (${res.status}). API kaliti yoki email noto'g'ri. ` +
-            `Server javobi: ${res.text.slice(0, 200)}`,
+          message:
+            `Ruxsat rad etildi (${res.status}). Server javobi: ${res.text.slice(0, 200)}\n\n` +
+            `CRM shu payt AYNAN quyidagilarni yubordi — moizvonki.ru shaxsiy ` +
+            `kabinetidagi (Sozlamalar → Integratsiya) qiymatlar bilan solishtiring:\n` +
+            `  • Hisob manzili: ${this.host}\n` +
+            `  • Admin email:   ${maskedEmail}\n` +
+            `  • API kalit:     ${keyLen} ta belgi (agar moizvonki.ru'dagi kalit boshqa ` +
+            `uzunlikda bo'lsa — demak eski kalit saqlangan)\n\n` +
+            `Eng ko'p uchraydigan sabablar:\n` +
+            `  1) Moizvonki.ru shaxsiy kabinetida kimdir API kalitini "Изменить" ` +
+            `tugmasi orqali YANGILAGAN — eski kalit endi ishlamaydi, yangisini shu ` +
+            `yerga qayta kiritish kerak.\n` +
+            `  2) 20 kunlik BEPUL SINOV muddati tugagan va hisob to'lov kutilmoqda — ` +
+            `bunday holda moizvonki.ru API'ni butunlay to'xtatadi (403 shu sababdan ham chiqadi).\n` +
+            `  3) Email yoki API kalit maydoniga nusxa ko'chirishda ko'rinmas probel/enter ` +
+            `qo'shilib qolgan (CRM endi buni avtomatik tozalaydi, lekin baribir maydonlarni ` +
+            `qayta kiritib ko'ring).`,
         };
       }
       if (!res.ok) {
