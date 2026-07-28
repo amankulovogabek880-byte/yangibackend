@@ -544,6 +544,15 @@ export class CallsService {
         const provider = new MoiZvonkiProvider(cfg);
         const rawEvents = await provider.fetchCrmEvents(50);
 
+        // 🔍 VAQTINCHA DEBUG: har sinxronizatsiyada BIRINCHI xom hodisani
+        // to'liq logga yozadi — agar yozuv/davomiylik maydonlari to'g'ri
+        // aniqlanmasa, shu logdan asl maydon nomlarini ko'rib, parseEvent()
+        // ni to'g'rilash mumkin. (Xavfsiz: shaxsiy ma'lumot faqat serverning
+        // o'z logida qoladi, tashqariga chiqmaydi.)
+        if (rawEvents.length) {
+          this.logger.log(`MoiZvonki xom hodisa namunasi [${tenant.id}]: ${JSON.stringify(rawEvents[0]).slice(0, 600)}`);
+        }
+
         for (const raw of rawEvents) {
           const event = provider.parseEvent(raw);
           if (!event) continue;
