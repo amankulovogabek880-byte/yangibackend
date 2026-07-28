@@ -462,8 +462,21 @@ export class OffersService {
     } else {
       // 1) Avval matn (link preview shu yerda saqlanadi)
       if (isBotConv) {
-        await this.telegram.sendMessage(tenantId, existingConv!.id, text, agentId, role, false);
-        deliveryInfo = { via: 'bot', conversationId: existingConv!.id };
+        try {
+          await this.telegram.sendMessage(tenantId, existingConv!.id, text, agentId, role, false);
+          deliveryInfo = { via: 'bot', conversationId: existingConv!.id };
+        } catch (e: any) {
+          // 🩹 TUZATISH: bot orqali yuborish muvaffaqiyatsiz bo'lsa (masalan
+          // bot vaqtincha aktiv emas), TAKLIF UMUMAN YUBORILMAY qolmasin —
+          // shaxsiy Telegram orqali zaxira yo'l sifatida urinamiz.
+          this.logger.warn(`Taklif bot orqali yuborilmadi, shaxsiyga o'tildi: ${e?.message || e}`);
+          const result = await this.userTelegram.sendPersonalMessage(tenantId, agentId, {
+            conversationId: existingConv?.id,
+            text,
+            clientId,
+          });
+          deliveryInfo = { via: 'personal', conversationId: result.conversationId };
+        }
       } else {
         const result = await this.userTelegram.sendPersonalMessage(tenantId, agentId, {
           conversationId: existingConv?.id,

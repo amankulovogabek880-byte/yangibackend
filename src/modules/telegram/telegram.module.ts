@@ -421,6 +421,46 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * 🩹 MUHIM TUZATISH: avval bot xotiradagi `this.bots` xaritasida topilmasa
+   * (masalan server hozirgina qayta ishga tushgan, deploy paytida bot hali
+   * to'liq ulanmagan, yoki 409 Conflict tufayli vaqtincha o'chib qolgan
+   * bo'lsa) — kod DARHOL "Bot aktiv emas" deb xato qaytarardi, HATTO klient
+   * /start bosgan va bot to'liq sozlangan bo'lsa ham. Endi shu holatda DB'dagi
+   * saqlangan tokendan foydalanib botni QAYTA ISHGA TUSHIRISHGA urinamiz —
+   * shundan keyingina, agar chindan ham muvaffaqiyatsiz bo'lsa, aniq xato
+   * qaytaramiz.
+   */
+  private async getOrStartBot(accountId: string, tenantId: string): Promise<TelegramBot> {
+    const cached = this.bots.get(accountId);
+    if (cached) return cached;
+
+    const acc = await this.prisma.telegramAccount.findFirst({
+      where: { id: accountId, tenantId, isActive: true, botToken: { not: null } },
+    });
+    if (!acc?.botToken) {
+      throw new BadRequestException(
+        "Bot ulanmagan yoki o'chirilgan. Settings → Telegram bo'limida bot tokenini tekshiring.",
+      );
+    }
+
+    this.logger.warn(`Bot ${accountId} xotirada topilmadi — DB tokenidan qayta ishga tushirilmoqda...`);
+    try {
+      await this.startBot(acc.id, tenantId, acc.botToken);
+    } catch (e: any) {
+      throw new BadRequestException(`Botni ishga tushirib bo'lmadi: ${e?.message || e}`);
+    }
+
+    const started = this.bots.get(accountId);
+    if (!started) {
+      throw new BadRequestException(
+        "Bot aktiv emas (qayta ishga tushirishga urinildi, lekin muvaffaqiyatsiz bo'ldi). " +
+          "Bot tokeni to'g'riligini (Settings → Telegram) tekshiring.",
+      );
+    }
+    return started;
+  }
+
   async sendMessage(
     tenantId: string, conversationId: string, text: string,
     agentId: string, agentRole: string, isInternal = false,
@@ -473,6 +513,15 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
+    // v14.1 TUZATISH: bot instansini xabar bazaga yozilishidan OLDIN
+    // aniqlaymiz (kerak bo'lsa lazy-restart qilib) — aks holda bot
+    // topilmasa, xabar allaqachon "yuborilgan" sifatida saqlanib qolar,
+    // lekin hech qanday xato/failed belgisi bo'lmasdi.
+    let bot: TelegramBot | undefined;
+    if (!isInternal && conv.channel === 'TELEGRAM' && conv.accountId) {
+      bot = await this.getOrStartBot(conv.accountId, tenantId);
+    }
+
     const msg = await this.prisma.message.create({
       data: {
         conversationId, agentId,
@@ -483,9 +532,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
     });
 
-    if (!isInternal && conv.channel === 'TELEGRAM' && conv.accountId) {
-      const bot = this.bots.get(conv.accountId);
-      if (!bot) throw new BadRequestException('Bot aktiv emas');
+    if (!isInternal && conv.channel === 'TELEGRAM' && conv.accountId && bot) {
       try {
         const sent = await bot.sendMessage(conv.externalChatId, text);
         // v13 DUBLIKAT FIX: avval bu natija bazaga yozilar edi-yu, lekin
@@ -572,6 +619,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       (data.mimeType?.startsWith('audio/') ?? false);
     const msgType: any = isVoice ? 'VOICE' : isImage ? 'PHOTO' : isVideo ? 'VIDEO' : 'DOCUMENT';
 
+    // v14.1 TUZATISH: sendMessage'dagi bilan bir xil — bot instansini
+    // xabar bazaga yozilishidan OLDIN aniqlaymiz (lazy-restart bilan).
+    let bot: TelegramBot | undefined;
+    if (conv.channel === 'TELEGRAM' && conv.accountId) {
+      bot = await this.getOrStartBot(conv.accountId, tenantId);
+    }
+
     const msg = await this.prisma.message.create({
       data: {
         conversationId, agentId,
@@ -586,9 +640,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     });
 
     // Telegramga yuborish
-    if (conv.channel === 'TELEGRAM' && conv.accountId) {
-      const bot = this.bots.get(conv.accountId);
-      if (!bot) throw new BadRequestException('Bot aktiv emas');
+    if (conv.channel === 'TELEGRAM' && conv.accountId && bot) {
 
       // v9-FINAL: Localhost URL — Telegram tashqaridan yuklay olmaydi
       // Fayl tizimidan stream sifatida o'qib yuboramiz
@@ -1118,8 +1170,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       );
     }
 
-    const bot = this.bots.get(account.id);
-    if (!bot) throw new BadRequestException('Bot ishlamayapti (qayta ulanishi kerak bo\'lishi mumkin)');
+    const bot = await this.getOrStartBot(account.id, tenantId);
 
     try {
       // Telegram caption cheklovi — 1024 belgi
@@ -1177,8 +1228,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       );
     }
 
-    const bot = this.bots.get(account.id);
-    if (!bot) throw new BadRequestException('Bot ishlamayapti');
+    const bot = await this.getOrStartBot(account.id, tenantId);
 
     try {
       const targetChat = data.chatId || data.username!;
