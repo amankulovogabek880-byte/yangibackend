@@ -425,6 +425,25 @@ export class ClientsService {
     return { ok: true, customFields: prefs.customFields };
   }
 
+  // v29: "Nima xohlaydi" — yo'nalish + byudjet. Ilgari bu ma'lumot faqat
+  // erkin "Qo'shimcha ma'lumot" (key=value) qutisiga yozilardi — agentlar
+  // buni har xil nom bilan yozardi ("Qayerga"/"Yo'nalish"/"Destination"),
+  // shuning uchun bir xil ma'noli ma'lumot har xil ko'rinar, ro'yxatda
+  // qidirib bo'lmasdi. Endi QAT'IY 2 ta maydon — hamma mijozda bir xil.
+  async setKeyInfo(tenantId: string, id: string, userId: string, role: string, body: any) {
+    await this.findOne(tenantId, id, userId, role);
+    const client = await this.prisma.client.findFirst({ where: { id, tenantId } });
+    if (!client) throw new NotFoundException('Mijoz topilmadi');
+    const prefs: any = (client as any).preferences || {};
+    prefs.keyInfo = {
+      destination: String(body?.destination || '').slice(0, 200),
+      budget: String(body?.budget || '').slice(0, 100),
+      budgetCurrency: ['USD', 'UZS', 'EUR'].includes(body?.budgetCurrency) ? body.budgetCurrency : 'USD',
+    };
+    await this.prisma.client.update({ where: { id }, data: { preferences: prefs } });
+    return { ok: true, keyInfo: prefs.keyInfo };
+  }
+
   async delete(tenantId: string, id: string, userId: string, role: string) {
     // Only ADMIN/MANAGER can delete
     if (role === 'AGENT') {

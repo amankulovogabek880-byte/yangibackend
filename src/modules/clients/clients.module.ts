@@ -102,6 +102,16 @@ export class ClientsController {
     return this.svc.setCustomFields(u.tenantId, id, u.sub, u.role, fields);
   }
 
+  // v29: "Nima xohlaydi" — QAT'IY 2 ta maydon (yo'nalish + byudjet), erkin
+  // key-value emas. Agent bitta qarab, mijoz qayerga bormoqchi va qancha
+  // puli borligini darhol ko'rishi uchun — har doim BIR XIL joyda, bir xil
+  // nom bilan. setCustomFields kabi server-side merge (boshqa preferences
+  // maydonlari, jumladan offers/customFields, saqlanib qoladi).
+  @Patch(':id/key-info')
+  setKeyInfo(@Param('id') id: string, @Body() body: any, @CurrentUser() u: any) {
+    return this.svc.setKeyInfo(u.tenantId, id, u.sub, u.role, body);
+  }
+
   /** v5: Open Chat — klient suhbatini Inbox'da ochish */
   @Get(':id/conversation')
   getConversation(@Param('id') id: string, @CurrentUser() u: any) {
