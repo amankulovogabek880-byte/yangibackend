@@ -6,6 +6,7 @@ import { TelLinkProvider } from './tel-link.provider';
 import { OnlinePbxProvider } from './onlinepbx.provider';
 import { TwilioProvider } from './twilio.provider';
 import { CustomSipProvider } from './custom-sip.provider';
+import { MoiZvonkiProvider } from './moizvonki.provider';
 
 export * from './provider.interface';
 
@@ -43,6 +44,8 @@ export class PhoneProviderFactory {
         return new TelLinkProvider();
       case 'CUSTOM_SIP':
         return new CustomSipProvider(config.customSip);
+      case 'MOIZVONKI':
+        return new MoiZvonkiProvider(config.moizvonki);
       case 'MYATI':
         // TODO: MyAti provider qo'shilganda
         this.logger.warn("MyAti hozircha qo'llab-quvvatlanmaydi, STUB ishlaydi");

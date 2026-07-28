@@ -10,6 +10,7 @@
  *   - TwilioProvider     - Twilio (xalqaro)
  *   - OnlinePbxProvider  - OnlinePBX.uz (O'zbek raqami)
  *   - CustomSipProvider  - Shaxsiy server (Asterisk/FreePBX)
+ *   - MoiZvonkiProvider  - Мои Звонки (moizvonki.ru) — Android telefon orqali
  */
 
 export interface CallInitiateOptions {
@@ -21,6 +22,8 @@ export interface CallInitiateOptions {
   agentPhone?: string;
   /** Agentning ATS ichki raqami (extension) */
   agentExtension?: string;
+  /** Agentning CRM'dagi email manzili (Мои Звонки kabi provayderlar xodimni email orqali aniqlaydi) */
+  agentEmail?: string;
   /** Klient ismi (CRM ko'rsatish uchun) */
   clientName?: string;
 }
@@ -116,5 +119,28 @@ export interface PhoneConfig {
   myati?: {
     apiKey?: string;
     domain?: string;
+  };
+
+  // Мои Звонки (moizvonki.ru) — arzon, Android telefon orqali ishlaydi.
+  // Qo'ng'iroqning o'zi agentning shaxsiy operatoriga (mobil tarif bo'yicha)
+  // ketadi, CRM faqat terishni ishga tushiradi va natijani (yozuv+davomiylik)
+  // qabul qiladi. Sozlamalarni moizvonki.ru → Sozlamalar → Integratsiya
+  // sahifasidan oling (bepul 20 kunlik sinov, kartasiz).
+  moizvonki?: {
+    /** Hisobingiz subdomeni (masalan "kompaniya" — https://kompaniya.moizvonki.ru) */
+    subdomain?: string;
+    /** Sozlamalar → Integratsiya sahifasidagi "API kaliti" */
+    apiKey?: string;
+    /** Sozlamalar → Integratsiya sahifasidagi admin Email (hisob egasi) */
+    adminEmail?: string;
+    recordingEnabled?: boolean;
+    /**
+     * CRM agentining bizning tizimdagi email manzilini moizvonki.ru
+     * hisobidagi xodim (employee) email'iga moslash. Agar CRM agenti
+     * moizvonki.ru'da xuddi shu email bilan ro'yxatdan o'tgan bo'lsa,
+     * bu xarita bo'sh qoldirilishi mumkin (email avtomatik ishlatiladi).
+     * Kalit — bizning User.email, qiymat — moizvonki.ru'dagi email.
+     */
+    employeeEmailMap?: Record<string, string>;
   };
 }

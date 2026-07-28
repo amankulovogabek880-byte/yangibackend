@@ -75,6 +75,7 @@ export const PhoneProvider = {
   ONLINEPBX: 'ONLINEPBX' as const,
   MYATI: 'MYATI' as const,
   CUSTOM_SIP: 'CUSTOM_SIP' as const,
+  MOIZVONKI: 'MOIZVONKI' as const,
 } as const;
 export type PhoneProvider = (typeof PhoneProvider)[keyof typeof PhoneProvider];
 

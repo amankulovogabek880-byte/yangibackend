@@ -47,7 +47,7 @@ export class TenantsService {
    * Admin tomonidan: qaysi provayder + uning kalitlari
    */
   async updatePhoneProvider(tenantId: string, data: { provider: string; config: any }) {
-    const validProviders = ['STUB', 'TEL_LINK', 'TWILIO', 'ONLINEPBX', 'MYATI'];
+    const validProviders = ['STUB', 'TEL_LINK', 'TWILIO', 'ONLINEPBX', 'MYATI', 'CUSTOM_SIP', 'MOIZVONKI'];
     if (!validProviders.includes(data.provider)) {
       throw new Error(`Noma'lum provayder: ${data.provider}`);
     }
@@ -74,7 +74,7 @@ export class TenantsService {
     if (!t) return null;
     // API kalitlarni maskalash
     const cfg: any = JSON.parse(JSON.stringify(t.phoneConfig || {}));
-    for (const provider of ['onlinepbx', 'twilio', 'myati']) {
+    for (const provider of ['onlinepbx', 'twilio', 'myati', 'moizvonki']) {
       if (cfg[provider]) {
         for (const key of ['apiKey', 'apiId', 'authToken']) {
           if (cfg[provider][key]) {

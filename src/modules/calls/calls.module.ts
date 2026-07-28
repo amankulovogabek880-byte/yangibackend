@@ -44,7 +44,7 @@ export class CallsService {
 
     const agent = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, name: true, callbackPhone: true, extension: true },
+      select: { id: true, name: true, email: true, callbackPhone: true, extension: true },
     });
     if (!agent) throw new NotFoundException('Agent topilmadi');
 
@@ -78,6 +78,7 @@ export class CallsService {
         agentId: userId,
         agentPhone: agent.callbackPhone || undefined,
         agentExtension: agent.extension || undefined,
+        agentEmail: agent.email || undefined,
         clientName,
       });
 
@@ -476,7 +477,140 @@ export class CallsService {
     return { ok: true };
   }
 
-  async getActive(userId: string) {
+  /**
+   * Мои Звонки uchun ALOHIDA webhook handleri.
+   *
+   * NEGA ALOHIDA (umumiy handleWebhook() dan farqli): OnlinePBX/Twilio
+   * uchun webhook FAQAT allaqachon initiate() orqali yaratilgan
+   * (chiquvchi) qo'ng'iroqni yangilaydi — kiruvchilar alohida cron
+   * (fetchHistory) orqali tortib olinadi, chunki OnlinePBX'da tasdiqlangan
+   * tarix endpointi bor. Мои Звонки uchun bunday endpoint hali
+   * tasdiqlanmagan — shuning uchun KIRUVCHI qo'ng'iroqlar ham xuddi
+   * shu webhook orqali (chunki qo'ng'iroq tugagach ilova serverga
+   * xabar yuboradi, yo'nalishidan qat'i nazar) keladi deb hisoblanadi.
+   *
+   * Oqim:
+   *   1) providerCallId bo'yicha mavjud Call qidiriladi (agar CRM'dan
+   *      initiate() orqali boshlangan bo'lsa — topiladi, yangilanadi).
+   *   2) Topilmasa — bu KIRUVCHI (yoki telefon'dan to'g'ridan-to'g'ri,
+   *      CRM orqali emas, terilgan chiquvchi) qo'ng'iroq deb hisoblab,
+   *      YANGI Call yozuvi yaratiladi, mijoz raqami bo'yicha
+   *      qidiriladi (pullInboundForTenant bilan bir xil mantiq).
+   */
+  async handleMoiZvonkiWebhook(tenantId: string, body: any) {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { id: true, phoneProvider: true, phoneConfig: true },
+    });
+    if (!tenant) throw new NotFoundException('Tenant topilmadi');
+
+    const { MoiZvonkiProvider } = await import('../phone-providers/moizvonki.provider');
+    const cfg: any = ((tenant as any).phoneConfig || {}).moizvonki || {};
+    const provider = new MoiZvonkiProvider(cfg);
+
+    const event = provider.parseWebhook(body);
+    if (!event) {
+      this.logger.warn(`MoiZvonki webhook: tanib bo'lmadi — ${JSON.stringify(body).slice(0, 200)}`);
+      return { ok: true };
+    }
+    const details = provider.parseWebhookDetails(body);
+
+    const statusMap: Record<string, CallStatus> = {
+      queued: 'QUEUED', initiated: 'INITIATED', ringing: 'RINGING',
+      in_progress: 'IN_PROGRESS', completed: 'COMPLETED',
+      busy: 'BUSY', failed: 'FAILED', no_answer: 'NO_ANSWER', canceled: 'CANCELED',
+    };
+    const newStatus = statusMap[event.status] || 'COMPLETED';
+    const safeRecording = sanitizeMediaUrl(event.recordingUrl);
+
+    // 1) Avval CRM orqali BOSHLANGAN (initiate()) qo'ng'iroqni qidiramiz
+    const existing = await this.prisma.call.findFirst({
+      where: { providerCallId: event.providerCallId, tenantId },
+    });
+
+    if (existing) {
+      const updateData: any = { status: newStatus };
+      if (event.duration && event.duration > 0) updateData.duration = event.duration;
+      if (safeRecording) updateData.recordingUrl = safeRecording;
+      if (['COMPLETED', 'FAILED', 'NO_ANSWER', 'BUSY'].includes(newStatus)) {
+        updateData.endedAt = new Date();
+      }
+      await this.prisma.call.update({ where: { id: existing.id }, data: updateData });
+
+      if (existing.agentId) {
+        this.realtime.emitToUser(existing.agentId, 'call:status', {
+          callId: existing.id, status: newStatus, duration: event.duration, recordingUrl: safeRecording,
+        });
+      }
+      return { ok: true, callId: existing.id, mode: 'updated' };
+    }
+
+    // 2) Topilmasa — bu YANGI (odatda kiruvchi) qo'ng'iroq
+    const fromPhone = normalizePhone(details.fromPhone || details.toPhone || '');
+    if (!fromPhone) {
+      this.logger.warn(`MoiZvonki webhook: telefon raqami topilmadi — ${JSON.stringify(body).slice(0, 200)}`);
+      return { ok: true };
+    }
+
+    const client = await this.prisma.client.findFirst({
+      where: { tenantId, phone: { in: phoneVariants(fromPhone) } },
+      select: { id: true, fullName: true, assignedAgentId: true },
+    });
+
+    // Qaysi agent gaplashgani — xodim email'i orqali (bizning User.email bilan mos)
+    let agentId: string | null = client?.assignedAgentId || null;
+    if (details.employeeEmail) {
+      const byEmail = await this.prisma.user.findFirst({
+        where: { tenantId, email: details.employeeEmail },
+        select: { id: true },
+      });
+      if (byEmail) agentId = byEmail.id;
+    }
+
+    const direction = details.direction || 'INBOUND';
+    const answered = (event.duration || 0) > 0 || newStatus === 'COMPLETED';
+
+    const call = await this.prisma.call.create({
+      data: {
+        tenantId,
+        clientId: client?.id || null,
+        agentId,
+        direction: direction as any,
+        status: (answered ? 'COMPLETED' : newStatus) as any,
+        providerCallId: event.providerCallId,
+        fromMasked: fromPhone,
+        toMasked: fromPhone,
+        duration: event.duration || 0,
+        recordingUrl: safeRecording || null,
+        startedAt: new Date(),
+        endedAt: new Date(),
+      } as any,
+    });
+
+    const payload = {
+      callId: call.id, clientId: client?.id || null, clientName: client?.fullName || null,
+      phone: fromPhone, answered, recordingUrl: safeRecording,
+    };
+    if (agentId) {
+      this.realtime.emitToUser(agentId, 'call:inbound', payload);
+    } else {
+      this.realtime.emitToTenant(tenantId, 'call:inbound', payload);
+    }
+
+    if (!answered && agentId) {
+      await this.notifications.create({
+        tenantId, userId: agentId, type: 'CALL_MISSED' as any,
+        title: "📞 Javobsiz qo'ng'iroq (Мои Звонки)",
+        body: `${client?.fullName || fromPhone} qo'ng'iroq qildi`,
+        link: client?.id ? `/clients/${client.id}` : '/calls',
+        metadata: { callId: call.id, phone: fromPhone },
+      }).catch(() => {});
+    }
+
+    return { ok: true, callId: call.id, mode: 'created' };
+  }
+
+
     return this.prisma.call.findFirst({
       where: {
         agentId: userId,
@@ -696,6 +830,37 @@ export class CallsController {
     if (!res.configured) this.warnOnce();
 
     return this.svc.handleWebhook(body);
+  }
+
+  @ApiOperation({
+    summary: 'Мои Звонки Webhook',
+    description: [
+      "Мои Звонки qo'ng'iroq tugagach ushbu endpointni chaqiradi.",
+      '',
+      'Webhook URL (moizvonki.ru Sozlamalar → Integratsiya sahifasiga kiriting):',
+      'POST https://yourdomain.com/api/v1/calls/webhook/moizvonki/{tenantId}?secret=SIZNING_KALIT',
+      '',
+      "Boshqa provayderlardan farqli o'laroq, URL ichida tenantId bor — chunki",
+      "kiruvchi qo'ng'iroqlar uchun hali CRM'da hech qanday yozuv yo'q va biz",
+      "so'rovni qaysi agentlikka tegishli ekanini boshqa yo'l bilan bilolmaymiz.",
+    ].join('\n'),
+  })
+  @Post('webhook/moizvonki/:tenantId')
+  @Public()
+  webhookMoiZvonki(
+    @Param('tenantId') tenantId: string,
+    @Body() body: any,
+    @Req() req: Request,
+  ) {
+    const res = checkWebhookSecret(
+      req.headers as any,
+      req.query as any,
+      process.env.PHONE_WEBHOOK_SECRET,
+    );
+    if (!res.ok) throw new UnauthorizedException("Webhook kaliti noto'g'ri");
+    if (!res.configured) this.warnOnce();
+
+    return this.svc.handleMoiZvonkiWebhook(tenantId, body);
   }
 
   private static warned = false;

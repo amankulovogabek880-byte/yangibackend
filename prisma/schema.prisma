@@ -81,6 +81,7 @@ enum PhoneProvider {
   ONLINEPBX    // OnlinePBX.uz (O'zbek raqami, recording + WebRTC)
   MYATI        // MyAti.uz (alternativa)
   CUSTOM_SIP   // Shaxsiy server (Asterisk / FreePBX / FusionPBX)
+  MOIZVONKI    // Мои Звонки (moizvonki.ru) — Android telefon orqali, arzon, O'zbekistonda mashhur
 }
 
 // v8: Lead taqsimlash strategiyasi
