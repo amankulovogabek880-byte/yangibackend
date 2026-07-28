@@ -610,7 +610,7 @@ export class CallsService {
     return { ok: true, callId: call.id, mode: 'created' };
   }
 
-
+  async getActive(userId: string) {
     return this.prisma.call.findFirst({
       where: {
         agentId: userId,
