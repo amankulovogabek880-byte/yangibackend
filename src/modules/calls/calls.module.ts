@@ -71,9 +71,13 @@ export class CallsService {
       callId: call.id, clientName, phone: toMasked, clientId: data.clientId,
     });
 
-    const provider = await this.providerFactory.getProvider(tenantId);
-
     try {
+      // 🩹 MUHIM TUZATISH: bu ilgari try/catch'dan TASHQARIDA edi —
+      // agar shu yerda (masalan vaqtinchalik DB ulanish uzilishi
+      // tufayli) xato chiqsa, `call` yozuvi abadiy "QUEUED" holatida
+      // qolib ketardi va foydalanuvchiga xom server xatosi ko'rsatilardi.
+      const provider = await this.providerFactory.getProvider(tenantId);
+
       const result = await provider.initiate({
         toPhone: data.toPhone,
         agentId: userId,

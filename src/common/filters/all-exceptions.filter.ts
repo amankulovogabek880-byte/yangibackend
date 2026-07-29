@@ -8,7 +8,12 @@ import {
 } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
-import { PrismaClientKnownRequestError, PrismaClientValidationError } from '@prisma/client/runtime/library';
+import {
+  PrismaClientKnownRequestError,
+  PrismaClientValidationError,
+  PrismaClientInitializationError,
+  PrismaClientUnknownRequestError,
+} from '@prisma/client/runtime/library';
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
@@ -46,6 +51,21 @@ export class AllExceptionsFilter implements ExceptionFilter {
         message = exception.message;
         errorCode = exception.code;
       }
+    } else if (
+      // 🩹 MUHIM TUZATISH: bazaga ulanish vaqtincha uzilib qolganda
+      // (masalan Render Postgres bo'sh ulanishni yopib qo'yganda)
+      // Prisma "Server has closed the connection" kabi texnik xato
+      // beradi — bu avval TO'G'RIDAN-TO'G'RI foydalanuvchiga
+      // ko'rsatilib kelingan (tushunarsiz va qo'rqinchli). Endi
+      // odam tushunadigan xabar beramiz; texnik tafsilot faqat
+      // serverdagi log'ga yoziladi.
+      exception instanceof PrismaClientInitializationError ||
+      exception instanceof PrismaClientUnknownRequestError ||
+      /server has closed the connection|connection.*(closed|reset|terminated)|econnreset/i.test(String(exception?.message || ''))
+    ) {
+      status = HttpStatus.SERVICE_UNAVAILABLE;
+      message = "Ma'lumotlar bazasiga vaqtincha ulanib bo'lmadi. Birozdan so'ng qayta urinib ko'ring.";
+      errorCode = 'DB_UNAVAILABLE';
     } else if (exception instanceof PrismaClientValidationError) {
       status = HttpStatus.BAD_REQUEST;
       message = "Ma'lumot formati noto'g'ri";
