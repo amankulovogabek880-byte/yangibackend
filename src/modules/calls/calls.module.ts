@@ -1157,6 +1157,10 @@ export class CallsController {
   @Post('log')
   @UseGuards(JwtAuthGuard)
   log(@Body() body: any, @CurrentUser() u: any) {
+    return this.svc.logManual(u.tenantId, u.sub, body);
+  }
+
+  @ApiOperation({
     summary: "Qo'ng'iroq matnini (transcript) kiritish/tahrirlash",
     description: "Avtomatik transkripsiya hozircha ulanmagan — agent yozuvni tinglab matnini shu yerga joylaydi. Keyin /analyze chaqirilsa, AI shu matn asosida ishlaydi.",
   })
@@ -1183,10 +1187,6 @@ export class CallsController {
     const d = Math.min(Number(days) || 30, 365);
     const aId = u.role === 'AGENT' ? u.sub : agentId;
     return this.svc.getObjectionsStats(u.tenantId, d, aId);
-  }
-
-  @ApiOperation({
-    return this.svc.logManual(u.tenantId, u.sub, body);
   }
 
   @ApiOperation({
