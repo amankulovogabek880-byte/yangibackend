@@ -1121,6 +1121,14 @@ model Call {
   endedAt      DateTime?
   createdAt    DateTime      @default(now())
 
+  // ═══ AI Qo'ng'iroq Tahlili (Claude orqali) ═══
+  aiSummary    String?       @db.Text   // 2-3 gapli xulosa: nima so'radi, e'tiroz, keyingi qadam
+  aiSentiment  String?                  // positive | neutral | negative
+  aiObjections Json?                    // [{ category, label, quote }]
+  aiNextAction Json?                    // { title, note, daysUntilDue, followUpId? }
+  aiFeedback   Json?                    // { score, strengths: [], improvements: [] }
+  aiAnalyzedAt DateTime?
+
   @@index([tenantId, createdAt])
   @@index([clientId])
   @@index([agentId, createdAt])

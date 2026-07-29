@@ -22,6 +22,20 @@ import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { PhoneProvidersModule, PhoneProviderFactory } from '../phone-providers/phone-providers.module';
 import type { WebhookEvent } from '../phone-providers/provider.interface';
 import { CallDirection, CallStatus } from '../../prisma-types';;
+import { FollowUpsModule, FollowUpsService } from '../followups/followups.module';
+
+// E'tiroz turlari — statistikani izchil yig'ish uchun yopiq ro'yxat
+// (Claude javobni shu kategoriyalardan birortasiga moslashtiradi)
+export const OBJECTION_CATEGORIES: Record<string, string> = {
+  price: 'Narx qimmat',
+  think_it_over: "O'ylab ko'raman / vaqt kerak",
+  trust: 'Ishonchsizlik / birinchi marta',
+  timing: 'Sana/muddat mos kelmadi',
+  competitor: 'Boshqa agentlikka qaraydi',
+  availability: 'Joy/tur mos kelmadi',
+  no_response: "Aloqa yo'qoldi / javob bermadi",
+  other: 'Boshqa',
+};
 
 @Injectable()
 export class CallsService {
@@ -33,7 +47,275 @@ export class CallsService {
     private notifications: NotificationsService,
     private realtime: RealtimeGateway,
     private providerFactory: PhoneProviderFactory,
+    private followUps: FollowUpsService,
   ) {}
+
+  // ═══════════════════════════════════════════════════════════════
+  // AI QO'NG'IROQ TAHLILI (Claude orqali) — v15
+  // ═══════════════════════════════════════════════════════════════
+  // Oqim: qo'ng'iroq matni (transcript) — yo agent qo'lda kiritadi,
+  // yo kelajakda transkripsiya provayderi (masalan Whisper/Deepgram)
+  // avtomatik to'ldiradi — Claude'ga yuboriladi va u:
+  //   1) 2-3 gapli xulosa yozadi (nima so'radi, e'tiroz, keyingi qadam)
+  //   2) mijozning kayfiyatini (sentiment) aniqlaydi
+  //   3) e'tirozlarni yopiq kategoriyalar bo'yicha ajratadi (statistikaga)
+  //   4) eng yaxshi keyingi qadamni (follow-up) taklif qiladi va uni
+  //      avtomatik "Eslatmalar" bo'limiga qo'shadi
+  //   5) agentning gaplashish sifatini 1-10 ballda baholaydi
+
+  private get anthropicKey() {
+    return (process.env.ANTHROPIC_API_KEY || '').trim();
+  }
+  private get anthropicModel() {
+    return (process.env.ANTHROPIC_MODEL || 'claude-sonnet-5').trim();
+  }
+  isAiConfigured(): boolean {
+    return !!this.anthropicKey;
+  }
+
+  /** Claude ba'zan JSON ichida xom boshqaruv belgilarini qaytaradi — tozalaymiz */
+  private sanitizeJsonControlChars(input: string): string {
+    let result = '';
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+      if (inString) {
+        if (escaped) { result += ch; escaped = false; continue; }
+        if (ch === '\\') { result += ch; escaped = true; continue; }
+        if (ch === '"') { result += ch; inString = false; continue; }
+        const code = ch.charCodeAt(0);
+        if (ch === '\n') { result += '\\n'; continue; }
+        if (ch === '\r') { result += '\\r'; continue; }
+        if (ch === '\t') { result += '\\t'; continue; }
+        if (code < 0x20) { result += '\\u' + code.toString(16).padStart(4, '0'); continue; }
+        result += ch;
+      } else {
+        if (ch === '"') inString = true;
+        result += ch;
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Qo'ng'iroq matnini (transcript) qo'lda kiritish/tahrirlash.
+   * Hozircha CRM'da avtomatik nutqni-matnga o'girish integratsiyasi
+   * yo'q (Claude API audio faylni to'g'ridan-to'g'ri qabul qilmaydi),
+   * shuning uchun agent yozuvni tinglab matnni shu yerga joylaydi —
+   * yoki kelajakda alohida transkripsiya xizmati shu maydonni
+   * avtomatik to'ldiradi. Matn kiritilgach, tahlil (`analyze`) darhol
+   * shu asosda ishlaydi.
+   */
+  async setTranscript(tenantId: string, userId: string, callId: string, transcript: string) {
+    if (!transcript?.trim()) throw new BadRequestException('Matn bo\'sh bo\'lishi mumkin emas');
+    const call = await this.prisma.call.findFirst({ where: { id: callId, tenantId } });
+    if (!call) throw new NotFoundException("Qo'ng'iroq topilmadi");
+    return this.prisma.call.update({
+      where: { id: callId },
+      data: { transcript: transcript.trim() },
+    });
+  }
+
+  /**
+   * Qo'ng'iroqni Claude yordamida tahlil qiladi: xulosa, kayfiyat,
+   * e'tirozlar, keyingi qadam (avtomatik eslatma yaratiladi) va
+   * agentga qisqa feedback.
+   */
+  async analyzeCall(tenantId: string, userId: string, callId: string) {
+    if (!this.anthropicKey) {
+      throw new BadRequestException(
+        "AI tahlil sozlanmagan. Serverda ANTHROPIC_API_KEY o'rnatilmagan.",
+      );
+    }
+
+    const call = await this.prisma.call.findFirst({
+      where: { id: callId, tenantId },
+      include: {
+        client: { select: { id: true, fullName: true } },
+        agent: { select: { id: true, name: true } },
+      },
+    });
+    if (!call) throw new NotFoundException("Qo'ng'iroq topilmadi");
+    if (!call.transcript?.trim()) {
+      throw new BadRequestException(
+        "Bu qo'ng'iroqda matn (transcript) yo'q. Avval yozuvni tinglab matnini kiriting.",
+      );
+    }
+
+    const categoriesList = Object.entries(OBJECTION_CATEGORIES)
+      .map(([k, v]) => `- "${k}": ${v}`).join('\n');
+
+    const system = `Sen O'zbekistondagi sayohat agentligi uchun ishlaydigan, ko'p yillik tajribaga ega sotuv menejeri va call-markaz auditorisan. Senga agent va mijoz o'rtasidagi telefon suhbati matni beriladi. Sen uni FAQAT matnga asoslanib, hech narsa to'qib chiqarmasdan tahlil qilasan. Har doim FAQAT o'zbek tilida, lotin alifbosida yozasan.
+
+Qattiq qoidalar:
+1. Xulosa (summary) 2-3 gapdan oshmasin: mijoz nima haqida so'radi, qanday e'tiroz/shubha bildirdi, keyingi qadam nima bo'lishi kerak.
+2. E'tirozlarni FAQAT quyidagi kategoriyalardan tanlab belgila (agar suhbatda e'tiroz bo'lmasa — bo'sh massiv qaytar):
+${categoriesList}
+3. Har bir e'tiroz uchun mijozning aslidagi gapiga yaqin qisqa "quote" ber (matndan, 15 so'zdan oshmasin).
+4. Keyingi qadam (nextAction) — aniq, bajarish mumkin bo'lgan harakat bo'lsin (masalan "3 kundan keyin narx bo'yicha qayta bog'laning va 5% chegirma taklif qiling"), daysUntilDue — necha kundan keyin bajarilishi kerakligi (1-14 oralig'ida butun son).
+5. Agent feedback — agentning gaplashish sifatini xolisona baholaysan (1-10 ball): savol berish, tinglash, e'tirozga javob berish, yakunlash ko'nikmalari. Kuchli va yaxshilash kerak bo'lgan tomonlarni QISQA (har biri 1 jumla) ko'rsat. Haqoratli emas, konstruktiv bo'l.
+6. Agar suhbat juda qisqa yoki mazmunsiz bo'lsa (masalan javob bermadi), buni halol yoz — o'ylab topma.
+
+Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki markdown belgisi qo'shma:
+{
+  "summary": "...",
+  "sentiment": "positive" | "neutral" | "negative",
+  "objections": [{"category": "price", "label": "Narx qimmat", "quote": "..."}],
+  "nextAction": {"title": "...", "note": "...", "daysUntilDue": 3},
+  "feedback": {"score": 8, "strengths": ["..."], "improvements": ["..."]}
+}`;
+
+    const prompt = `Mijoz: ${call.client?.fullName || 'Notanish mijoz'}
+Agent: ${call.agent?.name || 'Notanish agent'}
+Qo'ng'iroq davomiyligi: ${call.duration || 0} soniya
+
+SUHBAT MATNI:
+"""
+${call.transcript.trim().slice(0, 12000)}
+"""
+
+Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
+
+    let raw = '';
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': this.anthropicKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: this.anthropicModel,
+          max_tokens: 1500,
+          temperature: 0.4,
+          system,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Anthropic API xato (HTTP ${res.status}): ${text.slice(0, 300)}`);
+      }
+
+      const j: any = await res.json();
+      const textBlock = (j?.content || []).find((c: any) => c.type === 'text');
+      raw = textBlock?.text || '';
+
+      const match = raw.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error('AI javobidan JSON topilmadi');
+      let parsed: any;
+      try {
+        parsed = JSON.parse(match[0]);
+      } catch {
+        parsed = JSON.parse(this.sanitizeJsonControlChars(match[0]));
+      }
+
+      const objections = Array.isArray(parsed.objections)
+        ? parsed.objections
+            .filter((o: any) => o?.category && OBJECTION_CATEGORIES[o.category])
+            .map((o: any) => ({
+              category: o.category,
+              label: OBJECTION_CATEGORIES[o.category],
+              quote: String(o.quote || '').slice(0, 300),
+            }))
+        : [];
+
+      const nextAction = parsed.nextAction?.title ? {
+        title: String(parsed.nextAction.title).slice(0, 200),
+        note: String(parsed.nextAction.note || '').slice(0, 1000),
+        daysUntilDue: Math.min(Math.max(Number(parsed.nextAction.daysUntilDue) || 3, 1), 14),
+      } : null;
+
+      const feedback = parsed.feedback ? {
+        score: Math.min(Math.max(Number(parsed.feedback.score) || 5, 1), 10),
+        strengths: Array.isArray(parsed.feedback.strengths) ? parsed.feedback.strengths.slice(0, 5) : [],
+        improvements: Array.isArray(parsed.feedback.improvements) ? parsed.feedback.improvements.slice(0, 5) : [],
+      } : null;
+
+      const sentiment = ['positive', 'neutral', 'negative'].includes(parsed.sentiment)
+        ? parsed.sentiment : 'neutral';
+
+      // Keyingi qadamni avtomatik "Eslatmalar" (FollowUp) bo'limiga qo'shamiz
+      let followUpId: string | undefined;
+      if (nextAction && call.agentId) {
+        try {
+          const due = new Date();
+          due.setDate(due.getDate() + nextAction.daysUntilDue);
+          const fu = await this.followUps.create(tenantId, call.agentId, {
+            title: `📞 AI: ${nextAction.title}`,
+            note: nextAction.note,
+            dueAt: due.toISOString(),
+            clientId: call.clientId || undefined,
+            agentId: call.agentId,
+          });
+          followUpId = fu.id;
+        } catch (e: any) {
+          this.logger.warn(`AI eslatma yaratilmadi: ${e.message}`);
+        }
+      }
+
+      const updated = await this.prisma.call.update({
+        where: { id: callId },
+        data: {
+          aiSummary: String(parsed.summary || '').slice(0, 2000),
+          aiSentiment: sentiment,
+          aiObjections: objections,
+          aiNextAction: nextAction ? { ...nextAction, followUpId } : null,
+          aiFeedback: feedback,
+          aiAnalyzedAt: new Date(),
+        } as any,
+      });
+
+      if (call.agentId) {
+        this.realtime.emitToUser(call.agentId, 'call:analyzed', { callId, summary: updated.aiSummary });
+      }
+
+      return updated;
+    } catch (e: any) {
+      this.logger.error(`AI tahlil xato: ${e.message} | raw: ${raw.slice(0, 200)}`);
+      throw new BadRequestException(`Qo'ng'iroqni tahlil qilib bo'lmadi: ${e.message}`);
+    }
+  }
+
+  /**
+   * Berilgan davr uchun eng ko'p uchragan e'tirozlar statistikasi
+   * (Hisobotlar / Dashboard'da ko'rsatish uchun).
+   */
+  async getObjectionsStats(tenantId: string, days: number, agentId?: string) {
+    const from = new Date(Date.now() - days * 86400000);
+    const where: any = { tenantId, aiAnalyzedAt: { gte: from }, NOT: { aiObjections: null } };
+    if (agentId) where.agentId = agentId;
+
+    const calls = await this.prisma.call.findMany({
+      where,
+      select: { aiObjections: true },
+    });
+
+    const counts: Record<string, { category: string; label: string; count: number }> = {};
+    let analyzedWithObjections = 0;
+    for (const c of calls) {
+      const list = (c as any).aiObjections as any[] | null;
+      if (!Array.isArray(list) || !list.length) continue;
+      analyzedWithObjections++;
+      for (const o of list) {
+        if (!o?.category) continue;
+        if (!counts[o.category]) {
+          counts[o.category] = { category: o.category, label: OBJECTION_CATEGORIES[o.category] || o.category, count: 0 };
+        }
+        counts[o.category].count++;
+      }
+    }
+
+    const totalAnalyzed = calls.length;
+    return {
+      totalAnalyzed,
+      callsWithObjections: analyzedWithObjections,
+      objections: Object.values(counts).sort((a, b) => b.count - a.count),
+    };
+  }
 
   async initiate(tenantId: string, userId: string, data: {
     toPhone: string; clientId?: string; bookingId?: string;
@@ -875,6 +1157,35 @@ export class CallsController {
   @Post('log')
   @UseGuards(JwtAuthGuard)
   log(@Body() body: any, @CurrentUser() u: any) {
+    summary: "Qo'ng'iroq matnini (transcript) kiritish/tahrirlash",
+    description: "Avtomatik transkripsiya hozircha ulanmagan — agent yozuvni tinglab matnini shu yerga joylaydi. Keyin /analyze chaqirilsa, AI shu matn asosida ishlaydi.",
+  })
+  @Post(':id/transcript')
+  @UseGuards(JwtAuthGuard)
+  setTranscript(@Param('id') id: string, @Body() body: { transcript: string }, @CurrentUser() u: any) {
+    return this.svc.setTranscript(u.tenantId, u.sub, id, body.transcript);
+  }
+
+  @ApiOperation({
+    summary: "Qo'ng'iroqni AI (Claude) yordamida tahlil qilish",
+    description: "Xulosa, mijoz kayfiyati, e'tirozlar va keyingi qadamni chiqaradi; keyingi qadam avtomatik ravishda Eslatmalar bo'limiga qo'shiladi. Bajarish uchun avval /transcript orqali matn kiritilgan bo'lishi kerak.",
+  })
+  @Post(':id/analyze')
+  @UseGuards(JwtAuthGuard)
+  analyze(@Param('id') id: string, @CurrentUser() u: any) {
+    return this.svc.analyzeCall(u.tenantId, u.sub, id);
+  }
+
+  @ApiOperation({ summary: "Eng ko'p uchragan e'tirozlar statistikasi" })
+  @Get('objections-stats')
+  @UseGuards(JwtAuthGuard)
+  objectionsStats(@CurrentUser() u: any, @Query('days') days?: string, @Query('agentId') agentId?: string) {
+    const d = Math.min(Number(days) || 30, 365);
+    const aId = u.role === 'AGENT' ? u.sub : agentId;
+    return this.svc.getObjectionsStats(u.tenantId, d, aId);
+  }
+
+  @ApiOperation({
     return this.svc.logManual(u.tenantId, u.sub, body);
   }
 
@@ -973,7 +1284,7 @@ export class CallsController {
 }
 
 @Module({
-  imports: [PhoneProvidersModule],
+  imports: [PhoneProvidersModule, FollowUpsModule],
   controllers: [CallsController],
   providers: [CallsService],
   exports: [CallsService],

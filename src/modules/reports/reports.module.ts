@@ -8,6 +8,7 @@ import { CurrentUser, Roles } from '../../common/decorators';
 import { CacheService } from '../../common/cache/cache.service';
 import { CACHE_TTL, reportsKey } from '../../common/cache/cache.constants';
 import { clampDateRange, MAX_REPORT_RANGE_DAYS } from '../../common/utils/helpers';
+import { OBJECTION_CATEGORIES } from '../calls/calls.module';
 
 @Injectable()
 export class ReportsService {
@@ -1551,10 +1552,41 @@ export class ReportsService {
       byAgent = Object.values(agentMap).sort((a, b) => b.totalDurationSec - a.totalDurationSec);
     }
 
+    // v15: AI tahlil qilingan qo'ng'iroqlar — e'tirozlar va agent baholari
+    const analyzed = await this.prisma.call.findMany({
+      where: { ...where, aiAnalyzedAt: { not: null } },
+      select: { aiObjections: true, aiSentiment: true, aiFeedback: true },
+    });
+    const objectionCounts: Record<string, { category: string; label: string; count: number }> = {};
+    let sentimentCounts = { positive: 0, neutral: 0, negative: 0 };
+    let scoreSum = 0, scoreN = 0;
+    for (const c of analyzed) {
+      const list = (c as any).aiObjections as any[] | null;
+      if (Array.isArray(list)) {
+        for (const o of list) {
+          if (!o?.category) continue;
+          if (!objectionCounts[o.category]) {
+            objectionCounts[o.category] = { category: o.category, label: OBJECTION_CATEGORIES[o.category] || o.category, count: 0 };
+          }
+          objectionCounts[o.category].count++;
+        }
+      }
+      const sentiment = (c as any).aiSentiment as string | null;
+      if (sentiment && sentiment in sentimentCounts) (sentimentCounts as any)[sentiment]++;
+      const fb = (c as any).aiFeedback as any;
+      if (fb?.score) { scoreSum += Number(fb.score); scoreN++; }
+    }
+
     return {
       summary: { total, answered, noAnswer: total - answered, conversionRate: total > 0 ? Math.round(answered / total * 100) : 0 },
       byDay: Object.values(byDayMap),
       ...(byAgent ? { byAgent } : {}),
+      aiAnalytics: {
+        analyzedCount: analyzed.length,
+        objections: Object.values(objectionCounts).sort((a, b) => b.count - a.count),
+        sentiment: sentimentCounts,
+        avgAgentScore: scoreN > 0 ? Math.round((scoreSum / scoreN) * 10) / 10 : null,
+      },
     };
   }
 

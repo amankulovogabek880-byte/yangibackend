@@ -163,5 +163,6 @@ export class FollowUpsController {
 @Module({
   controllers: [FollowUpsController],
   providers: [FollowUpsService],
+  exports: [FollowUpsService],
 })
 export class FollowUpsModule {}
