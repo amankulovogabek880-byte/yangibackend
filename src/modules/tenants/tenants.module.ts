@@ -51,11 +51,41 @@ export class TenantsService {
     if (!validProviders.includes(data.provider)) {
       throw new Error(`Noma'lum provayder: ${data.provider}`);
     }
+
+    // BUG FIX: `getPhoneProvider` API kalitlarni frontendga MASKALAB
+    // (masalan "wJ8k****") qaytaradi. Agar admin sozlamalarni saqlaganda
+    // shu maskalangan qiymat (kalitni o'zgartirmagan holda) qaytib kelsa,
+    // uni HAQIQIY kalit deb bazaga yozib qo'yish — asl kalitni yo'q qilib
+    // yuborardi. Shuning uchun: eski (haqiqiy) config'ni bazadan olib,
+    // agar yangi qiymat maskalangan ko'rinishda bo'lsa — eski haqiqiy
+    // qiymatni saqlab qolamiz.
+    const existing = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { phoneConfig: true },
+    });
+    const oldCfg: any = (existing?.phoneConfig as any) || {};
+    const newCfg: any = JSON.parse(JSON.stringify(data.config || {}));
+
+    for (const provider of ['onlinepbx', 'twilio', 'myati', 'moizvonki']) {
+      if (newCfg[provider]) {
+        for (const key of ['apiKey', 'apiId', 'authToken']) {
+          const val = newCfg[provider][key];
+          // "****" bilan tugagan/ichida bo'lgan qiymat — bu maskalangan
+          // ko'rinish, haqiqiy kalit emas. Bunday holda eski qiymatni
+          // saqlab qolamiz (agar eskisi bo'lmasa — bo'sh qoldiramiz,
+          // xato bilan haqiqiy bo'lmagan kalitni yozib qo'ymaslik uchun).
+          if (typeof val === 'string' && val.includes('****')) {
+            newCfg[provider][key] = oldCfg?.[provider]?.[key] ?? '';
+          }
+        }
+      }
+    }
+
     return this.prisma.tenant.update({
       where: { id: tenantId },
       data: {
         phoneProvider: data.provider as any,
-        phoneConfig: data.config || {},
+        phoneConfig: newCfg,
       },
       select: {
         id: true, phoneProvider: true, phoneConfig: true,

@@ -186,6 +186,55 @@ export class AiMarketingService {
     return !!this.anthropicKey;
   }
 
+  /**
+   * BUG FIX: Claude ba'zan JSON qaytarganda satr (string) ichida XOM
+   * qator ko'chirish/tab kabi boshqaruv belgilarini ekranlamasdan
+   * qaytaradi (masalan Telegram posti matnida haqiqiy "enter" belgisi).
+   * JSON standarti bo'yicha bu taqiqlangan va JSON.parse xato beradi
+   * ("Bad control character in string literal"). Bu funksiya qo'shtirnoq
+   * ICHIDAGI boshqaruv belgilarinigina topib, ularni to'g'ri ekranlangan
+   * ko'rinishga (\\n, \\r, \\t, \\u00XX) o'giradi — qo'shtirnoqdan
+   * tashqaridagi joylarga (masalan kalitlar orasidagi bo'shliq) tegmaydi.
+   */
+  private sanitizeJsonControlChars(input: string): string {
+    let result = '';
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+      if (inString) {
+        if (escaped) {
+          result += ch;
+          escaped = false;
+          continue;
+        }
+        if (ch === '\\') {
+          result += ch;
+          escaped = true;
+          continue;
+        }
+        if (ch === '"') {
+          result += ch;
+          inString = false;
+          continue;
+        }
+        const code = ch.charCodeAt(0);
+        if (ch === '\n') { result += '\\n'; continue; }
+        if (ch === '\r') { result += '\\r'; continue; }
+        if (ch === '\t') { result += '\\t'; continue; }
+        if (code < 0x20) {
+          result += '\\u' + code.toString(16).padStart(4, '0');
+          continue;
+        }
+        result += ch;
+      } else {
+        if (ch === '"') inString = true;
+        result += ch;
+      }
+    }
+    return result;
+  }
+
   /** Rasm qidirish uchun kamida bitta manba (Pexels yoki Unsplash) sozlanganmi. */
   imagesConfigured(): boolean {
     return !!this.pexelsKey || !!this.unsplashKey;
@@ -673,7 +722,13 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
       // ba'zan model qo'shimcha matn bilan o'rab yuborishi mumkin)
       const match = raw.match(/\{[\s\S]*\}/);
       if (!match) throw new Error('AI javobidan JSON topilmadi');
-      const parsed = JSON.parse(match[0]);
+      let parsed: any;
+      try {
+        parsed = JSON.parse(match[0]);
+      } catch {
+        // Xom boshqaruv belgilarini (masalan haqiqiy "enter") tozalab qayta urinamiz
+        parsed = JSON.parse(this.sanitizeJsonControlChars(match[0]));
+      }
 
       return {
         instagram: String(parsed.instagram || '').trim(),
