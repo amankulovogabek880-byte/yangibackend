@@ -373,17 +373,60 @@ export class MoiZvonkiProvider implements IPhoneProvider {
     const dirRaw = String(e.direction || e.call_direction || e.type || '').toLowerCase();
     const direction = dirRaw.includes('in') ? 'INBOUND' : dirRaw.includes('out') ? 'OUTBOUND' : undefined;
 
+    const recordingUrl =
+      e.recording_url || e.recording || e.record_url || e.audio_url ||
+      // ⚠️ Yuqoridagi 4 ta nom hech biri mos kelmasa — butun hodisa
+      // obyektini (ichki obyekt/massivlar ichida ham) chuqur qidirib,
+      // audio-havolaga o'xshagan QIYMATNI avtomatik topamiz. Bu
+      // moizvonki.ru javobidagi HAQIQIY maydon nomi noma'lum bo'lgani
+      // uchun qo'shilgan xavfsiz zaxira yo'l — faqat http(s) bilan
+      // boshlanadigan va audio-faylga o'xshagan qatorlarni qabul qiladi.
+      this.findRecordingUrlDeep(e) || undefined;
+
     return {
       providerCallId: String(providerCallId),
       status,
       duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration) : undefined,
-      recordingUrl: e.recording_url || e.recording || e.record_url || e.audio_url || undefined,
+      recordingUrl,
       direction,
       fromPhone: e.from || e.caller || e.caller_number || e.src || e.phone,
       toPhone: e.to || e.callee || e.called_number || e.dst,
       employeeEmail: e.employee || e.employee_email || e.user || e.user_name,
       raw: e,
     };
+  }
+
+  /**
+   * Hodisa obyekti ichida (kalitning nomidan qat'iy nazar, hatto ichki
+   * obyekt/massivlar ichida ham) audio-yozuvga o'xshagan http(s) havolani
+   * qidiradi. Ikki bosqichda ishlaydi:
+   *   1) Kalit nomi "record"/"audio"/"voice"/"sound"/"file"/"link"/"media"
+   *      so'zlaridan birini o'z ichiga olsa — ustunlik beriladi.
+   *   2) Hech narsa topilmasa, qiymat .mp3/.wav/.m4a/.ogg/.aac bilan
+   *      tugagan har qanday http(s) havolaga tushib qoladi.
+   * 6 darajadan chuqur emas va aylanma havolalardan himoyalangan.
+   */
+  private findRecordingUrlDeep(obj: any, depth = 0, seen = new Set<any>()): string | null {
+    if (!obj || typeof obj !== 'object' || depth > 6 || seen.has(obj)) return null;
+    seen.add(obj);
+
+    const isHttpUrl = (v: any) => typeof v === 'string' && /^https?:\/\//i.test(v.trim());
+    const looksLikeAudio = (v: string) => /\.(mp3|wav|m4a|ogg|aac|amr)(\?.*)?$/i.test(v.trim());
+    const keyHintsRecording = (k: string) => /record|audio|voice|sound|zapis|file|link|media/i.test(k);
+
+    let fallback: string | null = null;
+
+    for (const [key, val] of Object.entries(obj)) {
+      if (isHttpUrl(val)) {
+        const v = (val as string).trim();
+        if (keyHintsRecording(key) || looksLikeAudio(v)) return v;
+        if (!fallback) fallback = v; // eng oxirgi imkoniyat — istalgan http havola
+      } else if (val && typeof val === 'object') {
+        const nested = this.findRecordingUrlDeep(val, depth + 1, seen);
+        if (nested) return nested;
+      }
+    }
+    return fallback;
   }
 
   /**
