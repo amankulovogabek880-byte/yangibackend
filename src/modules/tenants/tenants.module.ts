@@ -120,6 +120,38 @@ export class TenantsService {
   }
 
   /**
+   * v13: Har bir agent o'zining Мои Звонки login emailini o'zi
+   * sozlashi uchun — TENANT_ADMIN talab qilinmaydi. Faqat SHU
+   * so'rovni yuborgan foydalanuvchining OʻZ yozuvi (`agentEmail` —
+   * CRM email, JWT'dan olinadi, tanlab bo'lmaydi) yangilanadi;
+   * boshqa provayder sozlamalari (subdomen/API kalit/admin email)
+   * yoki boshqa agentlarning xaritasi tegilmaydi.
+   */
+  async updateMyMoiZvonkiEmail(tenantId: string, agentEmail: string, moizvonkiEmail: string) {
+    const existing = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { phoneConfig: true },
+    });
+    const cfg: any = JSON.parse(JSON.stringify((existing?.phoneConfig as any) || {}));
+    const moizvonki = { ...(cfg.moizvonki || {}) };
+    const map: Record<string, string> = { ...(moizvonki.employeeEmailMap || {}) };
+
+    const clean = String(moizvonkiEmail || '').trim();
+    if (clean) map[agentEmail] = clean;
+    else delete map[agentEmail];
+
+    moizvonki.employeeEmailMap = map;
+    const nextCfg = { ...cfg, moizvonki };
+
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: { phoneConfig: nextCfg },
+    });
+
+    return { success: true, myMoizvonkiEmail: map[agentEmail] || '' };
+  }
+
+  /**
    * v9: Source-based routing sozlamalarini olish
    */
   async getSourceRouting(tenantId: string) {
@@ -208,6 +240,15 @@ export class TenantsController {
   @Roles('TENANT_ADMIN')
   updatePhone(@Body() body: { provider: string; config: any }, @CurrentUser() u: any) {
     return this.svc.updatePhoneProvider(u.tenantId, body);
+  }
+
+  // v13: Har bir agent OʻZI oʻzining Мои Звонки login emailini
+  // sozlaydi — TENANT_ADMIN talab qilinmaydi (faqat login qilingan
+  // bo'lish yetarli). Endpoint faqat shu foydalanuvchining OʻZ
+  // yozuvini yangilaydi, boshqa hech narsani tegmaydi.
+  @Patch('phone-provider/my-moizvonki-email')
+  updateMyMoiZvonkiEmail(@Body() body: { email: string }, @CurrentUser() u: any) {
+    return this.svc.updateMyMoiZvonkiEmail(u.tenantId, u.email, body?.email || '');
   }
 
   // v9: Source-based routing
