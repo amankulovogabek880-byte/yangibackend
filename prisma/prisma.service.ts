@@ -1,7 +1,7 @@
 // src/prisma/prisma.service.ts
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
-import { installTenantGuard } from '../common/tenant/tenant-guard.prisma';
+import { installTenantGuard } from '../common/tenant/tenant-guard.prisma.ts';
 
 /**
  * 🩹 MUHIM TUZATISH: Render'dagi Postgres (ayniqsa bepul/kichik tarif)
