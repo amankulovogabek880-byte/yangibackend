@@ -23,6 +23,7 @@ import { PhoneProvidersModule, PhoneProviderFactory } from '../phone-providers/p
 import type { WebhookEvent } from '../phone-providers/provider.interface';
 import { CallDirection, CallStatus } from '../../prisma-types';;
 import { FollowUpsModule, FollowUpsService } from '../followups/followups.module';
+import { TranscriptionModule, TranscriptionService } from '../transcription/transcription.module';
 
 // E'tiroz turlari — statistikani izchil yig'ish uchun yopiq ro'yxat
 // (Claude javobni shu kategoriyalardan birortasiga moslashtiradi)
@@ -37,6 +38,20 @@ export const OBJECTION_CATEGORIES: Record<string, string> = {
   other: 'Boshqa',
 };
 
+// v16: Har bir e'tiroz kategoriyasi uchun qisqa, amaliy tavsiya —
+// admin panelida "eng ko'p uchragan e'tiroz" statistikasi yonida
+// ko'rsatiladi ("bu e'tirozga shunday javob bering" tarzida).
+export const OBJECTION_PLAYBOOK: Record<string, string> = {
+  price: "Narxni emas, qiymatni gapiring: nima kiradi (mehmonxona darajasi, ovqat, ekskursiya), muqobil/chegirmali variant taklif qiling, bo'lib to'lash imkoniyatini ayting.",
+  think_it_over: "Aniq muddat qo'ying (\"joylar tugab qolishi mumkin\"), qaysi savol hali ochiqligini so'rang, 2-3 kundan keyin o'zingiz qo'ng'iroq qiling — mijozga qoldirmang.",
+  trust: "Avvalgi mijozlar sharhlarini, litsenziya/guvohnomani ko'rsating, kichik oldindan to'lov bilan boshlashni taklif qiling, jonli video-qo'ng'iroqqa taklif eting.",
+  timing: "Muqobil sanalarni tayyor holda taklif qiling, kutish ro'yxatiga qo'shing va joy bo'shashi bilan xabar bering.",
+  competitor: "Sizning noyob afzalliklaringizni (narx, xizmat, tezkorlik) aniq solishtirib ko'rsating, shoshilinch aksiya/bonus taklif qiling.",
+  availability: "3 ta muqobil variant tayyorlab qo'ying (boshqa mehmonxona, boshqa sana, boshqa yo'nalish), talablarini aniq yozib oling.",
+  no_response: "24-48 soatdan keyin boshqa kanal orqali (Telegram/SMS) qisqa eslatma yuboring, savol shaklida yozing (\"hali qiziqasizmi?\").",
+  other: "Suhbat matnini qayta o'qib, mijozning asosiy tashvishini aniq belgilang va shaxsiy yondashuv bilan javob bering.",
+};
+
 @Injectable()
 export class CallsService {
   private readonly logger = new Logger('Calls');
@@ -48,6 +63,7 @@ export class CallsService {
     private realtime: RealtimeGateway,
     private providerFactory: PhoneProviderFactory,
     private followUps: FollowUpsService,
+    private transcription: TranscriptionService,
   ) {}
 
   // ═══════════════════════════════════════════════════════════════
@@ -310,11 +326,69 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
     }
 
     const totalAnalyzed = calls.length;
+    const sorted = Object.values(counts).sort((a, b) => b.count - a.count);
+    // v16: eng ko'p uchragan e'tirozga tayyor tavsiya — admin/agent panelida
+    // "bu e'tiroz ko'p chiqyapti, shunday qiling" tarzida ko'rsatish uchun
+    const topRecommendation = sorted.length
+      ? { category: sorted[0].category, label: sorted[0].label, tip: OBJECTION_PLAYBOOK[sorted[0].category] || OBJECTION_PLAYBOOK.other }
+      : null;
     return {
       totalAnalyzed,
       callsWithObjections: analyzedWithObjections,
-      objections: Object.values(counts).sort((a, b) => b.count - a.count),
+      objections: sorted,
+      topRecommendation,
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // AVTOMATIK TRANSKRIPSIYA + TAHLIL (v16) — hech kim qo'l tegizmaydi
+  // ═══════════════════════════════════════════════════════════════
+  // Oqim: yozuv (recordingUrl) paydo bo'ladi → Whisper orqali matnga
+  // o'giriladi → transcript saqlanadi → Claude avtomatik tahlil qiladi
+  // (analyzeCall). Agent yoki admin HECH QANDAY tugma bosishi shart
+  // emas. Bu — foydalanuvchi so'ragan "AI doim eshitib, doim tahlil
+  // qilib beradi, hech kim AI'ga savol bera olmaydi" talabining aynan
+  // o'zi: bu yerda faqat avtomatik pipeline bor, erkin savol-javob
+  // (chat) endpointi umuman mavjud emas.
+  @Cron('*/4 * * * *')
+  async autoTranscribeAndAnalyze() {
+    if (!this.transcription.isConfigured() || !this.anthropicKey) return;
+
+    // Faqat oxirgi 48 soatda tugagan, yozuvi bor, hali matni yo'q va
+    // hali tahlil qilinmagan, real suhbat bo'lgan (15 soniyadan uzun)
+    // qo'ng'iroqlarni olamiz — eskilarini abadiy qayta urinmaslik uchun.
+    const since = new Date(Date.now() - 48 * 3600 * 1000);
+    const candidates = await this.prisma.call.findMany({
+      where: {
+        status: 'COMPLETED',
+        recordingUrl: { not: null },
+        transcript: null,
+        aiAnalyzedAt: null,
+        duration: { gte: 15 },
+        createdAt: { gte: since },
+      },
+      select: { id: true, tenantId: true, recordingUrl: true },
+      take: 15,
+    }).catch(() => [] as any[]);
+
+    for (const c of candidates) {
+      try {
+        const text = await this.transcription.transcribeFromUrl(c.recordingUrl!);
+        if (!text) continue;
+
+        await this.prisma.call.update({
+          where: { id: c.id },
+          data: { transcript: text },
+        });
+
+        // Matn tayyor bo'lgach — darhol Claude tahlilini ham ishga tushiramiz
+        await this.analyzeCall(c.tenantId, '', c.id).catch((e: any) => {
+          this.logger.warn(`Avtomatik tahlil xato [${c.id}]: ${e?.message}`);
+        });
+      } catch (e: any) {
+        this.logger.warn(`Avtomatik transkripsiya xato [${c.id}]: ${e?.message}`);
+      }
+    }
   }
 
   async initiate(tenantId: string, userId: string, data: {
@@ -1284,7 +1358,7 @@ export class CallsController {
 }
 
 @Module({
-  imports: [PhoneProvidersModule, FollowUpsModule],
+  imports: [PhoneProvidersModule, FollowUpsModule, TranscriptionModule],
   controllers: [CallsController],
   providers: [CallsService],
   exports: [CallsService],

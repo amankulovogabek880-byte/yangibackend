@@ -8,7 +8,7 @@ import { CurrentUser, Roles } from '../../common/decorators';
 import { CacheService } from '../../common/cache/cache.service';
 import { CACHE_TTL, reportsKey } from '../../common/cache/cache.constants';
 import { clampDateRange, MAX_REPORT_RANGE_DAYS } from '../../common/utils/helpers';
-import { OBJECTION_CATEGORIES } from '../calls/calls.module';
+import { OBJECTION_CATEGORIES, OBJECTION_PLAYBOOK } from '../calls/calls.module';
 
 @Injectable()
 export class ReportsService {
@@ -1577,15 +1577,22 @@ export class ReportsService {
       if (fb?.score) { scoreSum += Number(fb.score); scoreN++; }
     }
 
+    const sortedObjections = Object.values(objectionCounts).sort((a, b) => b.count - a.count);
+    // v16: eng ko'p uchragan e'tirozga tayyor tavsiya (Hisobotlar/Dashboard uchun)
+    const topRecommendation = sortedObjections.length
+      ? { category: sortedObjections[0].category, label: sortedObjections[0].label, tip: OBJECTION_PLAYBOOK[sortedObjections[0].category] || OBJECTION_PLAYBOOK.other }
+      : null;
+
     return {
       summary: { total, answered, noAnswer: total - answered, conversionRate: total > 0 ? Math.round(answered / total * 100) : 0 },
       byDay: Object.values(byDayMap),
       ...(byAgent ? { byAgent } : {}),
       aiAnalytics: {
         analyzedCount: analyzed.length,
-        objections: Object.values(objectionCounts).sort((a, b) => b.count - a.count),
+        objections: sortedObjections,
         sentiment: sentimentCounts,
         avgAgentScore: scoreN > 0 ? Math.round((scoreSum / scoreN) * 10) / 10 : null,
+        topRecommendation,
       },
     };
   }
