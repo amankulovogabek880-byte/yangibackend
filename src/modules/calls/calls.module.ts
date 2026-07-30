@@ -916,16 +916,6 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         for (const raw of rawEvents) {
           const event = provider.parseEvent(raw);
           if (!event) continue;
-
-          // 🔍 v14.6: agar hodisada yozuv HALI yo'q, lekin suhbat bo'lgan
-          // (davomiyligi bor) bo'lsa — alohida amal orqali yozuvni
-          // so'rab ko'ramiz (yuqoridagi izohga qarang: AlfaCRM hujjatiga
-          // ko'ra bu odatiy holat, yozuv avtomatik kelmasligi mumkin).
-          if (!event.recordingUrl && event.duration && event.duration > 0) {
-            const fetched = await provider.fetchRecordingUrl(event.providerCallId).catch(() => undefined);
-            if (fetched) event.recordingUrl = fetched;
-          }
-
           const result = await this.processMoiZvonkiEvent(tenant.id, event).catch((e) => {
             this.logger.warn(`MoiZvonki hodisa xatosi [${tenant.id}]: ${e.message}`);
             return null;

@@ -39,6 +39,7 @@ export class UsersService {
         // v14 FIX: pauza holati ro'yxatga qaytmasdi — shuning uchun "Agentlarni
         // boshqarish"da pauza ko'rinmas va ochib bo'lmasdi (pauza qilib bo'lmayapti).
         isPausedFromAssignment: true, dailyLeadLimit: true, pausedUntil: true,
+        permissions: true,
         _count: { select: { assignedClients: true, bookings: true } },
       },
       orderBy: [{ status: 'asc' }, { name: 'asc' }],
@@ -348,6 +349,39 @@ export class UsersService {
       },
     });
   }
+
+  /**
+   * v17: Moslashtiriladigan ruxsatlar (custom permissions).
+   * Faqat TENANT_ADMIN chaqira oladi (controller darajasida cheklangan).
+   */
+  async getPermissions(tenantId: string, userId: string) {
+    const user = await this.prisma.user.findFirst({
+      where: { id: userId, tenantId },
+      select: { id: true, name: true, role: true, permissions: true },
+    });
+    if (!user) throw new NotFoundException('Foydalanuvchi topilmadi');
+    return user;
+  }
+
+  async setPermissions(tenantId: string, userId: string, permissions: Record<string, boolean>) {
+    const user = await this.prisma.user.findFirst({ where: { id: userId, tenantId } });
+    if (!user) throw new NotFoundException('Foydalanuvchi topilmadi');
+    if (user.role === 'TENANT_ADMIN' || user.role === 'PLATFORM_OWNER') {
+      throw new BadRequestException("Admin ruxsatlari cheklanmaydi — u allaqachon barcha huquqlarga ega");
+    }
+    // Faqat ma'lum kalitlarni qabul qilamiz (bo'lak-bo'lak, xavfsizlik uchun)
+    const { PERMISSION_DEFS } = await import('../../common/permissions/permissions.constants');
+    const validKeys = new Set(PERMISSION_DEFS.map((p) => p.key));
+    const clean: Record<string, boolean> = {};
+    for (const [k, v] of Object.entries(permissions || {})) {
+      if (validKeys.has(k as any) && typeof v === 'boolean') clean[k] = v;
+    }
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: { permissions: clean as any },
+      select: { id: true, name: true, role: true, permissions: true },
+    });
+  }
 }
 
 @Controller('users')
@@ -434,6 +468,21 @@ export class UsersController {
   @Roles('TENANT_ADMIN')
   delete(@Param('id') id: string, @CurrentUser() u: any) {
     return this.svc.delete(u.tenantId, id, u.sub);
+  }
+
+  /** v17: Moslashtiriladigan ruxsatlar — faqat TENANT_ADMIN ko'ra/o'zgartira oladi */
+  @Get(':id/permissions')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  getPermissions(@Param('id') id: string, @CurrentUser() u: any) {
+    return this.svc.getPermissions(u.tenantId, id);
+  }
+
+  @Patch(':id/permissions')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  setPermissions(@Param('id') id: string, @Body() body: { permissions: Record<string, boolean> }, @CurrentUser() u: any) {
+    return this.svc.setPermissions(u.tenantId, id, body.permissions || {});
   }
 }
 

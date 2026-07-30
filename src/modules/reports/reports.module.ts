@@ -4,7 +4,8 @@ import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
-import { CurrentUser, Roles } from '../../common/decorators';
+import { PermissionsGuard } from '../../common/guards/permissions.guard';
+import { CurrentUser, Roles, RequirePermission } from '../../common/decorators';
 import { CacheService } from '../../common/cache/cache.service';
 import { CACHE_TTL, reportsKey } from '../../common/cache/cache.constants';
 import { clampDateRange, MAX_REPORT_RANGE_DAYS } from '../../common/utils/helpers';
@@ -1713,11 +1714,13 @@ export class ReportsService {
   }
 
   // ─── EXPORT: Excel ────────────────────────────────────────────────────────
-  async exportExcel(tenantId: string, role: string, userId: string, type: string, from?: string, to?: string) {
+  /**
+   * v17: Eksport uchun umumiy ma'lumot tayyorlash — CSV, XLSX va PDF
+   * uchastkalari BIR XIL ma'lumotdan foydalanadi (dublikatni oldini olish).
+   */
+  private async getExportData(tenantId: string, role: string, userId: string, type: string, from?: string, to?: string) {
     const fromDate = from ? new Date(from) : new Date(new Date().setMonth(new Date().getMonth() - 1));
     const toDate = to ? new Date(to) : new Date();
-    const where: any = { tenantId, createdAt: { gte: fromDate, lte: toDate } };
-    if (role === 'AGENT') where.agentId = userId;
 
     let rows: any[] = [];
     let headers: string[] = [];
@@ -1768,6 +1771,12 @@ export class ReportsService {
       ]);
     }
 
+    return { headers, rows };
+  }
+
+  async exportExcel(tenantId: string, role: string, userId: string, type: string, from?: string, to?: string) {
+    const { headers, rows } = await this.getExportData(tenantId, role, userId, type, from, to);
+
     // Build CSV (simpler than Excel, works universally)
     const csvLines = [
       headers.join(','),
@@ -1781,6 +1790,101 @@ export class ReportsService {
     const csv = '\uFEFF' + csvLines.join(newline); // BOM for Excel UTF-8
 
     return { csv, filename: `${type}-${new Date().toISOString().slice(0,10)}.csv`, rows: rows.length };
+  }
+
+  /**
+   * v17: HAQIQIY .xlsx fayl (formatlash, ustun kengligi, sarlavha rangi
+   * bilan) — oldingi CSV'dan farqli, Excel'da to'g'ridan-to'g'ri chiroyli
+   * ochiladi.
+   */
+  async exportXlsx(tenantId: string, role: string, userId: string, type: string, from?: string, to?: string) {
+    const { headers, rows } = await this.getExportData(tenantId, role, userId, type, from, to);
+    const ExcelJS = await import('exceljs');
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'Omon CRM';
+    workbook.created = new Date();
+
+    const TITLES: Record<string, string> = {
+      bookings: 'Bookinglar', clients: 'Mijozlar', payments: "To'lovlar", calls: "Qo'ng'iroqlar",
+    };
+    const sheet = workbook.addWorksheet(TITLES[type] || 'Hisobot');
+
+    sheet.columns = headers.map((h) => ({ header: h, key: h, width: Math.max(12, h.length + 4) }));
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF3D7EFF' } };
+    headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+    headerRow.height = 22;
+
+    for (const row of rows) sheet.addRow(row);
+
+    // Juft-toq qatorlarni farqlash (o'qishni osonlashtirish uchun)
+    sheet.eachRow((row, idx) => {
+      if (idx === 1) return;
+      if (idx % 2 === 0) {
+        row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF3F6FC' } };
+      }
+    });
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    return { buffer: Buffer.from(buffer), filename: `${type}-${new Date().toISOString().slice(0,10)}.xlsx`, rows: rows.length };
+  }
+
+  /**
+   * v17: Oddiy, o'qish uchun qulay PDF hisobot (jadval ko'rinishida) —
+   * pdfkit orqali, tashqi brauzer/Chromium kerak emas (Render'da yengil
+   * ishlaydi).
+   */
+  async exportPdf(tenantId: string, role: string, userId: string, type: string, from?: string, to?: string) {
+    const { headers, rows } = await this.getExportData(tenantId, role, userId, type, from, to);
+    const PDFDocument = (await import('pdfkit')).default;
+
+    const TITLES: Record<string, string> = {
+      bookings: 'Bookinglar hisoboti', clients: 'Mijozlar hisoboti',
+      payments: "To'lovlar hisoboti", calls: "Qo'ng'iroqlar hisoboti",
+    };
+
+    const doc = new PDFDocument({ margin: 30, size: 'A4', layout: 'landscape' });
+    const chunks: Buffer[] = [];
+    doc.on('data', (c: Buffer) => chunks.push(c));
+    const done = new Promise<Buffer>((resolve) => {
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+
+    doc.fontSize(16).text(TITLES[type] || 'Hisobot', { align: 'center' });
+    doc.moveDown(0.3);
+    doc.fontSize(9).fillColor('#666').text(`Yaratilgan sana: ${new Date().toLocaleString('uz-UZ')}`, { align: 'center' });
+    doc.moveDown(1);
+
+    const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const colWidth = pageWidth / headers.length;
+    const startX = doc.page.margins.left;
+    let y = doc.y;
+
+    function drawRow(cells: any[], opts: { header?: boolean } = {}) {
+      const rowHeight = 20;
+      if (y + rowHeight > doc.page.height - doc.page.margins.bottom) {
+        doc.addPage();
+        y = doc.page.margins.top;
+      }
+      if (opts.header) {
+        doc.rect(startX, y, pageWidth, rowHeight).fill('#3d7eff');
+        doc.fillColor('#ffffff').fontSize(9).font('Helvetica-Bold');
+      } else {
+        doc.fillColor('#111111').fontSize(8).font('Helvetica');
+      }
+      cells.forEach((cell, i) => {
+        doc.text(String(cell ?? ''), startX + i * colWidth + 4, y + 5, { width: colWidth - 8, ellipsis: true });
+      });
+      y += rowHeight;
+    }
+
+    drawRow(headers, { header: true });
+    for (const row of rows.slice(0, 2000)) drawRow(row);
+
+    doc.end();
+    const buffer = await done;
+    return { buffer, filename: `${type}-${new Date().toISOString().slice(0,10)}.pdf`, rows: rows.length };
   }
 
   // ─── EXPORT: Summary stats ────────────────────────────────────────────────
@@ -2058,6 +2162,8 @@ export class ReportsController {
   }
 
   @Get('export')
+  @UseGuards(PermissionsGuard)
+  @RequirePermission('export_data')
   async exportData(
     @CurrentUser() u: any,
     @Query('type') type = 'bookings',
@@ -2069,6 +2175,40 @@ export class ReportsController {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
     res.send(result.csv);
+  }
+
+  /** v17: haqiqiy .xlsx fayl (Excel'da formatlangan holda ochiladi) */
+  @Get('export-xlsx')
+  @UseGuards(PermissionsGuard)
+  @RequirePermission('export_data')
+  async exportXlsx(
+    @CurrentUser() u: any,
+    @Query('type') type = 'bookings',
+    @Res() res: any,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    const result = await this.svc.exportXlsx(u.tenantId, u.role, u.sub, type, from, to);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
+    res.send(result.buffer);
+  }
+
+  /** v17: PDF hisobot (jadval ko'rinishida, chop etish/ulashish uchun qulay) */
+  @Get('export-pdf')
+  @UseGuards(PermissionsGuard)
+  @RequirePermission('export_data')
+  async exportPdf(
+    @CurrentUser() u: any,
+    @Query('type') type = 'bookings',
+    @Res() res: any,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    const result = await this.svc.exportPdf(u.tenantId, u.role, u.sub, type, from, to);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
+    res.send(result.buffer);
   }
 
   @Get('export-json')

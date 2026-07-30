@@ -1,8 +1,8 @@
 import { Module, Global, Injectable, Controller, Get, Query, UseGuards, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
-import { RolesGuard } from '../../common/guards/roles.guard';
-import { CurrentUser, Roles } from '../../common/decorators';
+import { PermissionsGuard } from '../../common/guards/permissions.guard';
+import { CurrentUser, RequirePermission } from '../../common/decorators';
 import { paginate, meta } from '../../common/utils/helpers';
 
 @Injectable()
@@ -78,11 +78,23 @@ export class AuditService {
     ]);
     return { data, meta: meta(total, page, limit) };
   }
+
+  /** v17: Filtrlash uchun mavjud entity/action turlari (frontend dropdown uchun) */
+  async filterOptions(tenantId: string) {
+    const [entities, actions] = await Promise.all([
+      this.prisma.auditLog.findMany({ where: { tenantId }, select: { entity: true }, distinct: ['entity'] }),
+      this.prisma.auditLog.findMany({ where: { tenantId }, select: { action: true }, distinct: ['action'] }),
+    ]);
+    return {
+      entities: entities.map((e) => e.entity).filter(Boolean).sort(),
+      actions: actions.map((a) => a.action).filter(Boolean).sort(),
+    };
+  }
 }
 
 @Controller('audit')
-@UseGuards(JwtAuthGuard, RolesGuard)
-@Roles('TENANT_ADMIN')
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+@RequirePermission('view_audit_log')
 export class AuditController {
   constructor(private svc: AuditService) {}
 
@@ -99,9 +111,13 @@ export class AuditController {
   ) {
     return this.svc.list(u.tenantId, { entity, action, userId, from, to, page, limit });
   }
+
+  @Get('filter-options')
+  filterOptions(@CurrentUser() u: any) {
+    return this.svc.filterOptions(u.tenantId);
+  }
 }
 
-@Global()
 @Global()
 @Module({
   controllers: [AuditController],
