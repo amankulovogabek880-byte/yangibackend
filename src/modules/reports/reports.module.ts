@@ -1522,35 +1522,83 @@ export class ReportsService {
       if ((c as any).status === 'COMPLETED') byDayMap[date].answered++;
     }
 
-    // v14.2: har bir agent qancha VAQT gaplashgani (jami suhbat davomiyligi)
-    // va nechta qo'ng'iroqda YOZUV borligi — faqat bitta agentga filtr
-    // qilinmagan bo'lsa (ya'ni admin/manager BARCHASINI ko'rayotganda) hisoblanadi.
+    // v17: har bir agent qancha VAQT gaplashgani (jami suhbat davomiyligi),
+    // nechta qo'ng'iroqda YOZUV borligi VA endi — AI tahlil natijalari ham
+    // AGENT KESIMIDA (o'rtacha bahosi, eng ko'p uchragan e'tirozi, kayfiyat
+    // taqsimoti). Foydalanuvchi so'ragan "qaysi hodim qanchalik ishlayotgani,
+    // nega sotolmayapti" — aynan shu agent-darajasidagi AI tahlil.
+    // Faqat bitta agentga filtr qilinmagan bo'lsa (ya'ni admin/manager
+    // BARCHASINI ko'rayotganda) hisoblanadi.
     let byAgent: any[] | undefined;
     if (!agentId) {
       const rows = await this.prisma.call.findMany({
         where,
         select: {
           agentId: true, status: true, duration: true, recordingUrl: true,
+          aiAnalyzedAt: true, aiObjections: true, aiSentiment: true, aiFeedback: true,
           agent: { select: { id: true, name: true } },
         },
       });
       const agentMap: Record<string, {
         agentId: string; agentName: string; totalCalls: number; answered: number;
         totalDurationSec: number; recordingsCount: number;
+        aiAnalyzedCount: number; aiScoreSum: number; aiScoreN: number;
+        aiObjectionCounts: Record<string, { category: string; label: string; count: number }>;
+        aiSentiment: { positive: number; neutral: number; negative: number };
       }> = {};
       for (const c of rows) {
         const aId = c.agentId || 'unassigned';
         const aName = c.agent?.name || "Agentsiz";
         if (!agentMap[aId]) {
-          agentMap[aId] = { agentId: aId, agentName: aName, totalCalls: 0, answered: 0, totalDurationSec: 0, recordingsCount: 0 };
+          agentMap[aId] = {
+            agentId: aId, agentName: aName, totalCalls: 0, answered: 0,
+            totalDurationSec: 0, recordingsCount: 0,
+            aiAnalyzedCount: 0, aiScoreSum: 0, aiScoreN: 0,
+            aiObjectionCounts: {},
+            aiSentiment: { positive: 0, neutral: 0, negative: 0 },
+          };
         }
         const entry = agentMap[aId];
         entry.totalCalls++;
         if (c.status === 'COMPLETED') entry.answered++;
         entry.totalDurationSec += c.duration || 0;
         if (c.recordingUrl) entry.recordingsCount++;
+
+        if ((c as any).aiAnalyzedAt) {
+          entry.aiAnalyzedCount++;
+          const fb = (c as any).aiFeedback as any;
+          if (fb?.score) { entry.aiScoreSum += Number(fb.score); entry.aiScoreN++; }
+          const sentiment = (c as any).aiSentiment as string | null;
+          if (sentiment && sentiment in entry.aiSentiment) (entry.aiSentiment as any)[sentiment]++;
+          const objList = (c as any).aiObjections as any[] | null;
+          if (Array.isArray(objList)) {
+            for (const o of objList) {
+              if (!o?.category) continue;
+              if (!entry.aiObjectionCounts[o.category]) {
+                entry.aiObjectionCounts[o.category] = { category: o.category, label: OBJECTION_CATEGORIES[o.category] || o.category, count: 0 };
+              }
+              entry.aiObjectionCounts[o.category].count++;
+            }
+          }
+        }
       }
-      byAgent = Object.values(agentMap).sort((a, b) => b.totalDurationSec - a.totalDurationSec);
+      byAgent = Object.values(agentMap)
+        .map((a) => {
+          const sortedObj = Object.values(a.aiObjectionCounts).sort((x, y) => y.count - x.count);
+          return {
+            agentId: a.agentId,
+            agentName: a.agentName,
+            totalCalls: a.totalCalls,
+            answered: a.answered,
+            totalDurationSec: a.totalDurationSec,
+            recordingsCount: a.recordingsCount,
+            aiAnalyzedCount: a.aiAnalyzedCount,
+            aiAvgScore: a.aiScoreN > 0 ? Math.round((a.aiScoreSum / a.aiScoreN) * 10) / 10 : null,
+            aiTopObjection: sortedObj[0] || null,
+            aiSentiment: a.aiSentiment,
+          };
+        })
+        .sort((a, b) => b.totalDurationSec - a.totalDurationSec);
     }
 
     // v15: AI tahlil qilingan qo'ng'iroqlar — e'tirozlar va agent baholari
