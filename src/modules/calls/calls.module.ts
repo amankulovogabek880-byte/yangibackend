@@ -1105,8 +1105,65 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       return { ok: true, callId: existing.id, mode: 'updated' as const };
     }
 
-    // 2) Topilmasa — bu YANGI (odatda kiruvchi) qo'ng'iroq
-    const fromPhone = normalizePhone(event.fromPhone || event.toPhone || '');
+    // 2) providerCallId bo'yicha topilmadi. LEKIN: agar bu qo'ng'iroq CRM
+    // ichidan ("Call" tugmasi orqali) boshlangan bo'lsa, uning ASL Call
+    // yozuvi allaqachon mavjud — faqat providerCallId MOS KELMAYAPTI,
+    // chunki `calls.make_call` javobi haqiqiy `db_call_id`ni qaytarmaydi
+    // (moizvonki hujjatida bu maydon yo'q). Shu sabab bunday qo'ng'iroq
+    // uchun DOIM yangi (dublikat) yozuv yaratilib, ASL yozuv (to'g'ri
+    // agentId bilan) abadiy QUEUED holatida qolib ketardi — VA "kim
+    // gaplashgani" employeeEmail orqali QAYTADAN (ehtimol notoʻgʻri)
+    // aniqlanardi. AYNAN SHU — "men gaplashsam, admin gaplashdi deb
+    // yozadi" xatosining haqiqiy sababi edi.
+    //
+    // Tuzatish: dublikat yaratishdan OLDIN, telefon raqami + so'nggi
+    // 15 daqiqa ichida CRM orqali boshlangan (agentId allaqachon TO'G'RI
+    // o'rnatilgan) chiquvchi qo'ng'iroqni qidiramiz va uni MOSLASHTIRIB
+    // yangilaymiz — hech qachon qaytadan taxmin qilmaymiz.
+    const rawPhone = normalizePhone(event.fromPhone || event.toPhone || '');
+    if (rawPhone) {
+      // `toRaw` shifrlangan (IV bilan, har safar boshqacha chiqadi), shuning
+      // uchun SQL darajasida to'g'ridan-to'g'ri solishtirib bo'lmaydi —
+      // avval qisqa vaqt oynasidagi NOMZODLARNI olamiz (ular kam bo'ladi),
+      // so'ng har birini deshifrlab, telefon raqamini solishtiramiz.
+      const candidates = await this.prisma.call.findMany({
+        where: {
+          tenantId,
+          direction: 'OUTBOUND',
+          status: { in: ['QUEUED', 'INITIATED', 'RINGING', 'IN_PROGRESS'] as any },
+          createdAt: { gte: new Date(Date.now() - 15 * 60000) },
+          agentId: { not: null },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 30,
+      });
+      const wantedVariants = new Set(phoneVariants(rawPhone));
+      const reconciled = candidates.find((c) => {
+        const decrypted = normalizePhone(this.encryption.decrypt(c.toRaw) || '');
+        return decrypted && wantedVariants.has(decrypted);
+      });
+      if (reconciled) {
+        const updateData: any = {
+          status: newStatus,
+          providerCallId: event.providerCallId, // endi haqiqiy db_call_id bilan bog'laymiz
+        };
+        if (event.duration && event.duration > 0) updateData.duration = event.duration;
+        if (safeRecording) updateData.recordingUrl = safeRecording;
+        if (['COMPLETED', 'FAILED', 'NO_ANSWER', 'BUSY'].includes(newStatus)) {
+          updateData.endedAt = new Date();
+        }
+        await this.prisma.call.update({ where: { id: reconciled.id }, data: updateData });
+        if (reconciled.agentId) {
+          this.realtime.emitToUser(reconciled.agentId, 'call:status', {
+            callId: reconciled.id, status: newStatus, duration: event.duration, recordingUrl: safeRecording,
+          });
+        }
+        return { ok: true, callId: reconciled.id, mode: 'reconciled' as const };
+      }
+    }
+
+    // 3) Haqiqatan ham YANGI (odatda kiruvchi) qo'ng'iroq
+    const fromPhone = rawPhone;
     if (!fromPhone) {
       this.logger.warn(`MoiZvonki: telefon raqami topilmadi — ${JSON.stringify(event.raw).slice(0, 200)}`);
       return { ok: true, mode: 'skipped' as const };
