@@ -117,6 +117,28 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   }
 
   /**
+   * `calls.list`/webhook javobidagi `recording` maydonini xavfsiz,
+   * ijro etsa bo'ladigan TO'LIQ URLga aylantiradi.
+   *
+   * Ko'rilgan holatlar:
+   *  - to'liq URL: "https://x.moizvonki.ru/rec/xxx.mp3" → o'zgarishsiz
+   *  - domensiz yo'l: "/records/2026/07/xxx.mp3" → host qo'shiladi
+   *  - "//"dan boshlanuvchi: "//x.moizvonki.ru/rec/xxx.mp3" → "https:" qo'shiladi
+   *  - bo'sh/mavjud emas → undefined (yozuv hali tayyor emas)
+   */
+  private normalizeRecordingUrl(raw: unknown): string | undefined {
+    if (typeof raw !== 'string') return undefined;
+    let s = raw.trim();
+    if (!s) return undefined;
+    if (s.length > 2000) return undefined;
+    if (/^https?:\/\//i.test(s)) return s;
+    if (s.startsWith('//')) return `https:${s}`;
+    if (!this.host) return undefined; // host'siz nisbiy yo'lni to'liqlab bo'lmaydi
+    if (!s.startsWith('/')) s = `/${s}`;
+    return `https://${this.host}${s}`;
+  }
+
+  /**
    * 🩹 MUHIM TUZATISH: sozlamalar formasidan (frontend) yoki
    * moizvonki.ru shaxsiy kabinetidan copy-paste qilinganda, oxiriga
    * yoki boshiga ko'rinmas probel/enter belgisi qo'shilib qolishi
@@ -392,8 +414,16 @@ export class MoiZvonkiProvider implements IPhoneProvider {
     // direction: 0 - kiruvchi (входящий), 1 - chiquvchi (исходящий)
     const direction = Number(e.direction) === 1 ? 'OUTBOUND' : 'INBOUND';
     // recording bo'sh satr ("") bo'lishi mumkin — javob berilmagan yoki
-    // yozuv hali tayyor bo'lmagan qo'ng'iroqlarda
-    const recordingUrl = typeof e.recording === 'string' && e.recording.trim() ? e.recording.trim() : undefined;
+    // yozuv hali tayyor bo'lmagan qo'ng'iroqlarda.
+    //
+    // 🩹 TUZATISH: hujjatda "recording — URL yoki bo'sh" deyilgan bo'lsa-da,
+    // amalda moizvonki.ru ko'pincha TO'LIQ URL o'rniga faqat FAYL YO'LINI
+    // (masalan "/records/2026/07/xxx.mp3" yoki "records/xxx.mp3") qaytaradi.
+    // Bunday holda `sanitizeMediaUrl()` uni http(s) bilan boshlanmagani
+    // uchun rad etadi va yozuv HECH QACHON saqlanmaydi — aynan shu sabab
+    // "N ta yozuv bor" deb hisoblanadi-yu, aslida birontasini ham ijro
+    // etib bo'lmaydi. Shu yerda to'liq URLga normalize qilamiz.
+    const recordingUrl = this.normalizeRecordingUrl(e.recording);
 
     return {
       providerCallId: String(dbCallId),

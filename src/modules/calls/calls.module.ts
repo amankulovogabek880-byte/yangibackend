@@ -1033,9 +1033,91 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       } catch (e: any) {
         this.logger.warn(`MoiZvonki sinxronizatsiya xatosi [${tenant.id}]: ${e.message}`);
       }
+
+      // 🩹 TUZATISH: kursor (`from_id`) faqat OLDINGA suriladi — agar
+      // yozuv (recording) qo'ng'iroq tugagan payt hali serverda tayyor
+      // bo'lmasa (odatiy holat — Мои Звонки uni bir necha daqiqada qayta
+      // ishlaydi), o'sha qo'ng'iroq navbatdan chiqib ketadi va yozuvi
+      // ENDI HECH QACHON qayta tekshirilmasdi. Shu sabab dashboardda
+      // "N ta yozuv bor" deb sanaladi-yu, aslida ko'pchiligi bo'sh
+      // ("yozuvsiz") ko'rinardi. Endi har CRON aylanishida oxirgi 24
+      // soatdagi yozuvsiz qo'ng'iroqlarni ham qayta tekshiramiz.
+      await this.backfillMoiZvonkiRecordings(tenant.id).catch((e: any) => {
+        this.logger.warn(`MoiZvonki yozuv backfill xatosi [${tenant.id}]: ${e.message}`);
+      });
     }
 
     if (total) this.logger.log(`Мои Звонки: +${total} yangi qo'ng'iroq`);
+  }
+
+  /**
+   * Oxirgi 24 soatda yaratilgan, javob berilgan (duration > 0) lekin
+   * hali `recordingUrl`i yo'q MoiZvonki qo'ng'iroqlarini topib,
+   * `calls.list`ni ularning eng kichik `db_call_id`sidan qayta so'raydi
+   * va yozuv endi tayyor bo'lsa — saqlaydi. Kursorni (lastSyncCallId)
+   * O'ZGARTIRMAYDI — faqat mavjud yozuvlarni to'ldiradi.
+   */
+  private async backfillMoiZvonkiRecordings(tenantId: string) {
+    const since = new Date(Date.now() - 24 * 3600 * 1000);
+    const candidates = await this.prisma.call.findMany({
+      where: {
+        tenantId,
+        recordingUrl: null,
+        duration: { gt: 0 },
+        providerCallId: { not: null },
+        createdAt: { gte: since },
+        status: 'COMPLETED',
+      },
+      select: { id: true, providerCallId: true },
+      take: 200,
+    });
+    if (!candidates.length) return;
+
+    const byProviderId = new Map<string, string>(); // providerCallId -> Call.id
+    let minId = Infinity;
+    for (const c of candidates) {
+      const pid = Number(c.providerCallId);
+      if (!Number.isFinite(pid)) continue;
+      byProviderId.set(String(pid), c.id);
+      if (pid < minId) minId = pid;
+    }
+    if (!byProviderId.size || !Number.isFinite(minId)) return;
+
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { phoneConfig: true },
+    });
+    const cfg: any = ((tenant as any)?.phoneConfig || {}).moizvonki || {};
+    if (!cfg.subdomain || !cfg.apiKey || !cfg.adminEmail) return;
+
+    const { MoiZvonkiProvider } = await import('../phone-providers/moizvonki.provider');
+    const provider = new MoiZvonkiProvider(cfg);
+
+    let updated = 0;
+    let fromOffset = 0;
+    let page = 0;
+    while (page < 5 && byProviderId.size) {
+      page++;
+      const { results, nextOffset, remains } = await provider.fetchRecentCalls(minId, 100, fromOffset);
+      if (!results.length) break;
+      for (const raw of results) {
+        const event = provider.parseCallRow(raw);
+        if (!event?.dbCallId) continue;
+        const callId = byProviderId.get(String(event.dbCallId));
+        if (!callId) continue;
+        if (event.recordingUrl) {
+          await this.prisma.call.update({
+            where: { id: callId },
+            data: { recordingUrl: event.recordingUrl },
+          }).catch(() => {});
+          byProviderId.delete(String(event.dbCallId));
+          updated++;
+        }
+      }
+      if (!remains || !nextOffset) break;
+      fromOffset = nextOffset;
+    }
+    if (updated) this.logger.log(`MoiZvonki: ${updated} ta qo'ng'iroqqa kechikkan yozuv topildi va saqlandi [tenant ${tenantId}]`);
   }
 
   /**
