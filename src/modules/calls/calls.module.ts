@@ -171,7 +171,8 @@ ${categoriesList}
 3. Har bir e'tiroz uchun mijozning aslidagi gapiga yaqin qisqa "quote" ber (matndan, 15 so'zdan oshmasin).
 4. Keyingi qadam (nextAction) — aniq, bajarish mumkin bo'lgan harakat bo'lsin (masalan "3 kundan keyin narx bo'yicha qayta bog'laning va 5% chegirma taklif qiling"), daysUntilDue — necha kundan keyin bajarilishi kerakligi (1-14 oralig'ida butun son).
 5. Agent feedback — agentning gaplashish sifatini xolisona baholaysan (1-10 ball): savol berish, tinglash, e'tirozga javob berish, yakunlash ko'nikmalari. Kuchli va yaxshilash kerak bo'lgan tomonlarni QISQA (har biri 1 jumla) ko'rsat. Haqoratli emas, konstruktiv bo'l.
-6. Agar suhbat juda qisqa yoki mazmunsiz bo'lsa (masalan javob bermadi), buni halol yoz — o'ylab topma.
+6. Sotuvga yaqinlik (saleReadiness) — mijoz sotib olishga qanchalik yaqinligini 1-10 ballda baholaysan (1 = umuman qiziqmadi, 10 = deyarli rozi bo'ldi/to'lovga tayyor). missedInfo — agent aytishi kerak bo'lib, aytmay qoldirgan MUHIM ma'lumot bo'lsa qisqa yoz (masalan narx, sana, hujjatlar), bo'lmasa bo'sh qoldir. whatWouldClose — mijozni aynan nima ishontirib, sotuvni yakunlagan bo'lardi (1 qisqa, aniq jumla, masalan "5% chegirma va bepul transfer taklif qilinsa rozi bo'lardi").
+7. Agar suhbat juda qisqa yoki mazmunsiz bo'lsa (masalan javob bermadi), buni halol yoz — o'ylab topma.
 
 Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki markdown belgisi qo'shma:
 {
@@ -179,7 +180,8 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
   "sentiment": "positive" | "neutral" | "negative",
   "objections": [{"category": "price", "label": "Narx qimmat", "quote": "..."}],
   "nextAction": {"title": "...", "note": "...", "daysUntilDue": 3},
-  "feedback": {"score": 8, "strengths": ["..."], "improvements": ["..."]}
+  "feedback": {"score": 8, "strengths": ["..."], "improvements": ["..."]},
+  "saleReadiness": {"score": 6, "missedInfo": "...", "whatWouldClose": "..."}
 }`;
 
     const prompt = `Mijoz: ${call.client?.fullName || 'Notanish mijoz'}
@@ -251,6 +253,12 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         improvements: Array.isArray(parsed.feedback.improvements) ? parsed.feedback.improvements.slice(0, 5) : [],
       } : null;
 
+      const saleReadiness = parsed.saleReadiness ? {
+        score: Math.min(Math.max(Number(parsed.saleReadiness.score) || 5, 1), 10),
+        missedInfo: String(parsed.saleReadiness.missedInfo || '').slice(0, 300),
+        whatWouldClose: String(parsed.saleReadiness.whatWouldClose || '').slice(0, 300),
+      } : null;
+
       const sentiment = ['positive', 'neutral', 'negative'].includes(parsed.sentiment)
         ? parsed.sentiment : 'neutral';
 
@@ -280,7 +288,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
           aiSentiment: sentiment,
           aiObjections: objections,
           aiNextAction: nextAction ? { ...nextAction, followUpId } : null,
-          aiFeedback: feedback,
+          aiFeedback: feedback ? { ...feedback, saleReadiness } : (saleReadiness ? { saleReadiness } : null),
           aiAnalyzedAt: new Date(),
         } as any,
       });
