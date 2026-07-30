@@ -29,6 +29,30 @@ async function bootstrap() {
   });
   const config = app.get(ConfigService);
   const port = config.get<number>('PORT', 3000);
+
+  // ─────────────────────────────────────────────────────────────
+  // v19 MUHIM TUZATISH: Express standart holatda HAR BIR JSON javobga
+  // avtomatik "ETag" qo'shadi. Brauzer keyingi so'rovda shu ETag'ni
+  // qaytarsa, server "304 Not Modified" deb javob beradi va JAVOB
+  // TANASINI (body) UMUMAN QAYTARMAYDI — brauzer o'zining eski
+  // keshidan foydalanishi kerak bo'ladi. Render kabi proksi-server
+  // ortida bu mexanizm ba'zan noto'g'ri ishlab, brauzer ESKI
+  // (masalan hali yozuv-recordingUrl qo'shilmagan) ma'lumotni
+  // ko'rsatishda "qotib qolishi"ga sabab bo'ladi — bu CRM kabi doim
+  // o'zgarib turadigan ma'lumot uchun MUTLAQO KERAKSIZ va xavfli.
+  // Yechim: ETag'ni butunlay o'chiramiz VA barcha API javoblariga
+  // aniq "keshlama" ko'rsatmasini qo'shamiz — shunda brauzer/proksi
+  // hech qachon eski javobni qaytarib bermaydi, har doim yangi
+  // so'rov ketadi.
+  // ─────────────────────────────────────────────────────────────
+  app.set('etag', false);
+  app.use((req: any, res: any, next: any) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    next();
+  });
+
   // ─── Startup security checks ─────────────────────────────
   if (process.env.NODE_ENV === 'production') {
     const requiredEnv = ['JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET', 'DATABASE_URL'];
