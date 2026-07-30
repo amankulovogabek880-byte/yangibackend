@@ -435,6 +435,12 @@ model User {
   notifyEmail    Boolean @default(true)
   notifyTelegram Boolean @default(false)
 
+  // v17: Moslashtiriladigan ruxsatlar (custom permissions) — role bo'yicha
+  // standart ruxsatlarni AYRIM foydalanuvchi uchun ustiga yozadi.
+  // Masalan: { "export_data": true, "view_salaries": false }
+  // null bo'lsa — to'liq rol bo'yicha standart ruxsatlar ishlatiladi.
+  permissions Json?
+
   // ─── SECURITY (v4) ───
   twoFactorEnabled  Boolean   @default(false)
   twoFactorSecret   String?   // encrypted
