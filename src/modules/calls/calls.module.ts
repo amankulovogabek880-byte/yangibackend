@@ -1085,6 +1085,16 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       if (['COMPLETED', 'FAILED', 'NO_ANSWER', 'BUSY'].includes(newStatus)) {
         updateData.endedAt = new Date();
       }
+      // v20: agar bu qo'ng'iroq hali agentga bog'lanmagan bo'lsa (masalan
+      // initiate() vaqtida agent noaniq bo'lgan), lekin endi MoiZvonki
+      // aniq xodim email'ini yuborgan bo'lsa — to'g'irlaymiz.
+      if (!existing.agentId && event.employeeEmail) {
+        const byEmail = await this.prisma.user.findFirst({
+          where: { tenantId, email: { equals: event.employeeEmail.trim(), mode: 'insensitive' } },
+          select: { id: true },
+        });
+        if (byEmail) updateData.agentId = byEmail.id;
+      }
       await this.prisma.call.update({ where: { id: existing.id }, data: updateData });
 
       if (existing.agentId) {
@@ -1110,11 +1120,34 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
     // Qaysi agent gaplashgani — xodim email'i orqali (bizning User.email bilan mos)
     let agentId: string | null = client?.assignedAgentId || null;
     if (event.employeeEmail) {
+      // v20 FIX: avval bu solishtiruv katta-kichik harfga SEZGIR edi
+      // (Prisma default) — MoiZvonki'dan kelgan login/email CRM'dagi bilan
+      // harflar registri bo'yicha farq qilsa (masalan "Agent@Mail.com" vs
+      // "agent@mail.com"), moslik doim TOPILMASDI va qo'ng'iroq JIMGINA
+      // mijozning standart agentiga (ko'pincha ADMIN) yozilib qolardi —
+      // aynan shu "men gaplashsam, admin gaplashdi deb yozadi" xatosi.
       const byEmail = await this.prisma.user.findFirst({
-        where: { tenantId, email: event.employeeEmail },
+        where: { tenantId, email: { equals: event.employeeEmail.trim(), mode: 'insensitive' } },
         select: { id: true },
       });
-      if (byEmail) agentId = byEmail.id;
+      if (byEmail) {
+        agentId = byEmail.id;
+      } else {
+        // v20 FIX: MoiZvonki ANIQ kim gaplashganini aytgan (`user_account`),
+        // lekin bu CRM'dagi hech qanday foydalanuvchi email'iga mos
+        // kelmadi — bunday holda ilgari JIMGINA mijozning standart
+        // agentiga (noto'g'ri!) yozib qo'yilardi. Endi: bunday qo'ng'iroq
+        // ANIQ SABABI bilan ogohlantiriladi va "Agentsiz" (agentId=null)
+        // qoldiriladi — noto'g'ri odamga yozib qo'yishdan ko'ra, ochiq
+        // "aniqlanmadi" holati ancha yaxshi va tuzatish oson.
+        this.logger.warn(
+          `MoiZvonki: xodim email topilmadi — MoiZvonki'dan "${event.employeeEmail}" keldi, ` +
+          `lekin CRM'da bunday email'li foydalanuvchi yo'q. Sozlamalar > Telefoniya > ` +
+          `"employeeEmailMap" orqali "${event.employeeEmail}" ni to'g'ri CRM xodimiga bog'lang. ` +
+          `Hozircha bu qo'ng'iroq "Agentsiz" sifatida saqlanadi (mijozning standart agentiga emas).`,
+        );
+        agentId = null;
+      }
     }
 
     const direction = event.direction || 'INBOUND';
