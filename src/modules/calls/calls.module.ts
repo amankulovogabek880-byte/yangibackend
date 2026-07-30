@@ -209,7 +209,6 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         body: JSON.stringify({
           model: this.anthropicModel,
           max_tokens: 1500,
-          temperature: 0.4,
           system,
           messages: [{ role: 'user', content: prompt }],
         }),

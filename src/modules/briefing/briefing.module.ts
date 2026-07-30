@@ -285,7 +285,6 @@ FAQAT JSON qaytar:
         body: JSON.stringify({
           model: this.anthropicModel,
           max_tokens: 1200,
-          temperature: 0.5,
           system,
           messages: [{ role: 'user', content: prompt }],
         }),

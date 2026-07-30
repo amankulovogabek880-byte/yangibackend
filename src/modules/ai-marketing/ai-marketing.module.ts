@@ -703,7 +703,6 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
         body: JSON.stringify({
           model: this.anthropicModel,
           max_tokens: 2000,
-          temperature: 1,
           system,
           messages: [{ role: 'user', content: prompt }],
         }),
