@@ -142,7 +142,14 @@ export interface PhoneConfig {
      * Kalit — bizning User.email, qiymat — moizvonki.ru'dagi email.
      */
     employeeEmailMap?: Record<string, string>;
-    /** CRM sinxronizatsiya navbati (calls.get_crm_event) uchun integratsiya nomi — bo'sh bo'lsa "crm" ishlatiladi */
+    /**
+     * v19: `calls.list` orqali ketma-ket sinxronizatsiya uchun kursor —
+     * oxirgi olingan qo'ng'iroqning `db_call_id + 1`. CRM avtomatik
+     * yangilab boradi (calls.module.ts → pullMoiZvonkiEvents), qo'lda
+     * o'zgartirish shart emas.
+     */
+    lastSyncCallId?: number;
+    /** @deprecated v19: `calls.get_crm_event` mavjud emas edi, endi ishlatilmaydi */
     appName?: string;
   };
 }

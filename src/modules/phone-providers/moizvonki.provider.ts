@@ -19,9 +19,8 @@ import {
  *   2) Qo'ng'iroq tugagach, natijani (davomiylik + ovozli yozuv
  *      havolasi) SO'RAB OLADI (pastga qarang — sabab bilan).
  *
- * ── ✅ TO'LIQ TASDIQLANGAN (rasmiy moizvonki.ru integratsiya kodi
- *    orqali, PHP/Yii2 komponenti — moizvonki.ru/guide/api/ hujjatiga
- *    asoslangan, 2026) ──
+ * ── ✅ TO'LIQ TASDIQLANGAN (moizvonki.ru rasmiy hujjati —
+ *    moizvonki.ru/guide/api/, 2026) ──
  *
  *   Yagona endpoint: POST https://{sizning-subdomen}.moizvonki.ru/api/v1
  *   Har doim JSON body, "action" maydoni orqali funksiya tanlanadi:
@@ -38,33 +37,40 @@ import {
  *        uchun bu yerda `user_name` = AYNAN o'sha agentning
  *        moizvonki.ru email'i, admin emaili emas!)
  *
- *     2) Qo'ng'iroqlar tarixini olish (sana oralig'ida):
+ *     2) Qo'ng'iroqlar tarixini olish — bu YAGONA rasmiy hujjatlashtirilgan
+ *        yo'l bo'lib, YOZUV HAVOLASI (`recording`) ham shu javobning
+ *        o'zida to'g'ridan-to'g'ri keladi (alohida so'rov shart emas!):
  *          action: "calls.list"
- *          from_date, to_date   — UTC timestamp (soniyalarda)
- *          from_offset          — sahifalash uchun boshlang'ich indeks
- *          max_results          — nechta natija
- *          supervised           — 1 = barcha xodimlar, 0 = faqat shu user
- *
- *     3) CRM sinxronizatsiya navbati (YANGI hodisalarni olish —
- *        qo'ng'iroq tugagach yozuv+davomiylik shu orqali keladi):
- *          action: "calls.get_crm_event"
- *          app_name:    integratsiyangiz nomi (o'zingiz tanlaysiz)
- *          max_results: 1-100
+ *          from_id     — shu ID (dan boshlab, shu ID'ni ham qo'shib)
+ *                        keyingi barcha qo'ng'iroqlarni qaytaradi —
+ *                        ketma-ket sinxronizatsiya uchun ENG TO'G'RI usul
+ *                        (0 yoki 1 — hammasini qaytaradi)
+ *          from_date   — muqobil, UTC timestamp (from_id berilsa e'tiborga
+ *                        olinmaydi)
+ *          from_offset — sahifalash uchun boshlang'ich indeks
+ *          max_results — 1-100
+ *          supervised  — 1 = admin nomidan BARCHA xodimlarning
+ *                        qo'ng'iroqlari (har birida `user_account` bilan
+ *                        birga), 0/berilmasa = faqat shu `user_name`niki
+ *        Javobdagi HAR BIR qo'ng'iroq — TASDIQLANGAN maydonlar:
+ *          db_call_id, direction (0=kiruvchi,1=chiquvchi), client_number,
+ *          client_name, start_time, answer_time, end_time, duration,
+ *          answered (0/1), recording (URL yoki bo'sh ""), user_account
+ *          (faqat supervised=1 bo'lsa), event_pbx_call_id, src_number.
  *
  *   Narx: 175₽/qurilma/oyiga (yozuvsiz), 230₽/qurilma/oyiga (ovozli
  *   yozuv bilan) — 20 kunlik bepul sinov, kartasiz. Ovozli yozuv
  *   serverda 30 kun saqlanadi (yoki cheksiz — Yandex/Google Disk
  *   ulansa). Faqat ODDIY qo'ng'iroqlar yoziladi (messenjer emas).
  *
- * ── ⚠️ HALI ANIQLASHTIRISH KERAK ──
- *   `calls.get_crm_event` javobidagi HAR BIR HODISA ichida qaysi
- *   maydonlar borligi (masalan `recording_url`, `duration`, `phone`,
- *   `direction`) — rasmiy misolda so'rov ko'rsatilgan, lekin javob
- *   namunasi yo'q. Shu sabab pastda `parseEvent()` BIR NECHTA
- *   ehtimoliy maydon nomini tekshiradi (xavfsiz — yo'q maydon
- *   shunchaki e'tiborsiz qoldiriladi). Agar CRM'da yozuvlar
- *   to'liq to'lmasa, `testConnection()` orqali qaytgan XOM javobni
- *   menga yuboring — bir necha daqiqada moslashtiraman.
+ * ── 🩹 v19 TUZATISH: avvalgi kodda `calls.get_crm_event` degan METOD
+ *    CHAQIRILARDI — LEKIN bunday action rasmiy hujjatda UMUMAN YO'Q
+ *    (faqat calls.make_call, calls.send_sms, calls.get_sms_templates,
+ *    calls.list, webhook.subscribe/unsubscribe/list, company.*).
+ *    Shu sabab server doim xato/bo'sh javob qaytargan va YOZUV
+ *    (recording) CRM'ga HECH QACHON kelmagan. Endi rasmiy `calls.list`
+ *    (from_id kursor bilan, supervised=1) ishlatiladi — pastdagi
+ *    `fetchRecentCalls()`/`parseCallRow()` shu orqali ishlaydi.
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -136,7 +142,7 @@ export class MoiZvonkiProvider implements IPhoneProvider {
    * xodimning (demak — qaysi jismoniy telefonning) teradigan ekanini
    * shu orqali biladi. Berilmasa, hisob egasining (adminEmail)
    * emaili ishlatiladi — bu faqat hisob darajasidagi umumiy amallar
-   * (masalan `calls.get_crm_event`, `testConnection`) uchun to'g'ri.
+   * (masalan `calls.list` supervised=1, `testConnection`) uchun to'g'ri.
    */
   private async request(action: string, extra: Record<string, any> = {}, userNameOverride?: string) {
     const controller = new AbortController();
@@ -182,9 +188,9 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * ✅ Endi TASDIQLANGAN `calls.get_crm_event` endpointi orqali
-   * tekshiradi — bu haqiqiy, mavjud amal, shuning uchun natija
-   * ancha ishonchli (avvalgi "ping" taxminidan farqli).
+   * ✅ v19: TASDIQLANGAN `calls.list` endpointi orqali tekshiradi —
+   * bu haqiqiy, hujjatlashtirilgan amal (avvalgi `calls.get_crm_event`
+   * mavjud bo'lmagan action edi, shuning uchun har doim xato qaytarardi).
    */
   async testConnection(): Promise<{ success: boolean; message: string }> {
     if (!this.host) {
@@ -208,9 +214,14 @@ export class MoiZvonkiProvider implements IPhoneProvider {
     }
 
     try {
-      const res = await this.request('calls.get_crm_event', {
-        app_name: this.config.appName || 'crm',
+      // ✅ v19: `calls.list` — rasmiy hujjatdagi haqiqiy action (avvalgi
+      // `calls.get_crm_event` mavjud emas edi). `from_id: 1` — hisobdagi
+      // eng birinchi qo'ng'iroqdan boshlab so'raymiz, faqat 1 tasi kifoya
+      // (ulanish ishlayaptimi-yo'qmi shuni tekshiramiz, xolos).
+      const res = await this.request('calls.list', {
+        from_id: 1,
         max_results: 1,
+        supervised: 1,
       });
 
       if (res.status === 404) {
@@ -320,93 +331,123 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // CRM SINXRONIZATSIYA — ✅ TASDIQLANGAN endpoint, ⚠️ javob
-  // ichidagi HAR BIR HODISA maydonlari hali aniqlashtirilmoqda
+  // QO'NG'IROQLAR TARIXI (calls.list) — ✅ TASDIQLANGAN, YOZUV
+  // (recording) SHU JAVOBNING O'ZIDA KELADI
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * Yangi qo'ng'iroq hodisalarini navbatdan oladi. `calls.module.ts`
-   * ichidagi CRON shu metodni har 2-3 daqiqada chaqiradi (xuddi
-   * OnlinePBX'ning `pullInboundForTenant` bilan bir xil naqshda).
+   * Kursor (`from_id`) dan boshlab qo'ng'iroqlar ro'yxatini oladi.
+   * `calls.module.ts` ichidagi CRON shu metodni har 3 daqiqada
+   * chaqiradi (xuddi OnlinePBX'ning `pullInboundForTenant` bilan bir
+   * xil naqshda), so'ng oxirgi olingan `db_call_id + 1` ni keyingi
+   * safar uchun kursor qilib saqlab qo'yadi.
+   *
+   * `supervised: 1` — admin nomidan BARCHA xodimlarning qo'ng'iroqlari
+   * qaytadi (har birida `user_account` bilan, kim gaplashganini
+   * aniqlash uchun). Buni faqat admin hisobi (`adminEmail`) bajara
+   * oladi — shuning uchun bu yerda userNameOverride BERILMAYDI (default
+   * `this.adminEmail` ishlatiladi).
    */
-  async fetchCrmEvents(maxResults = 50): Promise<any[]> {
-    const res = await this.request('calls.get_crm_event', {
-      app_name: this.config?.appName || 'crm',
-      max_results: maxResults,
+  async fetchRecentCalls(
+    fromId: number,
+    maxResults = 100,
+    fromOffset = 0,
+  ): Promise<{ results: any[]; nextOffset: number; remains: number }> {
+    const res = await this.request('calls.list', {
+      from_id: fromId && fromId > 0 ? fromId : 1,
+      from_offset: fromOffset,
+      max_results: Math.min(Math.max(maxResults, 1), 100),
+      supervised: 1,
     });
     if (!res.ok || res.json?.error) {
-      this.logger.warn(`get_crm_event xatosi: HTTP ${res.status} — ${res.text.slice(0, 200)}`);
-      return [];
+      this.logger.warn(`calls.list xatosi: HTTP ${res.status} — ${res.text.slice(0, 200)}`);
+      return { results: [], nextOffset: 0, remains: 0 };
     }
-    const j = res.json;
-    // Javob shakli turlicha bo'lishi mumkin — eng ehtimoliy variantlar tekshiriladi
-    const events = j?.data?.events || j?.events || j?.data || j?.result;
-    const parsed = Array.isArray(events) ? events : [];
-
-    // v18 FIX: ilgari xom javob FAQAT hodisa topilganda logga yozilardi —
-    // agar bizning ehtimoliy kalit nomlarimiz (`data.events`/`events`/`data`/
-    // `result`) noto'g'ri bo'lsa, parsed HAR DOIM bo'sh chiqib, xom javobni
-    // ko'rish IMKONSIZ bo'lib qolardi (o'zaro bog'liq muammo). Endi — parsed
-    // bo'sh chiqsa ham, xom javobning o'zi HAR DOIM logga yoziladi, shunda
-    // haqiqiy kalit nomini ko'rib, yuqoridagi qatorni tuzatish mumkin.
-    if (!parsed.length) {
-      this.logger.log(`get_crm_event XOM javob (hodisa topilmadi, tekshirish uchun): ${JSON.stringify(j).slice(0, 800)}`);
-    }
-
-    return parsed;
+    const j = res.json || {};
+    const results = Array.isArray(j.results) ? j.results : [];
+    return {
+      results,
+      nextOffset: Number(j.results_next_offset) || 0,
+      remains: Number(j.results_remains) || 0,
+    };
   }
 
   /**
-   * Bitta hodisani bizning umumiy `WebhookEvent` shakliga o'giradi.
-   * ⚠️ Maydon nomlari hali 100% tasdiqlanmagan — shuning uchun bir
-   * nechta ehtimoliy variant tekshiriladi (xavfsiz: yo'q maydon
-   * shunchaki o'tkazib yuboriladi).
+   * Bitta `calls.list` qatorini bizning umumiy `WebhookEvent` shakliga
+   * o'giradi. Maydon nomlari 100% rasmiy hujjatga mos (taxmin YO'Q).
    */
-  parseEvent(e: any): (WebhookEvent & {
+  parseCallRow(e: any): (WebhookEvent & {
     direction?: 'INBOUND' | 'OUTBOUND';
     fromPhone?: string;
     toPhone?: string;
     employeeEmail?: string;
+    dbCallId?: number;
   }) | null {
     if (!e || typeof e !== 'object') return null;
-    const providerCallId = e.call_id || e.id || e.uuid || e.event_id;
-    if (!providerCallId) return null;
+    const dbCallId = Number(e.db_call_id);
+    if (!Number.isFinite(dbCallId) || dbCallId <= 0) return null;
 
-    const rawStatus = String(e.status || e.call_status || e.disposition || '').toLowerCase();
-    const status: WebhookEvent['status'] =
-      /busy/.test(rawStatus) ? 'busy'
-      : /no_?answer|missed/.test(rawStatus) ? 'no_answer'
-      : /fail|error/.test(rawStatus) ? 'failed'
-      : 'completed';
-
-    const durationRaw = e.duration ?? e.talk_time ?? e.call_duration ?? e.length;
-    const duration = Number(durationRaw);
-
-    const dirRaw = String(e.direction || e.call_direction || e.type || '').toLowerCase();
-    const direction = dirRaw.includes('in') ? 'INBOUND' : dirRaw.includes('out') ? 'OUTBOUND' : undefined;
+    const answered = Number(e.answered) === 1;
+    const duration = Number(e.duration);
+    // direction: 0 - kiruvchi (входящий), 1 - chiquvchi (исходящий)
+    const direction = Number(e.direction) === 1 ? 'OUTBOUND' : 'INBOUND';
+    // recording bo'sh satr ("") bo'lishi mumkin — javob berilmagan yoki
+    // yozuv hali tayyor bo'lmagan qo'ng'iroqlarda
+    const recordingUrl = typeof e.recording === 'string' && e.recording.trim() ? e.recording.trim() : undefined;
 
     return {
-      providerCallId: String(providerCallId),
-      status,
+      providerCallId: String(dbCallId),
+      dbCallId,
+      status: answered ? 'completed' : 'no_answer',
       duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration) : undefined,
-      recordingUrl: e.recording_url || e.recording || e.record_url || e.audio_url || undefined,
+      recordingUrl,
       direction,
-      fromPhone: e.from || e.caller || e.caller_number || e.src || e.phone,
-      toPhone: e.to || e.callee || e.called_number || e.dst,
-      employeeEmail: e.employee || e.employee_email || e.user || e.user_name,
+      // client_number — mijozning raqami (yo'nalishdan qat'i nazar)
+      fromPhone: e.client_number,
+      toPhone: e.client_number,
+      // faqat supervised=1 so'rovda keladi — qaysi xodim gaplashgani
+      employeeEmail: this.resolveCrmEmail(e.user_account),
       raw: e,
     };
   }
 
   /**
-   * IPhoneProvider interfeysi talab qilishi mumkin bo'lgan umumiy
-   * webhook-parse (agar kelajakda moizvonki.ru haqiqiy push-webhook
-   * ham qo'shsa, shu metod ishlatiladi — hozircha asosiy yo'l emas,
-   * asosiysi yuqoridagi `fetchCrmEvents`/`parseEvent`).
+   * `user_account` (moizvonki.ru login emaili) → bizning CRM'dagi
+   * User.email. `employeeEmailMap` teskari yo'nalishda saqlanadi
+   * (bizning email → moizvonki email), shuning uchun bu yerda
+   * xaritani teskari aylantirib qidiramiz. Xaritada topilmasa —
+   * odatdagidek, ikkala tizimda ham bir xil email ishlatilgan deb
+   * hisoblab, `user_account`ning o'zi qaytariladi.
+   */
+  private resolveCrmEmail(moizvonkiEmail: string | undefined): string | undefined {
+    const val = String(moizvonkiEmail || '').trim();
+    if (!val) return undefined;
+    const map = this.config?.employeeEmailMap || {};
+    for (const [crmEmail, mzEmail] of Object.entries(map)) {
+      if (String(mzEmail || '').trim().toLowerCase() === val.toLowerCase()) return crmEmail;
+    }
+    return val;
+  }
+
+  /**
+   * moizvonki.ru'ning HAQIQIY push-webhook shakli (agar admin
+   * moizvonki.ru kabinetida yoki `webhook.subscribe` orqali ulagan
+   * bo'lsa): { "webhook": {action, account_id, ...}, "event": {...} }.
+   * Faqat `call.finish` (event_type=4) hodisasida `db_call_id`,
+   * `recording`, `duration`, `answered` keladi — shu maydonlar
+   * `calls.list` javobidagi qator bilan BIR XIL, shuning uchun
+   * `parseCallRow()` to'g'ridan-to'g'ri qayta ishlatiladi. Boshqa
+   * hodisalar (call.start/answer/sms) hozircha CRM uchun harakatga
+   * sabab bo'lmaydi (yozuv/davomiylik ularda yo'q) — shuning uchun
+   * `null` qaytariladi va asosiy yo'l bo'lib `calls.list` polling
+   * (`fetchRecentCalls`) qoladi, bu webhook faqat qo'shimcha tezlik
+   * uchun.
    */
   parseWebhook(body: any): WebhookEvent | null {
-    const d = body?.data && typeof body.data === 'object' ? body.data : body;
-    return this.parseEvent(d);
+    const event = body?.event && typeof body.event === 'object' ? body.event : body;
+    const eventType = Number(event?.event_type);
+    if (eventType !== 4) return null; // call.finish emas — o'tkazib yuboramiz
+    return this.parseCallRow(event);
   }
 
   /** O'zbek raqamlarini E.164 ga keltiradi (OnlinePBX provayderidagi bilan bir xil) */

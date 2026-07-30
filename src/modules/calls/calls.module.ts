@@ -844,11 +844,12 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
    * NEGA ALOHIDA (umumiy handleWebhook() dan farqli): OnlinePBX/Twilio
    * uchun webhook FAQAT allaqachon initiate() orqali yaratilgan
    * (chiquvchi) qo'ng'iroqni yangilaydi — kiruvchilar alohida cron
-   * (fetchHistory) orqali tortib olinadi, chunki OnlinePBX'da tasdiqlangan
-   * tarix endpointi bor. Мои Звонки uchun bunday endpoint hali
-   * tasdiqlanmagan — shuning uchun KIRUVCHI qo'ng'iroqlar ham xuddi
-   * shu webhook orqali (chunki qo'ng'iroq tugagach ilova serverga
-   * xabar yuboradi, yo'nalishidan qat'i nazar) keladi deb hisoblanadi.
+   * (fetchHistory) orqali tortib olinadi. МоиЗвонки uchun ASOSIY yo'l —
+   * `calls.list` cron sinxronizatsiyasi (`pullMoiZvonkiEvents`, pastda),
+   * bu endpoint esa QO'SHIMCHA — agar admin moizvonki.ru kabinetida
+   * `webhook.subscribe` orqali real-vaqt push'ni ham yoqsa, hodisa
+   * tezroq (3 daqiqalik cron kutmasdan) keladi. Ikkalasi ham bir xil
+   * `processMoiZvonkiEvent()`ga tushadi, shuning uchun dublikat bo'lmaydi.
    *
    * Oqim:
    *   1) providerCallId bo'yicha mavjud Call qidiriladi (agar CRM'dan
@@ -878,10 +879,12 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
   }
 
   /**
-   * ✅ ASOSIY sinxronizatsiya yo'li: `calls.get_crm_event` orqali
-   * navbatdagi YANGI qo'ng'iroq hodisalarini muntazam so'rab turadi
-   * (bu — moizvonki.ru rasmiy integratsiya kodida tasdiqlangan,
-   * mavjud amal). Har 3 daqiqada barcha MOIZVONKI ulangan
+   * ✅ v19 TUZATISH: asosiy sinxronizatsiya yo'li endi `calls.list`
+   * (kursor — `from_id`) orqali ishlaydi. Avvalgi kod `calls.get_crm_event`
+   * degan MAVJUD BO'LMAGAN action'ni chaqirardi (rasmiy hujjatda bunday
+   * amal yo'q) — shu sabab yozuv (recording) HECH QACHON CRM'ga kelmasdi.
+   * `calls.list` javobida `recording` maydoni to'g'ridan-to'g'ri keladi,
+   * alohida so'rov shart emas. Har 3 daqiqada barcha MOIZVONKI ulangan
    * tenantlar uchun ishga tushadi — xuddi OnlinePBX uchun
    * `syncInboundCalls` qanday ishlasa, shunday.
    */
@@ -898,11 +901,8 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
 
     for (const tenant of tenants) {
       try {
-        const cfg: any = ((tenant as any).phoneConfig || {}).moizvonki || {};
-        // v18 FIX: ilgari bu yerda hech qanday log qoldirmasdan "continue"
-        // qilinardi — shuning uchun sozlama to'liq bo'lmasa, tashqaridan
-        // "hech narsa ishlamayapti" degan taassurot qoldirib, sababini
-        // topib bo'lmasdi. Endi ANIQ ogohlantirish yoziladi.
+        const phoneConfig: any = (tenant as any).phoneConfig || {};
+        const cfg: any = phoneConfig.moizvonki || {};
         const missing: string[] = [];
         if (!cfg.subdomain) missing.push('subdomain');
         if (!cfg.apiKey) missing.push('apiKey');
@@ -913,30 +913,50 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         }
 
         const provider = new MoiZvonkiProvider(cfg);
-        const rawEvents = await provider.fetchCrmEvents(50);
+        let fromId = Number(cfg.lastSyncCallId) || 1;
+        let fromOffset = 0;
+        let maxDbCallId = fromId - 1;
+        let pageCount = 0;
 
-        // v18: hodisa umuman kelmasa ham buni bilib turish uchun log
-        if (!rawEvents.length) {
-          this.logger.log(`MoiZvonki [tenant ${tenant.id}]: yangi hodisa yo'q (get_crm_event bo'sh qaytdi)`);
+        // Bir CRON aylanishida bir nechta sahifani ketma-ket o'qiymiz
+        // (agar bir vaqtda ko'p qo'ng'iroq to'planib qolgan bo'lsa),
+        // lekin cheksiz aylanmaslik uchun 10 sahifa bilan cheklaymiz.
+        while (pageCount < 10) {
+          pageCount++;
+          const { results, nextOffset, remains } = await provider.fetchRecentCalls(fromId, 100, fromOffset);
+          if (!results.length) {
+            if (pageCount === 1) {
+              this.logger.log(`MoiZvonki [tenant ${tenant.id}]: yangi qo'ng'iroq yo'q (from_id=${fromId})`);
+            }
+            break;
+          }
+
+          for (const raw of results) {
+            const event = provider.parseCallRow(raw);
+            if (!event) continue;
+            if (event.dbCallId && event.dbCallId > maxDbCallId) maxDbCallId = event.dbCallId;
+
+            const result = await this.processMoiZvonkiEvent(tenant.id, event).catch((e) => {
+              this.logger.warn(`MoiZvonki hodisa xatosi [${tenant.id}]: ${e.message}`);
+              return null;
+            });
+            if (result?.mode === 'created') total++;
+          }
+
+          if (!remains || !nextOffset) break;
+          fromOffset = nextOffset;
         }
 
-        // 🔍 VAQTINCHA DEBUG: har sinxronizatsiyada BIRINCHI xom hodisani
-        // to'liq logga yozadi — agar yozuv/davomiylik maydonlari to'g'ri
-        // aniqlanmasa, shu logdan asl maydon nomlarini ko'rib, parseEvent()
-        // ni to'g'rilash mumkin. (Xavfsiz: shaxsiy ma'lumot faqat serverning
-        // o'z logida qoladi, tashqariga chiqmaydi.)
-        if (rawEvents.length) {
-          this.logger.log(`MoiZvonki xom hodisa namunasi [${tenant.id}]: ${JSON.stringify(rawEvents[0]).slice(0, 600)}`);
-        }
-
-        for (const raw of rawEvents) {
-          const event = provider.parseEvent(raw);
-          if (!event) continue;
-          const result = await this.processMoiZvonkiEvent(tenant.id, event).catch((e) => {
-            this.logger.warn(`MoiZvonki hodisa xatosi [${tenant.id}]: ${e.message}`);
-            return null;
+        // Kursorni bir qadam oldinga suramiz — keyingi safar shu ID'dan
+        // KEYIN (o'zi qo'shilmasdan) davom etamiz.
+        if (maxDbCallId >= fromId) {
+          const newCfg = { ...phoneConfig, moizvonki: { ...cfg, lastSyncCallId: maxDbCallId + 1 } };
+          await this.prisma.tenant.update({
+            where: { id: tenant.id },
+            data: { phoneConfig: newCfg } as any,
+          }).catch((e: any) => {
+            this.logger.warn(`MoiZvonki kursor saqlanmadi [${tenant.id}]: ${e.message}`);
           });
-          if (result?.mode === 'created') total++;
         }
       } catch (e: any) {
         this.logger.warn(`MoiZvonki sinxronizatsiya xatosi [${tenant.id}]: ${e.message}`);
@@ -948,7 +968,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
 
   /**
    * Bitta MoiZvonki hodisasini (webhook orqali kelgan yoki
-   * `calls.get_crm_event` orqali navbatdan olingan — ikkalasi ham
+   * `calls.list` orqali sinxronlashtirilgan — ikkalasi ham
    * bir xil unifikatsiya qilingan shaklda keladi) CRM'ga yozadi.
    *
    * Oqim:
@@ -982,7 +1002,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
 
     if (existing) {
       // Allaqachon to'liq qayta ishlangan hodisani qayta yangilamaymiz
-      // (get_crm_event xuddi shu hodisani ikkinchi marta qaytarishi mumkin)
+      // (calls.list bir xil qatorni qayta qaytarishi mumkin, masalan kursor to'liq ilgarilamasa)
       if (existing.status === 'COMPLETED' && existing.recordingUrl) {
         return { ok: true, callId: existing.id, mode: 'skipped' as const };
       }
