@@ -88,7 +88,7 @@ export class TranscriptionService {
 
       // 3) Whisper'ga yuboramiz (endi toza mp3, 16kHz mono)
       const form = new FormData();
-      const blob = new Blob([normalized.buffer], { type: 'audio/mpeg' });
+      const blob = new Blob([new Uint8Array(normalized.buffer)], { type: 'audio/mpeg' });
       form.append('file', blob, 'recording.mp3');
       form.append('model', 'whisper-1');
       form.append('language', 'uz'); // O'zbek tili
