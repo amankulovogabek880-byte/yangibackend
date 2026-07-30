@@ -45,7 +45,7 @@ async function bootstrap() {
   // hech qachon eski javobni qaytarib bermaydi, har doim yangi
   // so'rov ketadi.
   // ─────────────────────────────────────────────────────────────
-  app.set('etag', false);
+  app.getHttpAdapter().getInstance().set('etag', false);
   app.use((req: any, res: any, next: any) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
