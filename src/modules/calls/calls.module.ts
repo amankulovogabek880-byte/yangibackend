@@ -762,6 +762,75 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
     }
   }
 
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * v20 QO'SHILDI: MOIZVONKI uchun yo'qolgan yozuvlarni qayta so'rash.
+   * ═══════════════════════════════════════════════════════════════
+   * MUAMMO: `pullMoiZvonkiEvents()` kursor (`from_id`) orqali ishlaydi
+   * va har bir ko'rilgan qo'ng'iroqdan keyin kursorni ABADIY oldinga
+   * suradi — hatto o'sha lahzada `recording` hali bo'sh (audio hali
+   * telefondan serverga yuklanmagan) bo'lsa ham. Natijada bunday
+   * qo'ng'iroqning yozuvi HECH QACHON qayta so'ralmas va butunlay
+   * yo'qolar edi — garchi integratsiya 100% to'g'ri sozlangan, balans
+   * yetarli va Мои Звонки tomonida yozuv keyinroq tayyor bo'lgan
+   * taqdirda ham.
+   *
+   * YECHIM: OnlinePBX uchun ishlagan `backfillMissingRecordings()`
+   * bilan BIR XIL naqsh — har 5 daqiqada, yozuvi hali yo'q (lekin
+   * javob berilgan) so'nggi 2 soatlik qo'ng'iroqlarni topib,
+   * `MoiZvonkiProvider.getRecordingUrl()` orqali FAQAT shu bitta
+   * qo'ng'iroq uchun qayta so'raydi (sinxronizatsiya kursoriga
+   * tegmasdan).
+   */
+  @Cron('*/5 * * * *')
+  async backfillMissingMoiZvonkiRecordings() {
+    const tenants = await this.prisma.tenant.findMany({
+      where: { status: 'ACTIVE', phoneProvider: 'MOIZVONKI' as any },
+      select: { id: true, phoneConfig: true },
+    }).catch(() => [] as any[]);
+
+    for (const t of tenants) {
+      const cfg: any = ((t as any).phoneConfig || {}).moizvonki;
+      if (!cfg?.subdomain || !cfg?.apiKey || !cfg?.adminEmail) continue;
+
+      try {
+        const provider: any = await this.providerFactory.getProvider(t.id);
+        if (!provider || typeof provider.getRecordingUrl !== 'function') continue;
+
+        const since = new Date(Date.now() - 2 * 3600 * 1000);
+        const candidates = await this.prisma.call.findMany({
+          where: {
+            tenantId: t.id,
+            recordingUrl: null,
+            duration: { gt: 0 },
+            providerCallId: { not: null },
+            createdAt: { gte: since },
+            status: 'COMPLETED',
+          },
+          select: { id: true, providerCallId: true },
+          take: 50,
+        });
+
+        for (const c of candidates) {
+          try {
+            const url = await provider.getRecordingUrl(c.providerCallId);
+            const safe = url ? sanitizeMediaUrl(url) : null;
+            if (safe) {
+              await this.prisma.call.update({
+                where: { id: c.id },
+                data: { recordingUrl: safe },
+              });
+            }
+          } catch {
+            // Bitta yozuv topilmasa ham davom etamiz
+          }
+        }
+      } catch (e: any) {
+        this.logger.warn(`MoiZvonki audio backfill xato [${t.id}]: ${e?.message}`);
+      }
+    }
+  }
+
   /** Bitta tenant uchun tarixdan kiruvchi qo'ng'iroqlarni oladi */
   async pullInboundForTenant(tenantId: string) {
     const provider: any = await this.providerFactory.getProvider(tenantId);
