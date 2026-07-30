@@ -393,6 +393,7 @@ model Tenant {
   pipelines     Pipeline[]
   tasks         Task[]
   documents     Document[]
+  dailyBriefings DailyBriefing[]
   automations   Automation[]
   autoReplyRules AutoReplyRule[] @relation("AutoReplyRules")
   leadForms      LeadForm[]      @relation("LeadForms")
@@ -476,6 +477,7 @@ model User {
   tasks           Task[]            @relation("TaskAssignee")
   createdTasks    Task[]            @relation("TaskCreator")
   auditLogs       AuditLog[]
+  dailyBriefings  DailyBriefing[]
   documents       Document[]        @relation("DocumentUploader")
   templates       MessageTemplate[]
   kpis            Kpi[]             @relation("KpiAssignee")
@@ -1204,6 +1206,31 @@ model FollowUp {
   @@index([tenantId, agentId, done])
   @@index([dueAt, done, notifiedAt])
   @@map("followups")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// v19: "BUGUNGI USTUVORLIK" — AI kunlik brifing
+// Qo'ng'iroq tahlili + chat (Conversation) + Eslatma (FollowUp) +
+// Vazifa (Task) ma'lumotlarini birlashtirib, har bir agentga (va
+// adminga — jamoa bo'yicha) kuniga BIR MARTA (keshlangan) shaxsiy,
+// harakatga undovchi ustuvorlik ro'yxatini beradi.
+// ═══════════════════════════════════════════════════════════════
+model DailyBriefing {
+  id          String    @id @default(cuid())
+  tenantId    String
+  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // agentId = null → tenant darajasidagi (admin/manager uchun jamoaviy) brifing
+  agentId     String?
+  agent       User?     @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  // "2026-07-30" formatida — bir kunda bitta agentga bitta brifing (kesh)
+  date        String
+  data        Json      // { items: [...], weakSpot: {...}, teamStats?: {...} }
+  generatedAt DateTime  @default(now())
+  createdAt   DateTime  @default(now())
+
+  @@unique([tenantId, agentId, date])
+  @@index([tenantId, date])
+  @@map("daily_briefings")
 }
 
 // ═══════════════════════════════════════════════════════════════
