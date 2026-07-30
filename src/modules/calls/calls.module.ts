@@ -899,10 +899,26 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
     for (const tenant of tenants) {
       try {
         const cfg: any = ((tenant as any).phoneConfig || {}).moizvonki || {};
-        if (!cfg.subdomain || !cfg.apiKey || !cfg.adminEmail) continue;
+        // v18 FIX: ilgari bu yerda hech qanday log qoldirmasdan "continue"
+        // qilinardi — shuning uchun sozlama to'liq bo'lmasa, tashqaridan
+        // "hech narsa ishlamayapti" degan taassurot qoldirib, sababini
+        // topib bo'lmasdi. Endi ANIQ ogohlantirish yoziladi.
+        const missing: string[] = [];
+        if (!cfg.subdomain) missing.push('subdomain');
+        if (!cfg.apiKey) missing.push('apiKey');
+        if (!cfg.adminEmail) missing.push('adminEmail');
+        if (missing.length) {
+          this.logger.warn(`MoiZvonki sozlanmagan [tenant ${tenant.id}] — yetishmayotgan maydon(lar): ${missing.join(', ')}. Sozlamalar > Telefoniya sahifasida to'ldiring.`);
+          continue;
+        }
 
         const provider = new MoiZvonkiProvider(cfg);
         const rawEvents = await provider.fetchCrmEvents(50);
+
+        // v18: hodisa umuman kelmasa ham buni bilib turish uchun log
+        if (!rawEvents.length) {
+          this.logger.log(`MoiZvonki [tenant ${tenant.id}]: yangi hodisa yo'q (get_crm_event bo'sh qaytdi)`);
+        }
 
         // 🔍 VAQTINCHA DEBUG: har sinxronizatsiyada BIRINCHI xom hodisani
         // to'liq logga yozadi — agar yozuv/davomiylik maydonlari to'g'ri
