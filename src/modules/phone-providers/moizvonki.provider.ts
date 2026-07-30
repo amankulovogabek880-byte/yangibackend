@@ -373,21 +373,11 @@ export class MoiZvonkiProvider implements IPhoneProvider {
     const dirRaw = String(e.direction || e.call_direction || e.type || '').toLowerCase();
     const direction = dirRaw.includes('in') ? 'INBOUND' : dirRaw.includes('out') ? 'OUTBOUND' : undefined;
 
-    const recordingUrl =
-      e.recording_url || e.recording || e.record_url || e.audio_url ||
-      // ⚠️ Yuqoridagi 4 ta nom hech biri mos kelmasa — butun hodisa
-      // obyektini (ichki obyekt/massivlar ichida ham) chuqur qidirib,
-      // audio-havolaga o'xshagan QIYMATNI avtomatik topamiz. Bu
-      // moizvonki.ru javobidagi HAQIQIY maydon nomi noma'lum bo'lgani
-      // uchun qo'shilgan xavfsiz zaxira yo'l — faqat http(s) bilan
-      // boshlanadigan va audio-faylga o'xshagan qatorlarni qabul qiladi.
-      this.findRecordingUrlDeep(e) || undefined;
-
     return {
       providerCallId: String(providerCallId),
       status,
       duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration) : undefined,
-      recordingUrl,
+      recordingUrl: e.recording_url || e.recording || e.record_url || e.audio_url || undefined,
       direction,
       fromPhone: e.from || e.caller || e.caller_number || e.src || e.phone,
       toPhone: e.to || e.callee || e.called_number || e.dst,
@@ -397,36 +387,37 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   }
 
   /**
-   * Hodisa obyekti ichida (kalitning nomidan qat'iy nazar, hatto ichki
-   * obyekt/massivlar ichida ham) audio-yozuvga o'xshagan http(s) havolani
-   * qidiradi. Ikki bosqichda ishlaydi:
-   *   1) Kalit nomi "record"/"audio"/"voice"/"sound"/"file"/"link"/"media"
-   *      so'zlaridan birini o'z ichiga olsa — ustunlik beriladi.
-   *   2) Hech narsa topilmasa, qiymat .mp3/.wav/.m4a/.ogg/.aac bilan
-   *      tugagan har qanday http(s) havolaga tushib qoladi.
-   * 6 darajadan chuqur emas va aylanma havolalardan himoyalangan.
+   * 🔍 v14.6 — MUHIM TOPILMA: boshqa CRM'larning (masalan AlfaCRM)
+   * rasmiy MoiZvonki integratsiya hujjatiga ko'ra, yozuv ODATDA
+   * `calls.get_crm_event` javobi ICHIDA kelmaydi — u alohida amal
+   * orqali SO'ROV QILIB olinadi (shaxsiy kabinetda bu qo'lda "Успех"
+   * tugmasini bosishga o'xshaydi). Buning uchun moizvonki.ru'ning
+   * ROL huquqlarida ikkita alohida ruxsat bor: "Получить запись"
+   * (get-record) va "Подгрузить запись звонка" (load-record).
+   *
+   * Bu metod bir nechta ehtimoliy amal nomini SINAB ko'radi va birinchi
+   * muvaffaqiyatli javobni logga to'liq yozadi — shundan keyin aniq
+   * maydon nomini bilib, kodni yakuniy to'g'irlash mumkin bo'ladi.
    */
-  private findRecordingUrlDeep(obj: any, depth = 0, seen = new Set<any>()): string | null {
-    if (!obj || typeof obj !== 'object' || depth > 6 || seen.has(obj)) return null;
-    seen.add(obj);
-
-    const isHttpUrl = (v: any) => typeof v === 'string' && /^https?:\/\//i.test(v.trim());
-    const looksLikeAudio = (v: string) => /\.(mp3|wav|m4a|ogg|aac|amr)(\?.*)?$/i.test(v.trim());
-    const keyHintsRecording = (k: string) => /record|audio|voice|sound|zapis|file|link|media/i.test(k);
-
-    let fallback: string | null = null;
-
-    for (const [key, val] of Object.entries(obj)) {
-      if (isHttpUrl(val)) {
-        const v = (val as string).trim();
-        if (keyHintsRecording(key) || looksLikeAudio(v)) return v;
-        if (!fallback) fallback = v; // eng oxirgi imkoniyat — istalgan http havola
-      } else if (val && typeof val === 'object') {
-        const nested = this.findRecordingUrlDeep(val, depth + 1, seen);
-        if (nested) return nested;
+  async fetchRecordingUrl(providerCallId: string): Promise<string | undefined> {
+    const candidates = ['calls.get_record', 'calls.load_record', 'calls.get_call_record'];
+    for (const action of candidates) {
+      try {
+        const res = await this.request(action, { call_id: providerCallId, id: providerCallId });
+        if (!res.ok) continue;
+        const j = res.json || {};
+        const url =
+          j?.data?.recording_url || j?.data?.record_url || j?.data?.url || j?.data?.link || j?.data?.file ||
+          j?.recording_url || j?.record_url || j?.url || j?.link || j?.file;
+        this.logger.log(
+          `MoiZvonki "${action}" javobi [callId=${providerCallId}]: ${JSON.stringify(j).slice(0, 400)}`,
+        );
+        if (url) return String(url);
+      } catch (e: any) {
+        this.logger.warn(`MoiZvonki "${action}" xatosi [callId=${providerCallId}]: ${e?.message}`);
       }
     }
-    return fallback;
+    return undefined;
   }
 
   /**
