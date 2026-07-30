@@ -38,28 +38,39 @@ export class TranscriptionService {
 
   /**
    * Berilgan audio URL'ni yuklab olib, Whisper orqali matnga o'giradi.
-   * Xato bo'lsa — `null` qaytaradi (chaqiruvchi tomon jim o'tkazib
-   * yuborishi kerak, butun cron'ni to'xtatmasligi uchun).
+   * v18: avval faqat `string | null` qaytarardi — xato bo'lsa sabab
+   * FAQAT server logida qolardi, admin panelida "AI kutmoqda" abadiy
+   * osilib qolardi va HECH KIM sababini ko'ra olmasdi. Endi sabab ham
+   * qaytariladi — chaqiruvchi (`calls.module.ts`) buni `Call.aiError`ga
+   * yozadi, shunda admin/agent buni to'g'ridan-to'g'ri UI'da ko'radi.
    */
-  async transcribeFromUrl(recordingUrl: string): Promise<string | null> {
-    if (!this.apiKey) return null;
-    if (!/^https?:\/\//i.test(recordingUrl)) return null;
+  async transcribeFromUrl(recordingUrl: string): Promise<{ text: string | null; error?: string }> {
+    if (!this.apiKey) {
+      return { text: null, error: "OPENAI_API_KEY sozlanmagan (audio matnga o'girish — Whisper — uchun kerak, bu ANTHROPIC_API_KEY'dan ALOHIDA kalit)." };
+    }
+    if (!/^https?:\/\//i.test(recordingUrl)) {
+      return { text: null, error: `Yozuv havolasi noto'g'ri: ${String(recordingUrl).slice(0, 100)}` };
+    }
 
     try {
       // 1) Audio faylni yuklab olamiz
       const audioRes = await fetch(recordingUrl);
       if (!audioRes.ok) {
-        this.logger.warn(`Audio yuklab bo'lmadi (HTTP ${audioRes.status}): ${recordingUrl.slice(0, 100)}`);
-        return null;
+        const msg = `Audio yuklab bo'lmadi (HTTP ${audioRes.status}): ${recordingUrl.slice(0, 100)}`;
+        this.logger.warn(msg);
+        return { text: null, error: msg };
       }
       const contentLength = Number(audioRes.headers.get('content-length') || 0);
       // Whisper API cheklovi ~25MB — undan katta fayllarni o'tkazib yuboramiz
       if (contentLength && contentLength > 24 * 1024 * 1024) {
-        this.logger.warn(`Audio juda katta (${contentLength} bayt) — o'tkazib yuborildi`);
-        return null;
+        const msg = `Audio juda katta (${Math.round(contentLength / 1024 / 1024)}MB, limit 25MB)`;
+        this.logger.warn(msg);
+        return { text: null, error: msg };
       }
       const arrayBuf = await audioRes.arrayBuffer();
-      if (!arrayBuf || arrayBuf.byteLength < 500) return null; // bo'sh/buzuq fayl
+      if (!arrayBuf || arrayBuf.byteLength < 500) {
+        return { text: null, error: "Audio fayl bo'sh yoki buzilgan (juda kichik hajm)" };
+      }
 
       // 2) Whisper'ga yuboramiz
       const form = new FormData();
@@ -78,17 +89,23 @@ export class TranscriptionService {
 
       if (!res.ok) {
         const text = await res.text().catch(() => '');
-        this.logger.warn(`Whisper API xato (HTTP ${res.status}): ${text.slice(0, 300)}`);
-        return null;
+        const msg = `Whisper API xato (HTTP ${res.status}): ${text.slice(0, 300)}`;
+        this.logger.warn(msg);
+        return { text: null, error: msg };
       }
 
       const j: any = await res.json();
       const text = String(j?.text || '').trim();
-      if (!text || text.length < 5) return null;
-      return text;
+      if (!text || text.length < 5) {
+        // Xato emas — qo'ng'iroqda gap-so'z kam bo'lgani uchun bo'lishi mumkin,
+        // shuning uchun "error" emas, shunchaki bo'sh natija qaytaramiz.
+        return { text: null };
+      }
+      return { text };
     } catch (e: any) {
-      this.logger.warn(`Transkripsiya xatosi: ${e?.message}`);
-      return null;
+      const msg = `Transkripsiya xatosi: ${e?.message}`;
+      this.logger.warn(msg);
+      return { text: null, error: msg };
     }
   }
 }

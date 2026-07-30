@@ -1134,6 +1134,12 @@ model Call {
   aiNextAction Json?                    // { title, note, daysUntilDue, followUpId? }
   aiFeedback   Json?                    // { score, strengths: [], improvements: [] }
   aiAnalyzedAt DateTime?
+  // v18: avval xato bo'lsa faqat server logida qolardi — admin panelida
+  // "AI kutmoqda" abadiy osilib qolgan ko'rinardi, sababi ko'rinmasdi.
+  // Endi aniq sabab shu yerga yoziladi va UI'da to'g'ridan-to'g'ri ko'rsatiladi
+  // (masalan "OPENAI_API_KEY sozlanmagan" yoki Whisper/Claude xato matni).
+  aiError      String?       @db.Text
+  aiErrorAt    DateTime?
 
   @@index([tenantId, createdAt])
   @@index([clientId])

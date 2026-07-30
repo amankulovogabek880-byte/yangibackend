@@ -352,11 +352,20 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
   // (chat) endpointi umuman mavjud emas.
   @Cron('*/4 * * * *')
   async autoTranscribeAndAnalyze() {
-    if (!this.transcription.isConfigured() || !this.anthropicKey) return;
+    // v18 TUZATISH: avval bu yerda konfiguratsiya yo'q bo'lsa jimgina
+    // `return` qilinardi — hech qanday izsiz, admin panelida qo'ng'iroqlar
+    // "AI kutmoqda" holatida ABADIY osilib qolardi, sababini HECH KIM
+    // ko'ra olmasdi (faqat server logiga kirish huquqi bo'lganlar bilardi).
+    // Endi: konfiguratsiya yo'q bo'lsa ham, navbatdagi qo'ng'iroqlarga
+    // ANIQ sabab yoziladi (`Call.aiError`) — bu UI'da ko'rinadi.
+    const missingConfig: string[] = [];
+    if (!this.transcription.isConfigured()) missingConfig.push("OPENAI_API_KEY (Whisper — audio matnga o'girish uchun)");
+    if (!this.anthropicKey) missingConfig.push('ANTHROPIC_API_KEY (Claude — tahlil uchun)');
 
-    // Faqat oxirgi 48 soatda tugagan, yozuvi bor, hali matni yo'q va
-    // hali tahlil qilinmagan, real suhbat bo'lgan (15 soniyadan uzun)
-    // qo'ng'iroqlarni olamiz — eskilarini abadiy qayta urinmaslik uchun.
+    // Faqat oxirgi 48 soatda tugagan, yozuvi bor, hali matni yo'q, hali
+    // tahlil qilinmagan VA hali xato bilan to'xtamagan (aiError: null),
+    // real suhbat bo'lgan (15 soniyadan uzun) qo'ng'iroqlarni olamiz —
+    // eskilarini/doimiy xato beradiganlarini abadiy qayta urinmaslik uchun.
     const since = new Date(Date.now() - 48 * 3600 * 1000);
     const candidates = await this.prisma.call.findMany({
       where: {
@@ -364,6 +373,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         recordingUrl: { not: null },
         transcript: null,
         aiAnalyzedAt: null,
+        aiError: null,
         duration: { gte: 15 },
         createdAt: { gte: since },
       },
@@ -371,24 +381,86 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       take: 15,
     }).catch(() => [] as any[]);
 
-    for (const c of candidates) {
-      try {
-        const text = await this.transcription.transcribeFromUrl(c.recordingUrl!);
-        if (!text) continue;
+    if (!candidates.length) return;
 
-        await this.prisma.call.update({
-          where: { id: c.id },
-          data: { transcript: text },
-        });
-
-        // Matn tayyor bo'lgach — darhol Claude tahlilini ham ishga tushiramiz
-        await this.analyzeCall(c.tenantId, '', c.id).catch((e: any) => {
-          this.logger.warn(`Avtomatik tahlil xato [${c.id}]: ${e?.message}`);
-        });
-      } catch (e: any) {
-        this.logger.warn(`Avtomatik transkripsiya xato [${c.id}]: ${e?.message}`);
-      }
+    if (missingConfig.length) {
+      const msg = `AI tahlil ishlamayapti — serverda quyidagi sozlama(lar) yo'q: ${missingConfig.join(', ')}. Sozlab, so'ng "Qayta urinish" tugmasini bosing.`;
+      await this.prisma.call.updateMany({
+        where: { id: { in: candidates.map((c: any) => c.id) } },
+        data: { aiError: msg, aiErrorAt: new Date() } as any,
+      }).catch((e: any) => this.logger.warn(`aiError yozilmadi: ${e.message}`));
+      this.logger.warn(msg);
+      return;
     }
+
+    for (const c of candidates) {
+      await this.processAiPipelineForCall(c.id, c.tenantId, c.recordingUrl!);
+    }
+  }
+
+  /**
+   * Bitta qo'ng'iroq uchun: transkripsiya (Whisper) → Claude tahlili.
+   * Har ikkala bosqichda ham xato bo'lsa, ANIQ sababi `Call.aiError`ga
+   * yoziladi (server logi emas) — shuning uchun admin/agent buni to'g'ridan
+   * -to'g'ri UI'da ko'radi. Muvaffaqiyatli tahlildan so'ng `aiError`
+   * tozalanadi. Ham avtomatik cron, ham qo'lda "Qayta urinish" tugmasi
+   * (`retryAi`) shu metoddan foydalanadi.
+   */
+  private async processAiPipelineForCall(callId: string, tenantId: string, recordingUrl: string) {
+    try {
+      const { text, error } = await this.transcription.transcribeFromUrl(recordingUrl);
+      if (!text) {
+        if (error) {
+          await this.prisma.call.update({
+            where: { id: callId },
+            data: { aiError: error, aiErrorAt: new Date() } as any,
+          }).catch(() => {});
+        }
+        return;
+      }
+
+      await this.prisma.call.update({
+        where: { id: callId },
+        data: { transcript: text, aiError: null, aiErrorAt: null } as any,
+      });
+
+      // Matn tayyor bo'lgach — darhol Claude tahlilini ham ishga tushiramiz
+      await this.analyzeCall(tenantId, '', callId).catch(async (e: any) => {
+        this.logger.warn(`Avtomatik tahlil xato [${callId}]: ${e?.message}`);
+        await this.prisma.call.update({
+          where: { id: callId },
+          data: { aiError: String(e?.message || "AI tahlilida noma'lum xato").slice(0, 1000), aiErrorAt: new Date() } as any,
+        }).catch(() => {});
+      });
+    } catch (e: any) {
+      this.logger.warn(`Avtomatik transkripsiya xato [${callId}]: ${e?.message}`);
+      await this.prisma.call.update({
+        where: { id: callId },
+        data: { aiError: String(e?.message || "Noma'lum xato").slice(0, 1000), aiErrorAt: new Date() } as any,
+      }).catch(() => {});
+    }
+  }
+
+  /**
+   * Admin/agent "Qayta urinish" tugmasini bossa chaqiriladi — avvalgi
+   * xatoni tozalab, darhol qaytadan urinadi (4 daqiqalik cron kutmasdan).
+   */
+  async retryAi(tenantId: string, callId: string) {
+    const call = await this.prisma.call.findFirst({ where: { id: callId, tenantId } });
+    if (!call) throw new NotFoundException("Qo'ng'iroq topilmadi");
+    if (!call.recordingUrl) throw new BadRequestException("Bu qo'ng'iroqda audio yozuv yo'q");
+
+    await this.prisma.call.update({
+      where: { id: callId },
+      data: { aiError: null, aiErrorAt: null } as any,
+    });
+
+    if (call.transcript?.trim()) {
+      // Matn allaqachon bor — to'g'ridan-to'g'ri tahlilni qayta ishga tushiramiz
+      return this.analyzeCall(tenantId, '', callId);
+    }
+    await this.processAiPipelineForCall(callId, tenantId, call.recordingUrl);
+    return this.prisma.call.findFirst({ where: { id: callId, tenantId } });
   }
 
   async initiate(tenantId: string, userId: string, data: {
@@ -1288,6 +1360,16 @@ export class CallsController {
   @UseGuards(JwtAuthGuard)
   analyze(@Param('id') id: string, @CurrentUser() u: any) {
     return this.svc.analyzeCall(u.tenantId, u.sub, id);
+  }
+
+  @ApiOperation({
+    summary: "AI tahlilni qayta urinish",
+    description: "Avvalgi xatoni (aiError) tozalab, transkripsiya/tahlilni darhol qayta ishga tushiradi (4 daqiqalik cron kutmasdan). Sozlama (masalan OPENAI_API_KEY) tuzatilgandan keyin ishlatiladi.",
+  })
+  @Post(':id/retry-ai')
+  @UseGuards(JwtAuthGuard)
+  retryAi(@Param('id') id: string, @CurrentUser() u: any) {
+    return this.svc.retryAi(u.tenantId, id);
   }
 
   @ApiOperation({ summary: "Eng ko'p uchragan e'tirozlar statistikasi" })
