@@ -341,7 +341,19 @@ export class MoiZvonkiProvider implements IPhoneProvider {
     const j = res.json;
     // Javob shakli turlicha bo'lishi mumkin — eng ehtimoliy variantlar tekshiriladi
     const events = j?.data?.events || j?.events || j?.data || j?.result;
-    return Array.isArray(events) ? events : [];
+    const parsed = Array.isArray(events) ? events : [];
+
+    // v18 FIX: ilgari xom javob FAQAT hodisa topilganda logga yozilardi —
+    // agar bizning ehtimoliy kalit nomlarimiz (`data.events`/`events`/`data`/
+    // `result`) noto'g'ri bo'lsa, parsed HAR DOIM bo'sh chiqib, xom javobni
+    // ko'rish IMKONSIZ bo'lib qolardi (o'zaro bog'liq muammo). Endi — parsed
+    // bo'sh chiqsa ham, xom javobning o'zi HAR DOIM logga yoziladi, shunda
+    // haqiqiy kalit nomini ko'rib, yuqoridagi qatorni tuzatish mumkin.
+    if (!parsed.length) {
+      this.logger.log(`get_crm_event XOM javob (hodisa topilmadi, tekshirish uchun): ${JSON.stringify(j).slice(0, 800)}`);
+    }
+
+    return parsed;
   }
 
   /**
@@ -384,40 +396,6 @@ export class MoiZvonkiProvider implements IPhoneProvider {
       employeeEmail: e.employee || e.employee_email || e.user || e.user_name,
       raw: e,
     };
-  }
-
-  /**
-   * 🔍 v14.6 — MUHIM TOPILMA: boshqa CRM'larning (masalan AlfaCRM)
-   * rasmiy MoiZvonki integratsiya hujjatiga ko'ra, yozuv ODATDA
-   * `calls.get_crm_event` javobi ICHIDA kelmaydi — u alohida amal
-   * orqali SO'ROV QILIB olinadi (shaxsiy kabinetda bu qo'lda "Успех"
-   * tugmasini bosishga o'xshaydi). Buning uchun moizvonki.ru'ning
-   * ROL huquqlarida ikkita alohida ruxsat bor: "Получить запись"
-   * (get-record) va "Подгрузить запись звонка" (load-record).
-   *
-   * Bu metod bir nechta ehtimoliy amal nomini SINAB ko'radi va birinchi
-   * muvaffaqiyatli javobni logga to'liq yozadi — shundan keyin aniq
-   * maydon nomini bilib, kodni yakuniy to'g'irlash mumkin bo'ladi.
-   */
-  async fetchRecordingUrl(providerCallId: string): Promise<string | undefined> {
-    const candidates = ['calls.get_record', 'calls.load_record', 'calls.get_call_record'];
-    for (const action of candidates) {
-      try {
-        const res = await this.request(action, { call_id: providerCallId, id: providerCallId });
-        if (!res.ok) continue;
-        const j = res.json || {};
-        const url =
-          j?.data?.recording_url || j?.data?.record_url || j?.data?.url || j?.data?.link || j?.data?.file ||
-          j?.recording_url || j?.record_url || j?.url || j?.link || j?.file;
-        this.logger.log(
-          `MoiZvonki "${action}" javobi [callId=${providerCallId}]: ${JSON.stringify(j).slice(0, 400)}`,
-        );
-        if (url) return String(url);
-      } catch (e: any) {
-        this.logger.warn(`MoiZvonki "${action}" xatosi [callId=${providerCallId}]: ${e?.message}`);
-      }
-    }
-    return undefined;
   }
 
   /**
