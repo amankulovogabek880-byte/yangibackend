@@ -1,5 +1,4 @@
 import { Module, Injectable, Logger } from '@nestjs/common';
-import { normalizeAudioForWhisper } from '../../common/utils/voice-convert';
 
 /**
  * ═══════════════════════════════════════════════════════════════
@@ -45,7 +44,7 @@ export class TranscriptionService {
    * qaytariladi — chaqiruvchi (`calls.module.ts`) buni `Call.aiError`ga
    * yozadi, shunda admin/agent buni to'g'ridan-to'g'ri UI'da ko'radi.
    */
-  async transcribeFromUrl(recordingUrl: string): Promise<{ text: string | null; error?: string; transient?: boolean }> {
+  async transcribeFromUrl(recordingUrl: string): Promise<{ text: string | null; error?: string }> {
     if (!this.apiKey) {
       return { text: null, error: "OPENAI_API_KEY sozlanmagan (audio matnga o'girish — Whisper — uchun kerak, bu ANTHROPIC_API_KEY'dan ALOHIDA kalit)." };
     }
@@ -59,8 +58,7 @@ export class TranscriptionService {
       if (!audioRes.ok) {
         const msg = `Audio yuklab bo'lmadi (HTTP ${audioRes.status}): ${recordingUrl.slice(0, 100)}`;
         this.logger.warn(msg);
-        // PBX tomonidan vaqtinchalik bo'lishi mumkin (yozuv hali tayyorlanmoqda)
-        return { text: null, error: msg, transient: true };
+        return { text: null, error: msg };
       }
       const contentLength = Number(audioRes.headers.get('content-length') || 0);
       // Whisper API cheklovi ~25MB — undan katta fayllarni o'tkazib yuboramiz
@@ -71,24 +69,13 @@ export class TranscriptionService {
       }
       const arrayBuf = await audioRes.arrayBuffer();
       if (!arrayBuf || arrayBuf.byteLength < 500) {
-        return { text: null, error: "Audio fayl bo'sh yoki buzilgan (juda kichik hajm)", transient: true };
+        return { text: null, error: "Audio fayl bo'sh yoki buzilgan (juda kichik hajm)" };
       }
 
-      // 2) v19: Whisper'ga yuborishdan OLDIN ffmpeg orqali "tozalab" qayta
-      // kodlaymiz — PBX'dan kelgan audio ko'pincha nostandart/streaming
-      // sarlavhali bo'ladi va Whisper buni to'g'ridan-to'g'ri qabul qilsa
-      // "duration":0 xatosi berishi mumkin (garchi brauzerda ijro etilsa ham).
-      const normalized = await normalizeAudioForWhisper(Buffer.from(arrayBuf));
-      if ('error' in normalized) {
-        const msg = `Audio tozalashda xato: ${normalized.error}`;
-        this.logger.warn(msg);
-        // Bo'sh/hali tayyor bo'lmagan yozuv — vaqtinchalik, avtomatik qayta sinaladi
-        return { text: null, error: msg, transient: true };
-      }
-
-      // 3) Whisper'ga yuboramiz (endi toza mp3, 16kHz mono)
+      // 2) Whisper'ga yuboramiz
       const form = new FormData();
-      const blob = new Blob([new Uint8Array(normalized.buffer)], { type: 'audio/mpeg' });
+      const contentType = audioRes.headers.get('content-type') || 'audio/mpeg';
+      const blob = new Blob([arrayBuf], { type: contentType });
       form.append('file', blob, 'recording.mp3');
       form.append('model', 'whisper-1');
       form.append('language', 'uz'); // O'zbek tili
@@ -104,8 +91,7 @@ export class TranscriptionService {
         const text = await res.text().catch(() => '');
         const msg = `Whisper API xato (HTTP ${res.status}): ${text.slice(0, 300)}`;
         this.logger.warn(msg);
-        // 5xx / 429 — vaqtinchalik server yuklamasi, qayta urinsa bo'ladi
-        return { text: null, error: msg, transient: res.status >= 500 || res.status === 429 };
+        return { text: null, error: msg };
       }
 
       const j: any = await res.json();
@@ -119,7 +105,7 @@ export class TranscriptionService {
     } catch (e: any) {
       const msg = `Transkripsiya xatosi: ${e?.message}`;
       this.logger.warn(msg);
-      return { text: null, error: msg, transient: true };
+      return { text: null, error: msg };
     }
   }
 }

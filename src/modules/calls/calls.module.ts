@@ -171,8 +171,7 @@ ${categoriesList}
 3. Har bir e'tiroz uchun mijozning aslidagi gapiga yaqin qisqa "quote" ber (matndan, 15 so'zdan oshmasin).
 4. Keyingi qadam (nextAction) — aniq, bajarish mumkin bo'lgan harakat bo'lsin (masalan "3 kundan keyin narx bo'yicha qayta bog'laning va 5% chegirma taklif qiling"), daysUntilDue — necha kundan keyin bajarilishi kerakligi (1-14 oralig'ida butun son).
 5. Agent feedback — agentning gaplashish sifatini xolisona baholaysan (1-10 ball): savol berish, tinglash, e'tirozga javob berish, yakunlash ko'nikmalari. Kuchli va yaxshilash kerak bo'lgan tomonlarni QISQA (har biri 1 jumla) ko'rsat. Haqoratli emas, konstruktiv bo'l.
-6. Sotuvga yaqinlik (saleReadiness) — mijoz sotib olishga qanchalik yaqinligini 1-10 ballda baholaysan (1 = umuman qiziqmadi, 10 = deyarli rozi bo'ldi/to'lovga tayyor). missedInfo — agent aytishi kerak bo'lib, aytmay qoldirgan MUHIM ma'lumot bo'lsa qisqa yoz (masalan narx, sana, hujjatlar), bo'lmasa bo'sh qoldir. whatWouldClose — mijozni aynan nima ishontirib, sotuvni yakunlagan bo'lardi (1 qisqa, aniq jumla, masalan "5% chegirma va bepul transfer taklif qilinsa rozi bo'lardi").
-7. Agar suhbat juda qisqa yoki mazmunsiz bo'lsa (masalan javob bermadi), buni halol yoz — o'ylab topma.
+6. Agar suhbat juda qisqa yoki mazmunsiz bo'lsa (masalan javob bermadi), buni halol yoz — o'ylab topma.
 
 Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki markdown belgisi qo'shma:
 {
@@ -180,8 +179,7 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
   "sentiment": "positive" | "neutral" | "negative",
   "objections": [{"category": "price", "label": "Narx qimmat", "quote": "..."}],
   "nextAction": {"title": "...", "note": "...", "daysUntilDue": 3},
-  "feedback": {"score": 8, "strengths": ["..."], "improvements": ["..."]},
-  "saleReadiness": {"score": 6, "missedInfo": "...", "whatWouldClose": "..."}
+  "feedback": {"score": 8, "strengths": ["..."], "improvements": ["..."]}
 }`;
 
     const prompt = `Mijoz: ${call.client?.fullName || 'Notanish mijoz'}
@@ -253,12 +251,6 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         improvements: Array.isArray(parsed.feedback.improvements) ? parsed.feedback.improvements.slice(0, 5) : [],
       } : null;
 
-      const saleReadiness = parsed.saleReadiness ? {
-        score: Math.min(Math.max(Number(parsed.saleReadiness.score) || 5, 1), 10),
-        missedInfo: String(parsed.saleReadiness.missedInfo || '').slice(0, 300),
-        whatWouldClose: String(parsed.saleReadiness.whatWouldClose || '').slice(0, 300),
-      } : null;
-
       const sentiment = ['positive', 'neutral', 'negative'].includes(parsed.sentiment)
         ? parsed.sentiment : 'neutral';
 
@@ -288,7 +280,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
           aiSentiment: sentiment,
           aiObjections: objections,
           aiNextAction: nextAction ? { ...nextAction, followUpId } : null,
-          aiFeedback: feedback ? { ...feedback, saleReadiness } : (saleReadiness ? { saleReadiness } : null),
+          aiFeedback: feedback,
           aiAnalyzedAt: new Date(),
         } as any,
       });
@@ -375,7 +367,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
     // real suhbat bo'lgan (15 soniyadan uzun) qo'ng'iroqlarni olamiz —
     // eskilarini/doimiy xato beradiganlarini abadiy qayta urinmaslik uchun.
     const since = new Date(Date.now() - 48 * 3600 * 1000);
-    const freshCandidates = await this.prisma.call.findMany({
+    const candidates = await this.prisma.call.findMany({
       where: {
         status: 'COMPLETED',
         recordingUrl: { not: null },
@@ -389,29 +381,6 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       take: 15,
     }).catch(() => [] as any[]);
 
-    // v19: VAQTINCHALIK xatolar (masalan "yozuv hali PBX'da tayyor emas",
-    // 0 soniyalik audio, tarmoq xatosi) uchun avtomatik qayta urinamiz —
-    // 10 daqiqa o'tgach, 3 martagacha. Sozlama xatolari (API_KEY yo'q)
-    // qayta urinilmaydi — admin sozlashi kerak.
-    const retryWindow = new Date(Date.now() - 10 * 60 * 1000);
-    const retryCandidates = await this.prisma.call.findMany({
-      where: {
-        status: 'COMPLETED',
-        recordingUrl: { not: null },
-        transcript: null,
-        aiAnalyzedAt: null,
-        aiError: { not: null },
-        NOT: { aiError: { contains: 'API_KEY' } },
-        aiRetryCount: { lt: 3 },
-        aiErrorAt: { lte: retryWindow },
-        duration: { gte: 15 },
-        createdAt: { gte: since },
-      } as any,
-      select: { id: true, tenantId: true, recordingUrl: true },
-      take: 10,
-    }).catch(() => [] as any[]);
-
-    const candidates = [...freshCandidates, ...retryCandidates];
     if (!candidates.length) return;
 
     if (missingConfig.length) {
@@ -439,18 +408,12 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
    */
   private async processAiPipelineForCall(callId: string, tenantId: string, recordingUrl: string) {
     try {
-      const { text, error, transient } = await this.transcription.transcribeFromUrl(recordingUrl);
+      const { text, error } = await this.transcription.transcribeFromUrl(recordingUrl);
       if (!text) {
         if (error) {
           await this.prisma.call.update({
             where: { id: callId },
-            data: {
-              aiError: error,
-              aiErrorAt: new Date(),
-              // Faqat vaqtinchalik xatolarda hisoblagichni oshiramiz — 3 martadan
-              // keyin cron avtomatik qayta urinishni to'xtatadi (query filtri orqali)
-              ...(transient ? { aiRetryCount: { increment: 1 } } : {}),
-            } as any,
+            data: { aiError: error, aiErrorAt: new Date() } as any,
           }).catch(() => {});
         }
         return;
@@ -458,7 +421,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
 
       await this.prisma.call.update({
         where: { id: callId },
-        data: { transcript: text, aiError: null, aiErrorAt: null, aiRetryCount: 0 } as any,
+        data: { transcript: text, aiError: null, aiErrorAt: null } as any,
       });
 
       // Matn tayyor bo'lgach — darhol Claude tahlilini ham ishga tushiramiz
@@ -466,14 +429,14 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         this.logger.warn(`Avtomatik tahlil xato [${callId}]: ${e?.message}`);
         await this.prisma.call.update({
           where: { id: callId },
-          data: { aiError: String(e?.message || "AI tahlilida noma'lum xato").slice(0, 1000), aiErrorAt: new Date(), aiRetryCount: { increment: 1 } } as any,
+          data: { aiError: String(e?.message || "AI tahlilida noma'lum xato").slice(0, 1000), aiErrorAt: new Date() } as any,
         }).catch(() => {});
       });
     } catch (e: any) {
       this.logger.warn(`Avtomatik transkripsiya xato [${callId}]: ${e?.message}`);
       await this.prisma.call.update({
         where: { id: callId },
-        data: { aiError: String(e?.message || "Noma'lum xato").slice(0, 1000), aiErrorAt: new Date(), aiRetryCount: { increment: 1 } } as any,
+        data: { aiError: String(e?.message || "Noma'lum xato").slice(0, 1000), aiErrorAt: new Date() } as any,
       }).catch(() => {});
     }
   }
@@ -489,7 +452,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
 
     await this.prisma.call.update({
       where: { id: callId },
-      data: { aiError: null, aiErrorAt: null, aiRetryCount: 0 } as any,
+      data: { aiError: null, aiErrorAt: null } as any,
     });
 
     if (call.transcript?.trim()) {
@@ -758,75 +721,6 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         }
       } catch (e: any) {
         this.logger.warn(`Audio backfill xato [${t.id}]: ${e?.message}`);
-      }
-    }
-  }
-
-  /**
-   * ═══════════════════════════════════════════════════════════════
-   * v20 QO'SHILDI: MOIZVONKI uchun yo'qolgan yozuvlarni qayta so'rash.
-   * ═══════════════════════════════════════════════════════════════
-   * MUAMMO: `pullMoiZvonkiEvents()` kursor (`from_id`) orqali ishlaydi
-   * va har bir ko'rilgan qo'ng'iroqdan keyin kursorni ABADIY oldinga
-   * suradi — hatto o'sha lahzada `recording` hali bo'sh (audio hali
-   * telefondan serverga yuklanmagan) bo'lsa ham. Natijada bunday
-   * qo'ng'iroqning yozuvi HECH QACHON qayta so'ralmas va butunlay
-   * yo'qolar edi — garchi integratsiya 100% to'g'ri sozlangan, balans
-   * yetarli va Мои Звонки tomonida yozuv keyinroq tayyor bo'lgan
-   * taqdirda ham.
-   *
-   * YECHIM: OnlinePBX uchun ishlagan `backfillMissingRecordings()`
-   * bilan BIR XIL naqsh — har 5 daqiqada, yozuvi hali yo'q (lekin
-   * javob berilgan) so'nggi 2 soatlik qo'ng'iroqlarni topib,
-   * `MoiZvonkiProvider.getRecordingUrl()` orqali FAQAT shu bitta
-   * qo'ng'iroq uchun qayta so'raydi (sinxronizatsiya kursoriga
-   * tegmasdan).
-   */
-  @Cron('*/5 * * * *')
-  async backfillMissingMoiZvonkiRecordings() {
-    const tenants = await this.prisma.tenant.findMany({
-      where: { status: 'ACTIVE', phoneProvider: 'MOIZVONKI' as any },
-      select: { id: true, phoneConfig: true },
-    }).catch(() => [] as any[]);
-
-    for (const t of tenants) {
-      const cfg: any = ((t as any).phoneConfig || {}).moizvonki;
-      if (!cfg?.subdomain || !cfg?.apiKey || !cfg?.adminEmail) continue;
-
-      try {
-        const provider: any = await this.providerFactory.getProvider(t.id);
-        if (!provider || typeof provider.getRecordingUrl !== 'function') continue;
-
-        const since = new Date(Date.now() - 2 * 3600 * 1000);
-        const candidates = await this.prisma.call.findMany({
-          where: {
-            tenantId: t.id,
-            recordingUrl: null,
-            duration: { gt: 0 },
-            providerCallId: { not: null },
-            createdAt: { gte: since },
-            status: 'COMPLETED',
-          },
-          select: { id: true, providerCallId: true },
-          take: 50,
-        });
-
-        for (const c of candidates) {
-          try {
-            const url = await provider.getRecordingUrl(c.providerCallId);
-            const safe = url ? sanitizeMediaUrl(url) : null;
-            if (safe) {
-              await this.prisma.call.update({
-                where: { id: c.id },
-                data: { recordingUrl: safe },
-              });
-            }
-          } catch {
-            // Bitta yozuv topilmasa ham davom etamiz
-          }
-        }
-      } catch (e: any) {
-        this.logger.warn(`MoiZvonki audio backfill xato [${t.id}]: ${e?.message}`);
       }
     }
   }

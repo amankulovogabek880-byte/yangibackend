@@ -373,38 +373,6 @@ export class MoiZvonkiProvider implements IPhoneProvider {
   }
 
   /**
-   * ═══════════════════════════════════════════════════════════════
-   * v20 QO'SHILDI: bitta qo'ng'iroq uchun YOZUVNI QAYTA SO'RASH.
-   * ═══════════════════════════════════════════════════════════════
-   * NEGA KERAK: Мои Звонки'da audio fayl qo'ng'iroq tugagach agent
-   * TELEFONIDAN serverga ANIQ SHU PAYT emas, biroz KECHROQ yuklanadi
-   * (internet tezligiga bog'liq). `pullMoiZvonkiEvents()` esa har bir
-   * ko'rilgan `db_call_id`dan kursorni ABADIY oldinga suradi — agar
-   * o'sha lahzada `recording` hali bo'sh bo'lsa, bu qo'ng'iroq
-   * `calls.list` orqali IKKINCHI MARTA HECH QACHON so'ralmas edi va
-   * yozuv butunlay yo'qolardi. `getRecordingUrl()` — xuddi shu
-   * `calls.list`ni, lekin FAQAT bitta aniq `db_call_id` uchun (uni
-   * `from_id` sifatida berib) qayta so'raydi — kursorga ta'sir
-   * qilmaydi. `calls.module.ts`dagi `backfillMissingMoiZvonkiRecordings`
-   * shu metodni har 5 daqiqada, yozuvi hali yo'q qo'ng'iroqlar uchun
-   * chaqiradi (xuddi OnlinePBX uchun ishlagani kabi).
-   */
-  async getRecordingUrl(providerCallId: string): Promise<string | null> {
-    const dbCallId = Number(providerCallId);
-    if (!Number.isFinite(dbCallId) || dbCallId <= 0) return null;
-    try {
-      const { results } = await this.fetchRecentCalls(dbCallId, 1, 0);
-      const row = results.find((r: any) => Number(r.db_call_id) === dbCallId) || results[0];
-      if (!row) return null;
-      const recording = typeof row.recording === 'string' ? row.recording.trim() : '';
-      return recording || null;
-    } catch (e: any) {
-      this.logger.warn(`getRecordingUrl xatosi [${providerCallId}]: ${e?.message}`);
-      return null;
-    }
-  }
-
-  /**
    * Bitta `calls.list` qatorini bizning umumiy `WebhookEvent` shakliga
    * o'giradi. Maydon nomlari 100% rasmiy hujjatga mos (taxmin YO'Q).
    */
