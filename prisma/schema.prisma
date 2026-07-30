@@ -1140,6 +1140,10 @@ model Call {
   // (masalan "OPENAI_API_KEY sozlanmagan" yoki Whisper/Claude xato matni).
   aiError      String?       @db.Text
   aiErrorAt    DateTime?
+  // v19: vaqtinchalik xatolar (masalan "yozuv hali tayyor emas") uchun
+  // avtomatik qayta urinishlar hisoblagichi — 3 martadan keyin to'xtaydi
+  // (abadiy qayta urinib, tizimni ortiqcha yuklamaslik uchun).
+  aiRetryCount Int           @default(0)
 
   @@index([tenantId, createdAt])
   @@index([clientId])

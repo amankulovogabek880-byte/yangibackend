@@ -367,7 +367,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
     // real suhbat bo'lgan (15 soniyadan uzun) qo'ng'iroqlarni olamiz —
     // eskilarini/doimiy xato beradiganlarini abadiy qayta urinmaslik uchun.
     const since = new Date(Date.now() - 48 * 3600 * 1000);
-    const candidates = await this.prisma.call.findMany({
+    const freshCandidates = await this.prisma.call.findMany({
       where: {
         status: 'COMPLETED',
         recordingUrl: { not: null },
@@ -381,6 +381,29 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       take: 15,
     }).catch(() => [] as any[]);
 
+    // v19: VAQTINCHALIK xatolar (masalan "yozuv hali PBX'da tayyor emas",
+    // 0 soniyalik audio, tarmoq xatosi) uchun avtomatik qayta urinamiz —
+    // 10 daqiqa o'tgach, 3 martagacha. Sozlama xatolari (API_KEY yo'q)
+    // qayta urinilmaydi — admin sozlashi kerak.
+    const retryWindow = new Date(Date.now() - 10 * 60 * 1000);
+    const retryCandidates = await this.prisma.call.findMany({
+      where: {
+        status: 'COMPLETED',
+        recordingUrl: { not: null },
+        transcript: null,
+        aiAnalyzedAt: null,
+        aiError: { not: null },
+        NOT: { aiError: { contains: 'API_KEY' } },
+        aiRetryCount: { lt: 3 },
+        aiErrorAt: { lte: retryWindow },
+        duration: { gte: 15 },
+        createdAt: { gte: since },
+      } as any,
+      select: { id: true, tenantId: true, recordingUrl: true },
+      take: 10,
+    }).catch(() => [] as any[]);
+
+    const candidates = [...freshCandidates, ...retryCandidates];
     if (!candidates.length) return;
 
     if (missingConfig.length) {
@@ -408,12 +431,18 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
    */
   private async processAiPipelineForCall(callId: string, tenantId: string, recordingUrl: string) {
     try {
-      const { text, error } = await this.transcription.transcribeFromUrl(recordingUrl);
+      const { text, error, transient } = await this.transcription.transcribeFromUrl(recordingUrl);
       if (!text) {
         if (error) {
           await this.prisma.call.update({
             where: { id: callId },
-            data: { aiError: error, aiErrorAt: new Date() } as any,
+            data: {
+              aiError: error,
+              aiErrorAt: new Date(),
+              // Faqat vaqtinchalik xatolarda hisoblagichni oshiramiz — 3 martadan
+              // keyin cron avtomatik qayta urinishni to'xtatadi (query filtri orqali)
+              ...(transient ? { aiRetryCount: { increment: 1 } } : {}),
+            } as any,
           }).catch(() => {});
         }
         return;
@@ -421,7 +450,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
 
       await this.prisma.call.update({
         where: { id: callId },
-        data: { transcript: text, aiError: null, aiErrorAt: null } as any,
+        data: { transcript: text, aiError: null, aiErrorAt: null, aiRetryCount: 0 } as any,
       });
 
       // Matn tayyor bo'lgach — darhol Claude tahlilini ham ishga tushiramiz
@@ -429,14 +458,14 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         this.logger.warn(`Avtomatik tahlil xato [${callId}]: ${e?.message}`);
         await this.prisma.call.update({
           where: { id: callId },
-          data: { aiError: String(e?.message || "AI tahlilida noma'lum xato").slice(0, 1000), aiErrorAt: new Date() } as any,
+          data: { aiError: String(e?.message || "AI tahlilida noma'lum xato").slice(0, 1000), aiErrorAt: new Date(), aiRetryCount: { increment: 1 } } as any,
         }).catch(() => {});
       });
     } catch (e: any) {
       this.logger.warn(`Avtomatik transkripsiya xato [${callId}]: ${e?.message}`);
       await this.prisma.call.update({
         where: { id: callId },
-        data: { aiError: String(e?.message || "Noma'lum xato").slice(0, 1000), aiErrorAt: new Date() } as any,
+        data: { aiError: String(e?.message || "Noma'lum xato").slice(0, 1000), aiErrorAt: new Date(), aiRetryCount: { increment: 1 } } as any,
       }).catch(() => {});
     }
   }
@@ -452,7 +481,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
 
     await this.prisma.call.update({
       where: { id: callId },
-      data: { aiError: null, aiErrorAt: null } as any,
+      data: { aiError: null, aiErrorAt: null, aiRetryCount: 0 } as any,
     });
 
     if (call.transcript?.trim()) {
