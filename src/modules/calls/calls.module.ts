@@ -123,10 +123,33 @@ export class CallsService {
    * avtomatik to'ldiradi. Matn kiritilgach, tahlil (`analyze`) darhol
    * shu asosda ishlaydi.
    */
+  /**
+   * 🔒 XAVFSIZLIK TUZATISH: agent faqat O'ZINING qo'ng'irog'iga tegishli
+   * transkript/tahlil amallarini bajara olishi kerak. Ilgari `transcript`,
+   * `analyze` va `retry-ai` endpointlari faqat `tenantId`ni tekshirardi —
+   * shu sabab bir agent boshqa agentning qo'ng'irog'i ID'sini bilib,
+   * uning matnini o'zgartirishi yoki AI tahlilini qayta ishga tushirishi
+   * mumkin edi. `TENANT_ADMIN`/`MANAGER` barcha qo'ng'iroqlarga kirishni
+   * davom ettiradi (masalan `addNote`dagi bilan bir xil qoida).
+   *
+   * `userId` bo'sh satr (`''`) bo'lsa — bu ICHKI (cron/pipeline) chaqiruv
+   * deb hisoblanadi va tekshiruv o'tkazib yuboriladi (masalan avtomatik
+   * transkripsiya+tahlil `analyzeCall`ni foydalanuvchisiz chaqiradi).
+   */
+  private async assertCallOwnership(tenantId: string, userId: string, callAgentId: string | null) {
+    if (!userId) return; // ichki (cron) chaqiruv — o'tkazib yuboriladi
+    if (callAgentId === userId) return;
+    const user = await this.prisma.user.findFirst({ where: { id: userId, tenantId } });
+    if (!user || !['TENANT_ADMIN', 'MANAGER'].includes(user.role)) {
+      throw new ForbiddenException("Bu qo'ng'iroqqa kirish huquqingiz yo'q");
+    }
+  }
+
   async setTranscript(tenantId: string, userId: string, callId: string, transcript: string) {
     if (!transcript?.trim()) throw new BadRequestException('Matn bo\'sh bo\'lishi mumkin emas');
     const call = await this.prisma.call.findFirst({ where: { id: callId, tenantId } });
     if (!call) throw new NotFoundException("Qo'ng'iroq topilmadi");
+    await this.assertCallOwnership(tenantId, userId, call.agentId);
     return this.prisma.call.update({
       where: { id: callId },
       data: { transcript: transcript.trim() },
@@ -153,6 +176,7 @@ export class CallsService {
       },
     });
     if (!call) throw new NotFoundException("Qo'ng'iroq topilmadi");
+    await this.assertCallOwnership(tenantId, userId, call.agentId);
     if (!call.transcript?.trim()) {
       throw new BadRequestException(
         "Bu qo'ng'iroqda matn (transcript) yo'q. Avval yozuvni tinglab matnini kiriting.",
@@ -510,9 +534,10 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
    * Admin/agent "Qayta urinish" tugmasini bossa chaqiriladi — avvalgi
    * xatoni tozalab, darhol qaytadan urinadi (4 daqiqalik cron kutmasdan).
    */
-  async retryAi(tenantId: string, callId: string) {
+  async retryAi(tenantId: string, userId: string, callId: string) {
     const call = await this.prisma.call.findFirst({ where: { id: callId, tenantId } });
     if (!call) throw new NotFoundException("Qo'ng'iroq topilmadi");
+    await this.assertCallOwnership(tenantId, userId, call.agentId);
     if (!call.recordingUrl) throw new BadRequestException("Bu qo'ng'iroqda audio yozuv yo'q");
 
     await this.prisma.call.update({
@@ -1606,7 +1631,7 @@ export class CallsController {
   @Post(':id/retry-ai')
   @UseGuards(JwtAuthGuard)
   retryAi(@Param('id') id: string, @CurrentUser() u: any) {
-    return this.svc.retryAi(u.tenantId, id);
+    return this.svc.retryAi(u.tenantId, u.sub, id);
   }
 
   @ApiOperation({ summary: "Eng ko'p uchragan e'tirozlar statistikasi" })
