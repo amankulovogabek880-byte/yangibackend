@@ -95,7 +95,7 @@ async function bootstrap() {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'x-refresh-token'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'x-refresh-token', 'Cache-Control', 'Pragma'],
   });
   // ─── WebSocket adapter ────────────────────────────────────
   app.useWebSocketAdapter(new IoAdapter(app));
