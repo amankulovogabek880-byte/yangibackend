@@ -174,6 +174,10 @@ ${categoriesList}
 6. Sotuvga yaqinlik (saleReadiness) — mijoz sotib olishga qanchalik yaqinligini 1-10 ballda baholaysan (1 = umuman qiziqmadi, 10 = deyarli rozi bo'ldi/to'lovga tayyor). missedInfo — agent aytishi kerak bo'lib, aytmay qoldirgan MUHIM ma'lumot bo'lsa qisqa yoz (masalan narx, sana, hujjatlar), bo'lmasa bo'sh qoldir. whatWouldClose — mijozni aynan nima ishontirib, sotuvni yakunlagan bo'lardi (1 qisqa, aniq jumla).
 7. bestPhrase — agent ayntan shu suhbatda ishlatgan ENG KUCHLI/samarali gap yoki so'z birikmasi bo'lsa, uni AYNAN o'sha holicha (quote) ko'rsat (masalan mijozni ishontirgan yoki e'tirozni yaxshi yopgan gap). Bunday gap yo'q bo'lsa — bo'sh qoldir, o'ylab topma.
 8. Agar suhbat juda qisqa yoki mazmunsiz bo'lsa (masalan javob bermadi), buni halol yoz — o'ylab topma.
+9. overallScore — suhbatning umumiy sifatini 0-100 ballda baho (agent ko'nikmasi + mijozning qiziqishi + natija birgalikda hisobga olinadi; bu feedback.score'dan mustaqil, umumiyroq ko'rsatkich).
+10. churnRisk — ushbu mijozni butunlay yo'qotish xavfini 0-100% da baho (0 = xavf yo'q, 100 = deyarli aniq ketadi) — mijozning kayfiyati, e'tirozlari va javob berish tezligiga qarab.
+11. saleProbability — mijoz YAQIN ORADA (masalan 30 kun ichida) sotib olish ehtimolini 0-100% da baho.
+12. mistakes — agent yo'l qo'ygan ENG MUHIM xatolar ro'yxati (ko'pi bilan 5 ta, kam bo'lsa kamroq, umuman bo'lmasa bo'sh massiv). Har biri: { "mistake": "agent nima xato qildi (1 qisqa jumla)", "idealResponse": "agent o'rniga aynan qanday gapirishi/javob berishi kerak edi (tayyor, ishlatsa bo'ladigan gap)" }. O'ylab topma — faqat suhbatda haqiqatan sodir bo'lgan narsalarga asoslan.
 
 Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki markdown belgisi qo'shma:
 {
@@ -183,7 +187,11 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
   "nextAction": {"title": "...", "note": "...", "daysUntilDue": 3},
   "feedback": {"score": 8, "strengths": ["..."], "improvements": ["..."]},
   "saleReadiness": {"score": 6, "missedInfo": "...", "whatWouldClose": "..."},
-  "bestPhrase": "..."
+  "bestPhrase": "...",
+  "overallScore": 72,
+  "churnRisk": 35,
+  "saleProbability": 40,
+  "mistakes": [{"mistake": "...", "idealResponse": "..."}]
 }`;
 
     const prompt = `Mijoz: ${call.client?.fullName || 'Notanish mijoz'}
@@ -261,6 +269,22 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       } : null;
       const bestPhrase = parsed.bestPhrase ? String(parsed.bestPhrase).slice(0, 300) : null;
 
+      // v21: kengaytirilgan tahlil — umumiy ball, mijozni yo'qotish xavfi,
+      // sotuv ehtimoli va agentning aniq xatolari (har biriga ideal javob bilan)
+      const clampPct = (n: any) => Math.min(Math.max(Math.round(Number(n)) || 0, 0), 100);
+      const overallScore = parsed.overallScore != null ? clampPct(parsed.overallScore) : null;
+      const churnRisk = parsed.churnRisk != null ? clampPct(parsed.churnRisk) : null;
+      const saleProbability = parsed.saleProbability != null ? clampPct(parsed.saleProbability) : null;
+      const mistakes = Array.isArray(parsed.mistakes)
+        ? parsed.mistakes
+            .filter((m: any) => m?.mistake)
+            .slice(0, 5)
+            .map((m: any) => ({
+              mistake: String(m.mistake).slice(0, 300),
+              idealResponse: String(m.idealResponse || '').slice(0, 500),
+            }))
+        : [];
+
       const sentiment = ['positive', 'neutral', 'negative'].includes(parsed.sentiment)
         ? parsed.sentiment : 'neutral';
 
@@ -290,8 +314,8 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
           aiSentiment: sentiment,
           aiObjections: objections,
           aiNextAction: nextAction ? { ...nextAction, followUpId } : null,
-          aiFeedback: (feedback || saleReadiness || bestPhrase)
-            ? { ...(feedback || {}), saleReadiness, bestPhrase }
+          aiFeedback: (feedback || saleReadiness || bestPhrase || overallScore != null || churnRisk != null || saleProbability != null || mistakes.length)
+            ? { ...(feedback || {}), saleReadiness, bestPhrase, overallScore, churnRisk, saleProbability, mistakes }
             : null,
           aiAnalyzedAt: new Date(),
         } as any,
@@ -1162,58 +1186,6 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
   }
 
   /**
-   * v21 FIX — "MoiZvonki: xodim email topilmadi" xatosining ASL SABABI:
-   *
-   * Sozlamalar > Telefoniya sahifasida admin/agent "employeeEmailMap"ni
-   * to'ldirsa ham (`TenantsService.updateMyMoiZvonkiEmail`, bazada
-   * `phoneConfig.moizvonki.employeeEmailMap = { crmEmail: moizvonkiEmail }`
-   * shaklida saqlanadi), qo'ng'iroq qayta ishlanganda bu xarita HECH QACHON
-   * o'qilmas edi — faqat `event.employeeEmail`ni to'g'ridan-to'g'ri
-   * `User.email`ga solishtirardi. Natijada MoiZvonki login (masalan
-   * "ivanov" yoki ichki hisob nomi) CRM emaildan farq qilsa, xarita
-   * to'ldirilgan bo'lsa ham moslik HECH QACHON topilmasdi.
-   *
-   * Endi: avval to'g'ridan-to'g'ri email moslikka, TOPILMASA
-   * `employeeEmailMap`ga (aksincha yo'nalishda — xarita qiymati
-   * MoiZvonki email, kaliti CRM email) qarab agentni topamiz.
-   */
-  private async resolveAgentIdByEmployeeEmail(
-    tenantId: string,
-    employeeEmail: string,
-  ): Promise<string | null> {
-    const wanted = employeeEmail.trim().toLowerCase();
-    if (!wanted) return null;
-
-    // 1) To'g'ridan-to'g'ri moslik: MoiZvonki'dan kelgan email AYNAN
-    // CRM foydalanuvchisining email'i bilan bir xil.
-    const byEmail = await this.prisma.user.findFirst({
-      where: { tenantId, email: { equals: wanted, mode: 'insensitive' } },
-      select: { id: true },
-    });
-    if (byEmail) return byEmail.id;
-
-    // 2) To'g'ridan-to'g'ri topilmadi — Sozlamalar > Telefoniya sahifasida
-    // qo'lda to'ldirilgan xaritadan qidiramiz: { crmEmail: moizvonkiEmail }.
-    const tenant = await this.prisma.tenant.findUnique({
-      where: { id: tenantId },
-      select: { phoneConfig: true },
-    });
-    const map: Record<string, string> =
-      ((tenant?.phoneConfig as any)?.moizvonki?.employeeEmailMap as Record<string, string>) || {};
-
-    const crmEmail = Object.keys(map).find(
-      (crmEmailKey) => (map[crmEmailKey] || '').trim().toLowerCase() === wanted,
-    );
-    if (!crmEmail) return null;
-
-    const byMap = await this.prisma.user.findFirst({
-      where: { tenantId, email: { equals: crmEmail.trim(), mode: 'insensitive' } },
-      select: { id: true },
-    });
-    return byMap?.id || null;
-  }
-
-  /**
    * Bitta MoiZvonki hodisasini (webhook orqali kelgan yoki
    * `calls.list` orqali sinxronlashtirilgan — ikkalasi ham
    * bir xil unifikatsiya qilingan shaklda keladi) CRM'ga yozadi.
@@ -1264,8 +1236,11 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       // initiate() vaqtida agent noaniq bo'lgan), lekin endi MoiZvonki
       // aniq xodim email'ini yuborgan bo'lsa — to'g'irlaymiz.
       if (!existing.agentId && event.employeeEmail) {
-        const resolvedAgentId = await this.resolveAgentIdByEmployeeEmail(tenantId, event.employeeEmail);
-        if (resolvedAgentId) updateData.agentId = resolvedAgentId;
+        const byEmail = await this.prisma.user.findFirst({
+          where: { tenantId, email: { equals: event.employeeEmail.trim(), mode: 'insensitive' } },
+          select: { id: true },
+        });
+        if (byEmail) updateData.agentId = byEmail.id;
       }
       await this.prisma.call.update({ where: { id: existing.id }, data: updateData });
 
@@ -1310,7 +1285,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         take: 30,
       });
       const wantedVariants = new Set(phoneVariants(rawPhone));
-      const reconciled = candidates.find((c: any) => {
+      const reconciled = candidates.find((c) => {
         const decrypted = normalizePhone(this.encryption.decrypt(c.toRaw) || '');
         return decrypted && wantedVariants.has(decrypted);
       });
@@ -1355,29 +1330,25 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       // "agent@mail.com"), moslik doim TOPILMASDI va qo'ng'iroq JIMGINA
       // mijozning standart agentiga (ko'pincha ADMIN) yozilib qolardi —
       // aynan shu "men gaplashsam, admin gaplashdi deb yozadi" xatosi.
-      //
-      // v21 FIX: endi to'g'ridan-to'g'ri moslik topilmasa, Sozlamalar >
-      // Telefoniya sahifasida to'ldirilgan "employeeEmailMap" xaritasi
-      // HAM tekshiriladi (avval bu xarita hech qachon o'qilmas edi —
-      // shuning uchun uni to'ldirish xatoni yo'qotmas edi).
-      const resolvedAgentId = await this.resolveAgentIdByEmployeeEmail(tenantId, event.employeeEmail);
-      if (resolvedAgentId) {
-        agentId = resolvedAgentId;
+      const byEmail = await this.prisma.user.findFirst({
+        where: { tenantId, email: { equals: event.employeeEmail.trim(), mode: 'insensitive' } },
+        select: { id: true },
+      });
+      if (byEmail) {
+        agentId = byEmail.id;
       } else {
         // v20 FIX: MoiZvonki ANIQ kim gaplashganini aytgan (`user_account`),
-        // lekin bu CRM'dagi hech qanday foydalanuvchi email'iga (na
-        // to'g'ridan-to'g'ri, na employeeEmailMap orqali) mos kelmadi —
-        // bunday holda ilgari JIMGINA mijozning standart agentiga
-        // (noto'g'ri!) yozib qo'yilardi. Endi: bunday qo'ng'iroq ANIQ
-        // SABABI bilan ogohlantiriladi va "Agentsiz" (agentId=null)
+        // lekin bu CRM'dagi hech qanday foydalanuvchi email'iga mos
+        // kelmadi — bunday holda ilgari JIMGINA mijozning standart
+        // agentiga (noto'g'ri!) yozib qo'yilardi. Endi: bunday qo'ng'iroq
+        // ANIQ SABABI bilan ogohlantiriladi va "Agentsiz" (agentId=null)
         // qoldiriladi — noto'g'ri odamga yozib qo'yishdan ko'ra, ochiq
         // "aniqlanmadi" holati ancha yaxshi va tuzatish oson.
         this.logger.warn(
           `MoiZvonki: xodim email topilmadi — MoiZvonki'dan "${event.employeeEmail}" keldi, ` +
-          `lekin CRM'da bunday email'li foydalanuvchi yo'q va "employeeEmailMap"da ham mos ` +
-          `yozuv topilmadi. Sozlamalar > Telefoniya sahifasida "${event.employeeEmail}" ni ` +
-          `to'g'ri CRM xodimiga bog'lang. Hozircha bu qo'ng'iroq "Agentsiz" sifatida saqlanadi ` +
-          `(mijozning standart agentiga emas).`,
+          `lekin CRM'da bunday email'li foydalanuvchi yo'q. Sozlamalar > Telefoniya > ` +
+          `"employeeEmailMap" orqali "${event.employeeEmail}" ni to'g'ri CRM xodimiga bog'lang. ` +
+          `Hozircha bu qo'ng'iroq "Agentsiz" sifatida saqlanadi (mijozning standart agentiga emas).`,
         );
         agentId = null;
       }
@@ -1525,9 +1496,6 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
 @ApiBearerAuth('JWT')
 @Controller('calls')
 export class CallsController {
-  // v22 FIX: console.warn o'rniga markazlashgan Nest Logger.
-  private readonly logger = new Logger('CallsWebhook');
-
   constructor(private svc: CallsService) {}
 
   @ApiOperation({ summary: 'Telefoniya ulanishini tekshirish' })
@@ -1736,7 +1704,8 @@ export class CallsController {
   private warnOnce() {
     if (CallsController.warned) return;
     CallsController.warned = true;
-    this.logger.warn(
+    // eslint-disable-next-line no-console
+    console.warn(
       '[XAVFSIZLIK] PHONE_WEBHOOK_SECRET sozlanmagan — /calls/webhook himoyasiz. ' +
       'Ishlab chiqarishda albatta sozlang.',
     );
