@@ -82,8 +82,21 @@ export class CallsService {
   private get anthropicKey() {
     return (process.env.ANTHROPIC_API_KEY || '').trim();
   }
+  /**
+   * XARAJATNI KAMAYTIRISH (v29): standart model endi ARZONROQ Haiku.
+   * DIQQAT: bu funksiya (qo'ng'iroq tahlili) sotuv bahosi, xato tahlili
+   * va "idealResponse" kabi nozikroq baholash ham beradi — Sonnet'ga
+   * qaraganda Haiku biroz sodda tahlil berishi mumkin. Agar tahlil
+   * sifati (masalan `mistakes`/`overallScore`) yetarli chuqur chiqmasa,
+   * .env'da FAQAT shu funksiya uchun ANTHROPIC_MODEL_CALLS=claude-sonnet-5
+   * qo'shish kifoya — kodga tegish shart emas.
+   */
   private get anthropicModel() {
-    return (process.env.ANTHROPIC_MODEL || 'claude-sonnet-5').trim();
+    return (
+      process.env.ANTHROPIC_MODEL_CALLS ||
+      process.env.ANTHROPIC_MODEL ||
+      'claude-haiku-4-5-20251001'
+    ).trim();
   }
   isAiConfigured(): boolean {
     return !!this.anthropicKey;
@@ -241,7 +254,14 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         body: JSON.stringify({
           model: this.anthropicModel,
           max_tokens: 1500,
-          system,
+          // XARAJATNI KAMAYTIRISH (v29): `system` (qoidalar + e'tiroz
+          // kategoriyalari ro'yxati) HAR BIR qo'ng'iroq uchun bir xil —
+          // faqat `prompt` (mijoz/agent ismi, transkript) o'zgaradi.
+          // `cache_control` bilan keshlab, tez-tez ishlatilganda (5
+          // daqiqa ichida qayta chaqirilsa) kirish narxini kamaytiramiz.
+          system: [
+            { type: 'text', text: system, cache_control: { type: 'ephemeral' } },
+          ],
           messages: [{ role: 'user', content: prompt }],
         }),
       });

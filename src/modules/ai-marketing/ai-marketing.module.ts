@@ -172,8 +172,22 @@ export class AiMarketingService {
   private get anthropicKey() {
     return (process.env.ANTHROPIC_API_KEY || '').trim();
   }
+  /**
+   * XARAJATNI KAMAYTIRISH (v29): reklama matni yozish (copywriting)
+   * chuqur mulohaza talab qilmaydi — qat'iy formatga (JSON, uzunlik,
+   * struktura) rioya qilib, berilgan faktlar asosida matn yozish.
+   * Shuning uchun standart model endi ARZONROQ Haiku — Sonnet'ga
+   * qaraganda bir xil vazifada sezilarli kam narxda ishlaydi.
+   * Agar sifat yetarli bo'lmasa, .env'da ANTHROPIC_MODEL_MARKETING
+   * (yoki umumiy ANTHROPIC_MODEL) ni claude-sonnet-5 ga qaytarish
+   * kifoya — kod o'zgartirish shart emas.
+   */
   private get anthropicModel() {
-    return (process.env.ANTHROPIC_MODEL || 'claude-sonnet-5').trim();
+    return (
+      process.env.ANTHROPIC_MODEL_MARKETING ||
+      process.env.ANTHROPIC_MODEL ||
+      'claude-haiku-4-5-20251001'
+    ).trim();
   }
   private get pexelsKey() {
     return (process.env.PEXELS_API_KEY || '').trim();
@@ -702,8 +716,17 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
         },
         body: JSON.stringify({
           model: this.anthropicModel,
-          max_tokens: 2000,
-          system,
+          max_tokens: 1400,
+          // XARAJATNI KAMAYTIRISH (v29): `system` matni barcha
+          // tenantlar/tillar uchun deyarli o'zgarmas (faqat uz/ru
+          // qatori farq qiladi) — shuning uchun `cache_control` bilan
+          // keshlanadi. Birinchi chaqiruvdan keyin (5 daqiqa ichida
+          // qayta ishlatilsa) shu qismning kirish (input) narxi ~10%
+          // gacha tushadi — bu funksiya tez-tez, ko'p tenant tomonidan
+          // chaqirilgani uchun amaliy foyda beradi.
+          system: [
+            { type: 'text', text: system, cache_control: { type: 'ephemeral' } },
+          ],
           messages: [{ role: 'user', content: prompt }],
         }),
       });
