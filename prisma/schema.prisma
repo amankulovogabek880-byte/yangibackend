@@ -1142,6 +1142,10 @@ model Call {
   // (masalan "OPENAI_API_KEY sozlanmagan" yoki Whisper/Claude xato matni).
   aiError      String?       @db.Text
   aiErrorAt    DateTime?
+  // v20: kodda (calls.module.ts) ishlatilgan, lekin sxemada yo'q edi —
+  // shu sabab Prisma "Unknown argument `aiRetryCount`" xatosi berardi
+  // va foydalanuvchi buni "Ma'lumot formati noto'g'ri" deb ko'rardi.
+  aiRetryCount Int           @default(0)
 
   @@index([tenantId, createdAt])
   @@index([clientId])
