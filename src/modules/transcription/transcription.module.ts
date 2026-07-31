@@ -87,11 +87,15 @@ export class TranscriptionService {
       }
 
       // 3) Whisper'ga yuboramiz (endi toza mp3, 16kHz mono)
+      // v20: 'uz' (o'zbek) tili Whisper API'da QO'LLAB-QUVVATLANMAYDI —
+      // OpenAI buni "unsupported_language" xatosi bilan rad etadi.
+      // Shu sabab `language` maydonini umuman yubormaymiz — Whisper
+      // tilni o'zi avtomatik aniqlaydi (auto-detect). Amaliyotda bu
+      // o'zbek/rus aralash nutqda ham yetarlicha yaxshi ishlaydi.
       const form = new FormData();
       const blob = new Blob([new Uint8Array(normalized.buffer)], { type: 'audio/mpeg' });
       form.append('file', blob, 'recording.mp3');
       form.append('model', 'whisper-1');
-      form.append('language', 'uz'); // O'zbek tili
       form.append('response_format', 'json');
 
       const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
