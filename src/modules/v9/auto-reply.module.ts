@@ -1,12 +1,26 @@
-import { Module, Injectable, Controller, Post, Get, Put, Delete, Param, Body, UseGuards, BadRequestException } from '@nestjs/common';
+import { Module, Injectable, Controller, Post, Get, Put, Delete, Param, Body, UseGuards, BadRequestException, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser, Roles } from '../../common/decorators';
+import { EmailService } from '../email/email.service';
 
 @Injectable()
 export class AutoReplyService {
-  constructor(private prisma: PrismaService) {}
+  // v22 FIX: console.log/error o'rniga markazlashgan Nest Logger — bu
+  // winston transport orqali fayl+konsolga birdek yoziladi.
+  private readonly logger = new Logger('AutoReply');
+
+  constructor(
+    private prisma: PrismaService,
+    // v22 FIX: EMAIL kanali ilgari HAQIQATDA email yubormas edi — faqat
+    // "console.log(Email to X: ...)" bilan konsolga yozib qo'yardi va
+    // triggerCount'ni oshirib, "yuborildi" deb ko'rsatardi. Mijoz hech
+    // qanday xat olmasdi, lekin CRM'da "muvaffaqiyatli ishladi" deb
+    // ko'rinardi. EmailModule @Global(), shuning uchun bu yerga qo'shimcha
+    // import kerak emas — to'g'ridan-to'g'ri inject qilinadi.
+    private email: EmailService,
+  ) {}
 
   async list(tenantId: string) {
     return this.prisma.autoReplyRule.findMany({
@@ -127,10 +141,25 @@ export class AutoReplyService {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: 'Markdown' }),
-              }).catch((e: any) => console.error('[AutoReply] Telegram send error:', e?.message));
+              }).catch((e: any) => this.logger.error(`Telegram send error: ${e?.message}`));
             }
           } else if (rule.channel === 'EMAIL' && (client as any).email) {
-            console.log(`[AutoReply] Email to ${(client as any).email}: ${message}`);
+            // v22 FIX: ilgari bu yerda email UMUMAN yuborilmasdi — faqat
+            // konsolga chiqarib qo'yilardi va pastdagi triggerCount baribir
+            // oshirilib, "muvaffaqiyatli" deb belgilanardi. Endi haqiqatan
+            // EmailService orqali yuboriladi.
+            const sendResult = await this.email.send({
+              to: (client as any).email,
+              toName: client.fullName || undefined,
+              subject: rule.name || "Avtomatik javob",
+              html: message.replace(/\n/g, '<br/>'),
+              text: message,
+              tenantId,
+              metadata: { autoReplyRuleId: rule.id, clientId: client.id },
+            });
+            if (!sendResult.ok) {
+              this.logger.error(`Email yuborilmadi [rule ${rule.id}]: ${sendResult.error}`);
+            }
           }
           // Trigger count update
           await this.prisma.autoReplyRule.update({
@@ -138,7 +167,7 @@ export class AutoReplyService {
             data: { triggerCount: { increment: 1 } },
           });
         } catch (e: any) {
-          console.error(`[AutoReply] Error rule ${rule.id}:`, e?.message);
+          this.logger.error(`Error rule ${rule.id}: ${e?.message}`);
         }
       }, rule.delayMs || 0);
     }

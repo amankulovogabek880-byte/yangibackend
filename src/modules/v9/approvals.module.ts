@@ -12,6 +12,7 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -40,6 +41,9 @@ import { AuditService } from '../audit/audit.module';
  */
 @Injectable()
 export class ApprovalsService {
+  // v22 FIX: console.error o'rniga markazlashgan Nest Logger.
+  private readonly logger = new Logger('Approvals');
+
   constructor(
     private _prisma: PrismaService,
     private notifications: NotificationsService,
@@ -342,9 +346,9 @@ export class ApprovalsService {
           // Faqat log qilamiz, haqiqiy o'zgarish qo'lda qilinadi
           break;
       }
-    } catch (e) {
+    } catch (e: any) {
       // Apply muvaffaqiyatsiz bo'lsa ham approval qoldi
-      console.error('Approval apply error:', e);
+      this.logger.error(`Approval apply error: ${e?.message || e}`);
     }
   }
 

@@ -1,6 +1,11 @@
 /**
  * Common utility helpers used across services.
  */
+// v22 FIX: bu yerda oldin to'g'ridan-to'g'ri console.log/warn/error
+// ishlatilardi — bular markazlashgan winston logga (fayl + Render/Docker
+// log yig'uvchilarga) tushmasdi, faqat terminalga chiqib yo'qolib
+// ketardi. Endi butun ilova bilan bir xil `winstonLogger`dan foydalanadi.
+import { winstonLogger } from '../logger/winston.logger';
 
 export function safeEnum<T extends string>(val: any, list: readonly T[], def: T): T {
   return list.includes(val) ? (val as T) : def;
@@ -155,7 +160,7 @@ export async function getExchangeRates(): Promise<FxRates> {
     };
     return _fxCache;
   } catch (e: any) {
-    console.error('[getExchangeRates] CBU.uz dan kurs olib bo\'lmadi:', e?.message || e);
+    winstonLogger.error(`[getExchangeRates] CBU.uz dan kurs olib bo'lmadi: ${e?.message || e}`, { context: 'ExchangeRate' });
     if (_fxCache) return _fxCache;
     return FX_FALLBACK;
   }
@@ -224,7 +229,7 @@ export async function pickNextAgent(prisma: any, tenantId: string): Promise<stri
     });
 
     if (!agents || agents.length === 0) {
-      console.warn('[pickNextAgent] No available agents for tenant:', tenantId);
+      winstonLogger.warn(`[pickNextAgent] No available agents for tenant: ${tenantId}`, { context: 'RoundRobin' });
       return null;
     }
 
@@ -247,7 +252,7 @@ export async function pickNextAgent(prisma: any, tenantId: string): Promise<stri
     }
 
     if (available.length === 0) {
-      console.warn('[pickNextAgent] All agents reached daily limit for tenant:', tenantId);
+      winstonLogger.warn(`[pickNextAgent] All agents reached daily limit for tenant: ${tenantId}`, { context: 'RoundRobin' });
       return null;
     }
 
@@ -259,7 +264,7 @@ export async function pickNextAgent(prisma: any, tenantId: string): Promise<stri
     });
 
     const next = available[0];
-    console.log('[pickNextAgent] → Agent:', next.id, '| lastAssigned:', next.lastAssignedAt);
+    winstonLogger.info(`[pickNextAgent] -> Agent: ${next.id} | lastAssigned: ${next.lastAssignedAt}`, { context: 'RoundRobin' });
 
     // lastAssignedAt yangilaymiz (xato bo'lsa ham agent ID qaytaramiz)
     try {
@@ -268,14 +273,14 @@ export async function pickNextAgent(prisma: any, tenantId: string): Promise<stri
         data: { lastAssignedAt: new Date() },
       });
     } catch (updateErr: any) {
-      console.error('[pickNextAgent] lastAssignedAt update FAILED:', updateErr?.message);
-      console.error('[pickNextAgent] => Run: npx prisma db push');
+      winstonLogger.error(`[pickNextAgent] lastAssignedAt update FAILED: ${updateErr?.message}`, { context: 'RoundRobin' });
+      winstonLogger.error('[pickNextAgent] => Run: npx prisma db push', { context: 'RoundRobin' });
     }
 
     return next.id;
 
   } catch (e: any) {
-    console.error('[pickNextAgent] FATAL error:', e?.message || e);
+    winstonLogger.error(`[pickNextAgent] FATAL error: ${e?.message || e}`, { context: 'RoundRobin' });
     return null;
   }
 }

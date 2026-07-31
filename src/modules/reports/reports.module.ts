@@ -1545,6 +1545,8 @@ export class ReportsService {
         aiAnalyzedCount: number; aiScoreSum: number; aiScoreN: number;
         aiObjectionCounts: Record<string, { category: string; label: string; count: number }>;
         aiSentiment: { positive: number; neutral: number; negative: number };
+        bestPhrases: string[]; missedInfos: string[]; whatWouldCloseList: string[]; improvements: string[];
+        saleReadinessSum: number; saleReadinessN: number;
       }> = {};
       for (const c of rows) {
         const aId = c.agentId || 'unassigned';
@@ -1556,6 +1558,8 @@ export class ReportsService {
             aiAnalyzedCount: 0, aiScoreSum: 0, aiScoreN: 0,
             aiObjectionCounts: {},
             aiSentiment: { positive: 0, neutral: 0, negative: 0 },
+            bestPhrases: [], missedInfos: [], whatWouldCloseList: [], improvements: [],
+            saleReadinessSum: 0, saleReadinessN: 0,
           };
         }
         const entry = agentMap[aId];
@@ -1568,6 +1572,15 @@ export class ReportsService {
           entry.aiAnalyzedCount++;
           const fb = (c as any).aiFeedback as any;
           if (fb?.score) { entry.aiScoreSum += Number(fb.score); entry.aiScoreN++; }
+          // v22: koching (o'qitish) uchun — agent ishlatgan eng kuchli gaplar,
+          // aytmay qoldirgan ma'lumotlar, mijozni yakunlashi mumkin bo'lgan
+          // takliflar va yaxshilash kerak nuqtalar — HAR BIR qo'ng'iroqdan
+          // emas, endi AGENT DARAJASIDA jamlab ko'rsatiladi.
+          if (fb?.bestPhrase) entry.bestPhrases.push(fb.bestPhrase);
+          if (fb?.saleReadiness?.missedInfo) entry.missedInfos.push(fb.saleReadiness.missedInfo);
+          if (fb?.saleReadiness?.whatWouldClose) entry.whatWouldCloseList.push(fb.saleReadiness.whatWouldClose);
+          if (fb?.saleReadiness?.score) { entry.saleReadinessSum += Number(fb.saleReadiness.score); entry.saleReadinessN++; }
+          if (Array.isArray(fb?.improvements)) entry.improvements.push(...fb.improvements);
           const sentiment = (c as any).aiSentiment as string | null;
           if (sentiment && sentiment in entry.aiSentiment) (entry.aiSentiment as any)[sentiment]++;
           const objList = (c as any).aiObjections as any[] | null;
@@ -1596,6 +1609,12 @@ export class ReportsService {
             aiAvgScore: a.aiScoreN > 0 ? Math.round((a.aiScoreSum / a.aiScoreN) * 10) / 10 : null,
             aiTopObjection: sortedObj[0] || null,
             aiSentiment: a.aiSentiment,
+            // v22: koching paneli uchun — oxirgi 5 tasi
+            aiAvgSaleReadiness: a.saleReadinessN > 0 ? Math.round((a.saleReadinessSum / a.saleReadinessN) * 10) / 10 : null,
+            aiBestPhrases: a.bestPhrases.slice(-5),
+            aiMissedInfos: a.missedInfos.slice(-5),
+            aiWhatWouldClose: a.whatWouldCloseList.slice(-5),
+            aiImprovements: a.improvements.slice(-5),
           };
         })
         .sort((a, b) => b.totalDurationSec - a.totalDurationSec);

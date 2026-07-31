@@ -1,6 +1,6 @@
 import {
   Module, Injectable, Controller, Get, Post, Put, Delete, Param, Body,
-  UseGuards, NotFoundException, BadRequestException,
+  UseGuards, NotFoundException, BadRequestException, Logger,
 } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
 import { EventEmitter2 } from '@nestjs/event-emitter';
@@ -19,6 +19,9 @@ const TRIGGERS: AutomationTrigger[] = [
 
 @Injectable()
 export class AutomationsService {
+  // v22 FIX: console.error o'rniga markazlashgan Nest Logger.
+  private readonly logger = new Logger('Automations');
+
   constructor(
     private prisma: PrismaService,
     private eventEmitter: EventEmitter2,
@@ -113,7 +116,7 @@ export class AutomationsService {
               }
             }
           } catch (ae: any) {
-            console.error(`[Automation] action error [${automation.id}]:`, ae?.message);
+            this.logger.error(`action error [${automation.id}]: ${ae?.message}`);
           }
         }
         await this.prisma.automation.update({
@@ -122,7 +125,7 @@ export class AutomationsService {
         });
       }
     } catch (e: any) {
-      console.error(`[Automation] executor error [${trigger}]:`, e?.message);
+      this.logger.error(`executor error [${trigger}]: ${e?.message}`);
     }
   }
 

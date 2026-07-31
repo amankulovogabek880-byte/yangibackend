@@ -1162,6 +1162,58 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
   }
 
   /**
+   * v21 FIX — "MoiZvonki: xodim email topilmadi" xatosining ASL SABABI:
+   *
+   * Sozlamalar > Telefoniya sahifasida admin/agent "employeeEmailMap"ni
+   * to'ldirsa ham (`TenantsService.updateMyMoiZvonkiEmail`, bazada
+   * `phoneConfig.moizvonki.employeeEmailMap = { crmEmail: moizvonkiEmail }`
+   * shaklida saqlanadi), qo'ng'iroq qayta ishlanganda bu xarita HECH QACHON
+   * o'qilmas edi — faqat `event.employeeEmail`ni to'g'ridan-to'g'ri
+   * `User.email`ga solishtirardi. Natijada MoiZvonki login (masalan
+   * "ivanov" yoki ichki hisob nomi) CRM emaildan farq qilsa, xarita
+   * to'ldirilgan bo'lsa ham moslik HECH QACHON topilmasdi.
+   *
+   * Endi: avval to'g'ridan-to'g'ri email moslikka, TOPILMASA
+   * `employeeEmailMap`ga (aksincha yo'nalishda — xarita qiymati
+   * MoiZvonki email, kaliti CRM email) qarab agentni topamiz.
+   */
+  private async resolveAgentIdByEmployeeEmail(
+    tenantId: string,
+    employeeEmail: string,
+  ): Promise<string | null> {
+    const wanted = employeeEmail.trim().toLowerCase();
+    if (!wanted) return null;
+
+    // 1) To'g'ridan-to'g'ri moslik: MoiZvonki'dan kelgan email AYNAN
+    // CRM foydalanuvchisining email'i bilan bir xil.
+    const byEmail = await this.prisma.user.findFirst({
+      where: { tenantId, email: { equals: wanted, mode: 'insensitive' } },
+      select: { id: true },
+    });
+    if (byEmail) return byEmail.id;
+
+    // 2) To'g'ridan-to'g'ri topilmadi — Sozlamalar > Telefoniya sahifasida
+    // qo'lda to'ldirilgan xaritadan qidiramiz: { crmEmail: moizvonkiEmail }.
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { phoneConfig: true },
+    });
+    const map: Record<string, string> =
+      ((tenant?.phoneConfig as any)?.moizvonki?.employeeEmailMap as Record<string, string>) || {};
+
+    const crmEmail = Object.keys(map).find(
+      (crmEmailKey) => (map[crmEmailKey] || '').trim().toLowerCase() === wanted,
+    );
+    if (!crmEmail) return null;
+
+    const byMap = await this.prisma.user.findFirst({
+      where: { tenantId, email: { equals: crmEmail.trim(), mode: 'insensitive' } },
+      select: { id: true },
+    });
+    return byMap?.id || null;
+  }
+
+  /**
    * Bitta MoiZvonki hodisasini (webhook orqali kelgan yoki
    * `calls.list` orqali sinxronlashtirilgan — ikkalasi ham
    * bir xil unifikatsiya qilingan shaklda keladi) CRM'ga yozadi.
@@ -1212,11 +1264,8 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       // initiate() vaqtida agent noaniq bo'lgan), lekin endi MoiZvonki
       // aniq xodim email'ini yuborgan bo'lsa — to'g'irlaymiz.
       if (!existing.agentId && event.employeeEmail) {
-        const byEmail = await this.prisma.user.findFirst({
-          where: { tenantId, email: { equals: event.employeeEmail.trim(), mode: 'insensitive' } },
-          select: { id: true },
-        });
-        if (byEmail) updateData.agentId = byEmail.id;
+        const resolvedAgentId = await this.resolveAgentIdByEmployeeEmail(tenantId, event.employeeEmail);
+        if (resolvedAgentId) updateData.agentId = resolvedAgentId;
       }
       await this.prisma.call.update({ where: { id: existing.id }, data: updateData });
 
@@ -1261,7 +1310,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         take: 30,
       });
       const wantedVariants = new Set(phoneVariants(rawPhone));
-      const reconciled = candidates.find((c) => {
+      const reconciled = candidates.find((c: any) => {
         const decrypted = normalizePhone(this.encryption.decrypt(c.toRaw) || '');
         return decrypted && wantedVariants.has(decrypted);
       });
@@ -1306,25 +1355,29 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       // "agent@mail.com"), moslik doim TOPILMASDI va qo'ng'iroq JIMGINA
       // mijozning standart agentiga (ko'pincha ADMIN) yozilib qolardi —
       // aynan shu "men gaplashsam, admin gaplashdi deb yozadi" xatosi.
-      const byEmail = await this.prisma.user.findFirst({
-        where: { tenantId, email: { equals: event.employeeEmail.trim(), mode: 'insensitive' } },
-        select: { id: true },
-      });
-      if (byEmail) {
-        agentId = byEmail.id;
+      //
+      // v21 FIX: endi to'g'ridan-to'g'ri moslik topilmasa, Sozlamalar >
+      // Telefoniya sahifasida to'ldirilgan "employeeEmailMap" xaritasi
+      // HAM tekshiriladi (avval bu xarita hech qachon o'qilmas edi —
+      // shuning uchun uni to'ldirish xatoni yo'qotmas edi).
+      const resolvedAgentId = await this.resolveAgentIdByEmployeeEmail(tenantId, event.employeeEmail);
+      if (resolvedAgentId) {
+        agentId = resolvedAgentId;
       } else {
         // v20 FIX: MoiZvonki ANIQ kim gaplashganini aytgan (`user_account`),
-        // lekin bu CRM'dagi hech qanday foydalanuvchi email'iga mos
-        // kelmadi — bunday holda ilgari JIMGINA mijozning standart
-        // agentiga (noto'g'ri!) yozib qo'yilardi. Endi: bunday qo'ng'iroq
-        // ANIQ SABABI bilan ogohlantiriladi va "Agentsiz" (agentId=null)
+        // lekin bu CRM'dagi hech qanday foydalanuvchi email'iga (na
+        // to'g'ridan-to'g'ri, na employeeEmailMap orqali) mos kelmadi —
+        // bunday holda ilgari JIMGINA mijozning standart agentiga
+        // (noto'g'ri!) yozib qo'yilardi. Endi: bunday qo'ng'iroq ANIQ
+        // SABABI bilan ogohlantiriladi va "Agentsiz" (agentId=null)
         // qoldiriladi — noto'g'ri odamga yozib qo'yishdan ko'ra, ochiq
         // "aniqlanmadi" holati ancha yaxshi va tuzatish oson.
         this.logger.warn(
           `MoiZvonki: xodim email topilmadi — MoiZvonki'dan "${event.employeeEmail}" keldi, ` +
-          `lekin CRM'da bunday email'li foydalanuvchi yo'q. Sozlamalar > Telefoniya > ` +
-          `"employeeEmailMap" orqali "${event.employeeEmail}" ni to'g'ri CRM xodimiga bog'lang. ` +
-          `Hozircha bu qo'ng'iroq "Agentsiz" sifatida saqlanadi (mijozning standart agentiga emas).`,
+          `lekin CRM'da bunday email'li foydalanuvchi yo'q va "employeeEmailMap"da ham mos ` +
+          `yozuv topilmadi. Sozlamalar > Telefoniya sahifasida "${event.employeeEmail}" ni ` +
+          `to'g'ri CRM xodimiga bog'lang. Hozircha bu qo'ng'iroq "Agentsiz" sifatida saqlanadi ` +
+          `(mijozning standart agentiga emas).`,
         );
         agentId = null;
       }
@@ -1472,6 +1525,9 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
 @ApiBearerAuth('JWT')
 @Controller('calls')
 export class CallsController {
+  // v22 FIX: console.warn o'rniga markazlashgan Nest Logger.
+  private readonly logger = new Logger('CallsWebhook');
+
   constructor(private svc: CallsService) {}
 
   @ApiOperation({ summary: 'Telefoniya ulanishini tekshirish' })
@@ -1680,8 +1736,7 @@ export class CallsController {
   private warnOnce() {
     if (CallsController.warned) return;
     CallsController.warned = true;
-    // eslint-disable-next-line no-console
-    console.warn(
+    this.logger.warn(
       '[XAVFSIZLIK] PHONE_WEBHOOK_SECRET sozlanmagan — /calls/webhook himoyasiz. ' +
       'Ishlab chiqarishda albatta sozlang.',
     );

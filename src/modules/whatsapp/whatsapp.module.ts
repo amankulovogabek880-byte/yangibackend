@@ -355,6 +355,9 @@ export class WhatsAppController {
 
 @Controller('public/whatsapp')
 export class WhatsAppWebhookController {
+  // v22 FIX: console.warn o'rniga markazlashgan Nest Logger.
+  private readonly logger = new Logger('WhatsAppWebhook');
+
   constructor(private svc: WhatsAppService) {}
 
   // UltraMsg webhook: POST /api/v1/public/whatsapp/webhook/TENANT_ID
@@ -382,8 +385,7 @@ export class WhatsAppWebhookController {
     if (!res.configured) {
       if (!WhatsAppWebhookController.warned) {
         WhatsAppWebhookController.warned = true;
-        // eslint-disable-next-line no-console
-        console.warn(
+        this.logger.warn(
           '[XAVFSIZLIK] WHATSAPP_WEBHOOK_SECRET sozlanmagan — WhatsApp webhook himoyasiz.',
         );
       }
