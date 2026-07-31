@@ -1,4 +1,4 @@
-import { Module, Injectable, Controller, Get, Post, Put, Delete, Param, Body, UseGuards, BadRequestException, Query } from '@nestjs/common';
+import { Module, Injectable, Controller, Get, Post, Put, Delete, Param, Body, UseGuards, BadRequestException, Query, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
@@ -7,6 +7,10 @@ import { RoundRobinService, RoundRobinModule } from './round-robin.module';
 
 @Injectable()
 export class LeadFormsService {
+  // v23 FIX: console yo'q edi, lekin catch(() => {}) bilan xatolar jim
+  // yutilardi — endi ko'rinadigan bo'lishi uchun Logger qo'shildi.
+  private readonly logger = new Logger('LeadForms');
+
   constructor(
     private prisma: PrismaService,
     private roundRobin: RoundRobinService,
@@ -93,10 +97,12 @@ export class LeadFormsService {
     if (!fullName) throw new BadRequestException('Ism majburiy');
     if (!phone && !email) throw new BadRequestException('Telefon yoki email kerak');
 
-    // 1. Submission saqla
+    // 1. Submission saqla (xom audit yozuvi — asosiy Client pastda
+    // baribir yaratiladi, shuning uchun bu yerda xato blokламайди,
+    // lekin endi kamida loglanadi).
     await (this.prisma as any).leadFormSubmission?.create({
       data: { formId: form.id, tenantId, data, email, phone },
-    }).catch(() => {});
+    }).catch((e: any) => this.logger.warn(`Submission audit yozuvi saqlanmadi (form ${form.id}): ${e?.message}`));
 
     // 2. Dublikat tekshir
     let existing: any = null;
@@ -115,7 +121,7 @@ export class LeadFormsService {
           description: message,
           metadata: { isDuplicate: true, formSlug: slug, formName: form.name },
         },
-      }).catch(() => {});
+      }).catch((e: any) => this.logger.warn(`Timeline yozilmadi (client ${clientId}): ${e?.message}`));
     } else {
       const newClient = await this.prisma.client.create({
         data: {
@@ -133,22 +139,27 @@ export class LeadFormsService {
           description: message,
           metadata: { formSlug: slug, formName: form.name, formId: form.id },
         },
-      }).catch(() => {});
+      }).catch((e: any) => this.logger.warn(`Timeline yozilmadi (client ${clientId}): ${e?.message}`));
 
-      // Round Robin tayinlash (strategiya tekshirib)
+      // Round Robin tayinlash (strategiya tekshirib). v23 FIX: xato
+      // bo'lsa jim qolardi — lead agentsiz qolib ketganini hech kim
+      // bilmasdi. Endi loglanadi, admin "Reassign all" bilan tuzatishi mumkin.
       assignedAgentId = await this.roundRobin.assignNewLead({
         tenantId,
         clientId,
         clientName: fullName,
         source: 'WEBSITE',
-      }).catch(() => null);
+      }).catch((e: any) => {
+        this.logger.warn(`Avtomatik tayinlash muvaffaqiyatsiz (client ${clientId}): ${e?.message}`);
+        return null;
+      });
     }
 
-    // 3. Submit count yangilash
+    // 3. Submit count yangilash (statistika, ikkinchi darajali)
     await this.prisma.leadForm.update({
       where: { id: form.id },
       data: { submitCount: form.submitCount + 1, lastSubmitAt: new Date() },
-    }).catch(() => {});
+    }).catch((e: any) => this.logger.warn(`submitCount yangilanmadi (form ${form.id}): ${e?.message}`));
 
     return { success: true, message: form.successMsg || 'Rahmat!', clientId, assignedAgentId };
   }

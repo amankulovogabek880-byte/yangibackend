@@ -601,7 +601,18 @@ export class OffersService {
         currency: 'USD',
         method: 'CASH',
         note: "Taklif 'Sotildi' deb belgilanganda avtomatik to'langan deb qayd etildi",
-      }).catch(() => {}); // to'lov yaratishda xato bo'lsa ham booking yaratilishi buzilmasin
+      }).catch((e: any) => {
+        // v23 FIX: to'lov yozuvi yaratilmasa (masalan validatsiya xatosi),
+        // ilgari bu HECH QAYERDA ko'rinmasdi — booking "CONFIRMED" bo'lib
+        // qolardi, lekin moliyaviy hisobotda to'lov yo'q edi va buni
+        // hech kim bilmasdi. Booking yaratilishi baribir buzilmasin
+        // (shu sabab bloklamaymiz), lekin endi aniq loglanadi.
+        this.logger.error(
+          `[MOLIYA] Taklif SOTILDI deb belgilanganda avtomatik to'lov yozuvi ` +
+          `yaratilmadi (booking ${confirmed.id}, summa ${confirmed.totalPrice}). ` +
+          `To'lovni qo'lda kiriting! Xato: ${e?.message}`,
+        );
+      });
 
     }
 

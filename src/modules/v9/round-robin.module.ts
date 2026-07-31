@@ -233,10 +233,25 @@ export class RoundRobinService {
         continue;
       }
 
-      await this.prisma.client.update({
-        where: { id: client.id },
-        data: { assignedAgentId: agentId },
-      }).catch(() => {});
+      // v23 FIX: bu yerda avval `.catch(() => {})` bilan xato JIMGINA
+      // yutilardi, lekin pastda baribir `assigned++` va "muvaffaqiyatli
+      // tayinlandi" logi yozilardi — ya'ni baza yozuvi HAQIQATDA
+      // muvaffaqiyatsiz bo'lsa ham, admin panelida "50 ta tayinlandi"
+      // ko'rinardi, aslida ba'zilari saqlanmagan bo'lardi. Endi: yozuv
+      // muvaffaqiyatsiz bo'lsa, bu mijoz "skipped" (o'tkazib yuborilgan)
+      // sifatida hisoblanadi va xato loglanadi — admin buni ko'radi.
+      const updateOk = await this.prisma.client
+        .update({ where: { id: client.id }, data: { assignedAgentId: agentId } })
+        .then(() => true)
+        .catch((e: any) => {
+          this.logger.error(`[ROUND ROBIN] Tayinlash saqlanmadi: Lead=${client.id} → Agent=${agentId}: ${e?.message}`);
+          return false;
+        });
+
+      if (!updateOk) {
+        skipped++;
+        continue;
+      }
 
       await this.prisma.clientTimeline.create({
         data: {
@@ -246,7 +261,11 @@ export class RoundRobinService {
           title: '🔄 Qayta tayinlandi (Admin)',
           metadata: { autoAssigned: true, strategy: 'REASSIGN_ALL' },
         },
-      }).catch(() => {});
+      }).catch((e: any) => {
+        // Timeline yozuvi ikkinchi darajali (audit) — tayinlash o'zi
+        // allaqachon saqlangan, shuning uchun bu yerda faqat log qilamiz.
+        this.logger.warn(`[ROUND ROBIN] Timeline yozuvi saqlanmadi (assign o'zi saqlandi): Lead=${client.id}: ${e?.message}`);
+      });
 
       this.logger.log(`[ROUND ROBIN] Reassign: Lead=${client.id} → Agent=${agentId}`);
       assigned++;

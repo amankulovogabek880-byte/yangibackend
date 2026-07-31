@@ -1291,10 +1291,20 @@ export class MarketplaceService {
       // Booking yaratilmadi — band qilingan joylarni QAYTARAMIZ,
       // aks holda joylar "yo'qolib" qolardi.
       if (seatsReserved) {
+        // v23 FIX: bu "qaytarish" (compensation) qadami o'zi ham
+        // muvaffaqiyatsiz bo'lsa, ilgari BUTUNLAY jim qolardi — natijada
+        // o'rin sonini hech kim qo'lda tuzatmasdi va tur "band" ko'rinib,
+        // aslida bo'sh joy bor bo'lardi. Endi kamida xato aniq loglanadi,
+        // shunda operator qo'lda tuzatishi mumkin.
         await this.prisma.marketplaceTour.updateMany({
           where: { id: tour.id },
           data: { seatsAvailable: { increment: needSeats } },
-        }).catch(() => {});
+        }).catch((rollbackErr: any) => {
+          this.logger.error(
+            `[JIDDIY] Tour ${tour.id}: band qilingan ${needSeats} o'rinni qaytarib bo'lmadi ` +
+            `(booking yaratish xatosidan keyin). Qo'lda tuzatish kerak! Xato: ${rollbackErr?.message}`,
+          );
+        });
       }
       throw e;
     }
@@ -1305,8 +1315,12 @@ export class MarketplaceService {
       `Booking yaratildi: ${booking.bookingRef}`,
       `${booking.tourName} • $${booking.totalPrice}`,
       { userId, bookingId: booking.id, source: 'marketplace' },
-    ).catch(() => {});
-    await this.clients.recalcStats(client.id).catch(() => {});
+    ).catch((e: any) => this.logger.warn(`Timeline yozilmadi (booking ${booking.id}): ${e?.message}`));
+    // v23 FIX: statistika qayta hisoblanmasa (masalan mijozning umumiy
+    // xarid summasi), buni hech kim ko'rmasdi — endi loglanadi.
+    await this.clients.recalcStats(client.id).catch((e: any) =>
+      this.logger.warn(`Mijoz statistikasi qayta hisoblanmadi (client ${client.id}): ${e?.message}`),
+    );
 
     // ── Agentga bildirishnoma (agar boshqa odam biriktirgan bo'lsa) ──
     const agentId = booking.agentId;

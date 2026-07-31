@@ -409,7 +409,10 @@ export class BookingsService {
 
     // ── Recalc client stats if financial fields changed ──
     if (safe.totalPrice !== undefined || safe.supplierCost !== undefined || safe.discount !== undefined) {
-      await this.clients.recalcStats(existing.clientId).catch(() => {});
+      // v23 FIX: statistika qayta hisoblanmasa buni hech kim bilmasdi — endi loglanadi.
+      await this.clients.recalcStats(existing.clientId).catch((e: any) =>
+        this.logger.warn(`Mijoz statistikasi qayta hisoblanmadi (client ${existing.clientId}): ${e?.message}`),
+      );
     }
 
     // ── Commission auto-create when status → CONFIRMED or COMPLETED ──
@@ -530,7 +533,9 @@ export class BookingsService {
     }
 
     await this.prisma.booking.delete({ where: { id } });
-    await this.clients.recalcStats(b.clientId).catch(() => {});
+    await this.clients.recalcStats(b.clientId).catch((e: any) =>
+      this.logger.warn(`Mijoz statistikasi qayta hisoblanmadi (client ${b.clientId}, booking o'chirilgandan keyin): ${e?.message}`),
+    );
 
     // Timeline
     await this.clients.addTimeline(
