@@ -201,6 +201,24 @@ export class AiMarketingService {
   }
 
   /**
+   * 🩹 TUZATISH: bu servis (reklama matni yozish) ilgari Platform
+   * Owner'ning "Kompaniyalar" jadvalidagi AI yoqish/o'chirish
+   * (tenant.settings.aiEnabled) tugmasiga UMUMAN qaramasdan ishlardi —
+   * faqat serverda ANTHROPIC_API_KEY bor-yo'qligini tekshirardi. Ya'ni
+   * owner biror kompaniyada AI'ni o'chirsa ham (masalan xarajatni
+   * to'xtatish uchun), o'sha kompaniya AI Marketing orqali baribir
+   * Claude'ga so'rov yuborib, token sarflay olardi — bu calls.module.ts
+   * va briefing.module.ts'dagi xuddi shu tekshiruv bilan nomuvofiq edi.
+   * Endi ikkalasi ham BIR XIL bayroqqa (tenant.settings.aiEnabled)
+   * bo'ysunadi: o'chiq bo'lsa, bu yerda ham Claude'ga umuman so'rov
+   * ketmaydi.
+   */
+  private async isAiEnabledForTenant(tenantId: string): Promise<boolean> {
+    const tenant = await this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { settings: true } });
+    return (tenant?.settings as any)?.aiEnabled === true;
+  }
+
+  /**
    * BUG FIX: Claude ba'zan JSON qaytarganda satr (string) ichida XOM
    * qator ko'chirish/tab kabi boshqaruv belgilarini ekranlamasdan
    * qaytaradi (masalan Telegram posti matnida haqiqiy "enter" belgisi).
@@ -769,6 +787,15 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
    * nomi/kontakti/valyuta saqlangan shablondan avtomatik to'ldiriladi.
    */
   async generateTourAd(tenantId: string, rawInput: TourAdInput): Promise<TourAdOutput> {
+    // 🩹 TUZATISH: AI (Claude) so'rovidan OLDIN tenant darajasidagi
+    // yoqilgan/o'chirilgan holatini tekshiramiz — o'chiq bo'lsa bu yerda
+    // to'xtaymiz, hech qanday token sarflanmaydi (rasm qidiruvi ham
+    // ishga tushmaydi, chunki u ham shu funksiya ichida ketma-ket).
+    if (!(await this.isAiEnabledForTenant(tenantId))) {
+      throw new BadRequestException(
+        "Bu kompaniyada AI xizmati yoqilmagan. Yoqish uchun platforma administratoriga murojaat qiling.",
+      );
+    }
     const { input } = await this.mergeWithTemplate(tenantId, rawInput);
 
     const [libraryPhotos, images, posts] = await Promise.all([
