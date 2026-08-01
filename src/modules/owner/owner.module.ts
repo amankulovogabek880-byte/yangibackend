@@ -213,7 +213,12 @@ export class OwnerService {
 
     const updateData: any = {};
     if (data.name?.trim()) updateData.name = data.name.trim();
-    if (data.plan) updateData.plan = safeEnum(data.plan, ['FREE', 'STARTER', 'PRO', 'ENTERPRISE'], 'FREE');
+    // 🩹 TUZATISH: bu yerda avval alohida, ESKIRGAN ro'yxat ishlatilgan edi
+    // (['FREE','STARTER','PRO','ENTERPRISE'] — 'PRO' xato, haqiqiy qiymat
+    // 'PROFESSIONAL'). Natijada PROFESSIONAL tarifidagi har qanday kompaniya
+    // shu endpoint orqali tahrirlansa, jim-jit FREE'ga tushirilib qo'yilardi.
+    // Endi fayl boshidagi yagona PLANS ro'yxatidan foydalanamiz.
+    if (data.plan) updateData.plan = safeEnum(data.plan, PLANS, tenant.plan as SubscriptionPlan);
     if (data.timezone) updateData.timezone = data.timezone;
     if (data.currency) updateData.currency = data.currency;
     if (data.country !== undefined) updateData.country = data.country;

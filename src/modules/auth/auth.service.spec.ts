@@ -11,6 +11,13 @@ import { UnauthorizedException, ForbiddenException, BadRequestException } from '
 const mockPrisma = {
   user: {
     findUnique: jest.fn(),
+    // 🩹 TUZATISH: login() endi bir xil email bir nechta tenantda bo'lishi
+    // mumkinligini hisobga olib findMany ishlatadi, createUser() esa
+    // findFirst ishlatadi (tenant ichida email tekshirish uchun) — bular
+    // avval mock'da yo'q edi, shu sabab testlar "is not a function" bilan
+    // qulab tushardi (haqiqiy login/createUser kodi buzuq emas edi).
+    findMany: jest.fn(),
+    findFirst: jest.fn(),
     update: jest.fn(),
     create: jest.fn(),
   },
@@ -103,7 +110,7 @@ describe('AuthService', () => {
     });
 
     it('to\'g\'ri credentials bilan kiradi', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue(mockUser);
+      mockPrisma.user.findMany.mockResolvedValue([mockUser]);
       mockPrisma.userSession.create.mockResolvedValue({ id: 'session-1' });
       mockPrisma.userSession.findMany.mockResolvedValue([]);
       mockPrisma.user.update.mockResolvedValue(mockUser);
@@ -116,7 +123,7 @@ describe('AuthService', () => {
     });
 
     it('mavjud bo\'lmagan email bilan kirish rad etiladi', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue(null);
+      mockPrisma.user.findMany.mockResolvedValue([]);
       mockPrisma.loginAttempt.create.mockResolvedValue({});
       await expect(
         service.login('noone@test.com', 'anypass', undefined)
@@ -124,7 +131,7 @@ describe('AuthService', () => {
     });
 
     it('noto\'g\'ri parol bilan kirish rad etiladi', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue(mockUser);
+      mockPrisma.user.findMany.mockResolvedValue([mockUser]);
       mockPrisma.loginAttempt.create.mockResolvedValue({});
       mockPrisma.user.update.mockResolvedValue(mockUser);
       await expect(
@@ -133,7 +140,7 @@ describe('AuthService', () => {
     });
 
     it('INACTIVE foydalanuvchi kirolmaydi', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, status: 'INACTIVE' });
+      mockPrisma.user.findMany.mockResolvedValue([{ ...mockUser, status: 'INACTIVE' }]);
       mockPrisma.loginAttempt.create.mockResolvedValue({});
       await expect(
         service.login('test@test.com', 'ValidPass123!', undefined)
@@ -145,7 +152,7 @@ describe('AuthService', () => {
         ...mockUser,
         lockedUntil: new Date(Date.now() + 10 * 60 * 1000), // 10 min future
       };
-      mockPrisma.user.findUnique.mockResolvedValue(lockedUser);
+      mockPrisma.user.findMany.mockResolvedValue([lockedUser]);
       mockPrisma.loginAttempt.create.mockResolvedValue({});
       await expect(
         service.login('test@test.com', 'ValidPass123!', undefined)
@@ -161,7 +168,7 @@ describe('AuthService', () => {
 
   describe('createUser', () => {
     it('yangi agent yaratadi', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue(null);
+      mockPrisma.user.findFirst.mockResolvedValue(null);
       mockPrisma.user.create.mockResolvedValue({
         id: 'new-user', email: 'agent@test.com', name: 'Agent', role: 'AGENT',
         tenantId: 'tenant-1', status: 'ACTIVE', twoFactorEnabled: false,
@@ -177,7 +184,7 @@ describe('AuthService', () => {
     });
 
     it('mavjud email bilan yaratish rad etiladi', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'exists' });
+      mockPrisma.user.findFirst.mockResolvedValue({ id: 'exists' });
       await expect(
         service.createUser('tenant-1', {
           email: 'exists@test.com',
