@@ -337,7 +337,7 @@ export class AuthService {
   async me(userId: string) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      include: { tenant: { select: { name: true, slug: true, plan: true, brandColor: true, status: true, currency: true } } },
+      include: { tenant: { select: { name: true, slug: true, plan: true, brandColor: true, status: true, currency: true, settings: true } } },
     });
     if (!user) throw new UnauthorizedException();
     return this.sanitize(user);
@@ -652,6 +652,12 @@ export class AuthService {
       tenantPlan: user.tenant?.plan,
       tenantStatus: user.tenant?.status ?? null,
       tenantCurrency: (user.tenant as any)?.currency ?? 'USD',
+      // v26: shu kompaniyada AI (qo'ng'iroq transkripsiyasi + Claude
+      // tahlili) yoqilganmi — frontend shunga qarab AI bo'limlarini
+      // (badge, "AI tahlil" tugmasi, koching xulosasi) ko'rsatadi yoki
+      // yashiradi. O'CHIQ bo'lsa ham yozuv (recording)lar odatdagidek
+      // ko'rinadi — faqat AI ustama chiqmaydi.
+      tenantAiEnabled: (user.tenant as any)?.settings?.aiEnabled === true,
     };
   }
 }

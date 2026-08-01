@@ -83,6 +83,20 @@ export class CallsService {
   private get anthropicKey() {
     return (process.env.ANTHROPIC_API_KEY || '').trim();
   }
+
+  /**
+   * v26: AI (Whisper transkripsiya + Claude tahlil) — har bir kompaniya
+   * uchun ALOHIDA yoqilishi/o'chirilishi mumkin bo'lgan PULLIK qo'shimcha
+   * xizmat (Platform Owner "Kompaniyalar" jadvalidan boshqaradi,
+   * `tenant.settings.aiEnabled`). O'CHIQ bo'lgan kompaniyalarda
+   * qo'ng'iroqlar baribir yoziladi (recordingUrl saqlanadi, tinglash
+   * mumkin) — lekin Whisper/Claude'ga umuman so'rov ketmaydi, demak
+   * o'sha kompaniya uchun AI xarajati SIFR bo'ladi.
+   */
+  private async isAiEnabledForTenant(tenantId: string): Promise<boolean> {
+    const tenant = await this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { settings: true } });
+    return (tenant?.settings as any)?.aiEnabled === true;
+  }
   /**
    * XARAJATNI KAMAYTIRISH (v29, mustahkamlandi v36): standart model —
    * ARZONROQ Haiku. Bu qo'ng'iroq TAHLILI eng KO'P chaqiriladigan AI
@@ -186,6 +200,14 @@ export class CallsService {
     if (!this.anthropicKey) {
       throw new BadRequestException(
         "AI tahlil sozlanmagan. Serverda ANTHROPIC_API_KEY o'rnatilmagan.",
+      );
+    }
+    // v26: bu kompaniyada AI xizmati o'chiq bo'lsa — tahlil qilinmaydi
+    // (faqat yozuv/recording xizmati bor). Ichki (cron) chaqiruvda ham,
+    // qo'lda "AI" tugmasi bosilganda ham baravar amal qiladi.
+    if (!(await this.isAiEnabledForTenant(tenantId))) {
+      throw new BadRequestException(
+        "Bu kompaniyada AI tahlil xizmati yoqilmagan. Yoqish uchun platforma administratoriga murojaat qiling.",
       );
     }
 
@@ -520,6 +542,13 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
    * (`retryAi`) shu metoddan foydalanadi.
    */
   private async processAiPipelineForCall(callId: string, tenantId: string, recordingUrl: string) {
+    // v26: AI bu kompaniyada sotib olinmagan/o'chirilgan bo'lsa — Whisper
+    // transkripsiyasiga ham, Claude tahliliga ham UMUMAN so'rov ketmaydi
+    // (bu — cron orqali AVTOMATIK chaqiriladigan yagona joy, shuning
+    // uchun xarajatni butunlay to'xtatish uchun eng to'g'ri nuqta).
+    // `Call.aiError`ga yozmaymiz — bu xato emas, shunchaki xizmat yo'q,
+    // yozuv (recording) esa baribir odatdagidek mavjud va tinglanadi.
+    if (!(await this.isAiEnabledForTenant(tenantId))) return;
     try {
       const { text, error, transient } = await this.transcription.transcribeFromUrl(recordingUrl);
       if (!text) {
@@ -569,6 +598,11 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
     if (!call) throw new NotFoundException("Qo'ng'iroq topilmadi");
     await this.assertCallOwnership(tenantId, userId, call.agentId);
     if (!call.recordingUrl) throw new BadRequestException("Bu qo'ng'iroqda audio yozuv yo'q");
+    if (!(await this.isAiEnabledForTenant(tenantId))) {
+      throw new BadRequestException(
+        "Bu kompaniyada AI tahlil xizmati yoqilmagan. Yoqish uchun platforma administratoriga murojaat qiling.",
+      );
+    }
 
     await this.prisma.call.update({
       where: { id: callId },

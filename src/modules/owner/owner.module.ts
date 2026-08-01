@@ -81,7 +81,10 @@ export class OwnerService {
       },
       orderBy: { createdAt: 'desc' },
     });
-    return tenants;
+    // v26: har bir kompaniya uchun `aiEnabled`ni tekis (top-level) maydon
+    // sifatida ham qaytaramiz — frontend `settings` JSON ichiga kirmasdan
+    // to'g'ridan-to'g'ri `c.aiEnabled` deb o'qiy oladi.
+    return tenants.map((t: any) => ({ ...t, aiEnabled: (t.settings as any)?.aiEnabled === true }));
   }
 
   async getCompany(id: string) {
@@ -93,12 +96,12 @@ export class OwnerService {
       },
     });
     if (!tenant) throw new NotFoundException('Topilmadi');
-    return tenant;
+    return { ...tenant, aiEnabled: (tenant.settings as any)?.aiEnabled === true };
   }
 
   async createCompany(data: {
     name: string; slug: string; adminName: string; adminEmail: string;
-    adminPassword: string; plan?: string;
+    adminPassword: string; plan?: string; aiEnabled?: boolean;
   }) {
     if (!data.name?.trim()) throw new BadRequestException('name majburiy');
     if (!data.slug?.trim()) throw new BadRequestException('slug majburiy');
@@ -135,6 +138,12 @@ export class OwnerService {
           maxClients: limits.clients,
           maxBookings: limits.bookings,
           leadAssignmentStrategy: 'ROUND_ROBIN' as any,
+          // v26: AI (transkripsiya + Claude tahlil) — PULLIK QO'SHIMCHA XIZMAT.
+          // Yangi kompaniya yaratilganda owner o'zi belgilaydi: agar
+          // belgilanmasa, standart holatda O'CHIQ (faqat yozuv/recording
+          // bo'ladi, AI xarajat qilinmaydi). Owner istalgan vaqt
+          // "Kompaniyalar" jadvalidan yoqib/o'chirib qo'ya oladi.
+          settings: { aiEnabled: data.aiEnabled === true },
         },
       });
 
@@ -169,6 +178,23 @@ export class OwnerService {
     });
   }
 
+  // v26: Owner panelidan bitta kompaniyaga AI (transkripsiya + Claude
+  // tahlil)ni yoqish/o'chirish. O'CHIQ bo'lsa — o'sha kompaniyada
+  // qo'ng'iroqlar FAQAT yozuv (recording) sifatida saqlanadi, Whisper/
+  // Claude'ga umuman so'rov ketmaydi (xarajat sarflanmaydi). Bu holat
+  // `calls.module.ts`dagi `analyzeCall` va `processAiPipelineForCall`
+  // metodlarida tekshiriladi.
+  async setAiEnabled(id: string, aiEnabled: boolean) {
+    const tenant = await this.prisma.tenant.findUnique({ where: { id }, select: { settings: true } });
+    if (!tenant) throw new NotFoundException("Kompaniya topilmadi");
+    const settings: any = (tenant.settings as any) || {};
+    return this.prisma.tenant.update({
+      where: { id },
+      data: { settings: { ...settings, aiEnabled: !!aiEnabled } },
+      select: { id: true, name: true, settings: true },
+    });
+  }
+
   // v9-FINAL: Kompaniya nomi, plan, lokatsiya'sini o'zgartirish
   async updateCompany(id: string, data: {
     name?: string;
@@ -180,6 +206,7 @@ export class OwnerService {
     phone?: string;
     email?: string;
     website?: string;
+    aiEnabled?: boolean;
   }) {
     const tenant = await this.prisma.tenant.findUnique({ where: { id } });
     if (!tenant) throw new NotFoundException("Kompaniya topilmadi");
@@ -194,11 +221,17 @@ export class OwnerService {
     if (data.phone !== undefined) updateData.phone = data.phone;
     if (data.email !== undefined) updateData.email = data.email;
     if (data.website !== undefined) updateData.website = data.website;
+    // v26: AI yoqilgan/o'chirilganini ham shu umumiy tahrirlash orqali
+    // o'zgartirish mumkin (settings JSON ichida saqlanadi).
+    if (data.aiEnabled !== undefined) {
+      const settings: any = (tenant.settings as any) || {};
+      updateData.settings = { ...settings, aiEnabled: !!data.aiEnabled };
+    }
 
     return this.prisma.tenant.update({
       where: { id },
       data: updateData,
-      select: { id: true, name: true, status: true, plan: true },
+      select: { id: true, name: true, status: true, plan: true, settings: true },
     });
   }
 
@@ -285,6 +318,13 @@ export class OwnerController {
   @Patch('companies/:id/status')
   status(@Param('id') id: string, @Body() body: any) {
     return this.svc.setStatus(id, body.status);
+  }
+
+  // v26: bitta bosishda kompaniyaga AI (transkripsiya + tahlil)ni
+  // yoqish/o'chirish — status select'iga o'xshab ishlaydi.
+  @Patch('companies/:id/ai')
+  setAi(@Param('id') id: string, @Body() body: any) {
+    return this.svc.setAiEnabled(id, !!body.aiEnabled);
   }
 
   // v9-FINAL: Kompaniyani to'liq tahrirlash (nom, plan, lokatsiya)
