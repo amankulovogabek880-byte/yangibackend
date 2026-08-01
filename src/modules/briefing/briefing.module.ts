@@ -83,6 +83,20 @@ export class BriefingService {
 
   /** Asosiy kirish nuqtasi: keshdan qaytaradi yoki yangi generatsiya qiladi */
   async getBriefing(tenantId: string, userId: string, role: string, force = false) {
+    // v27: "Bugungi ustuvorlik" kartasi ham Claude'ga so'rov yuboradi —
+    // bu kompaniyada AI xizmati o'chiq bo'lsa, bu yerda ham UMUMAN
+    // so'rov ketmasligi kerak (token sarflanmasligi uchun). Frontend
+    // buni butunlay yashiradi, lekin API to'g'ridan-to'g'ri chaqirilsa
+    // ham (masalan eski keshlangan sahifa) himoyalangan bo'lishi kerak.
+    const tenant = await this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { settings: true } });
+    if ((tenant?.settings as any)?.aiEnabled !== true) {
+      return {
+        disabled: true,
+        error: 'AI bu kompaniyada yoqilmagan.',
+        items: [], weakSpot: null, greeting: null, generatedAt: new Date(), cached: false,
+      };
+    }
+
     const isAgent = role === 'AGENT';
     const agentId = isAgent ? userId : null; // admin/manager -> jamoaviy (agentId: null)
     const date = this.todayKey();
