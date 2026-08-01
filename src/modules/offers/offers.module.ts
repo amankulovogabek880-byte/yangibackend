@@ -126,6 +126,7 @@ export class OffersService {
       includesHotel: data.includesHotel !== false,
       includesTransfer: data.includesTransfer || false,
       includesInsurance: data.includesInsurance || false,
+      includesExcursion: data.includesExcursion || false,
       notes: data.notes || null,
       // v14: taklifga havola (Booking.com va h.k.) — mijozga yuborilganda Telegram
       // avtomatik preview qiladi. URL to'g'ri formatda bo'lsagina saqlaymiz.
@@ -196,6 +197,7 @@ export class OffersService {
     if (offer.includesTransfer) includes.push('🚐 Transfer');
     if (offer.includesVisa) includes.push('🛂 Viza yordami');
     if (offer.includesInsurance) includes.push('🛡 Sug\'urta');
+    if (offer.includesExcursion) includes.push('🗺️ Ekskursiya');
     if (includes.length) {
       lines.push('✅ Narxga kiradi:');
       for (const i of includes) lines.push(`   • ${i}`);
@@ -308,6 +310,7 @@ export class OffersService {
       includesHotel: data.includesHotel ?? existing.includesHotel,
       includesTransfer: data.includesTransfer ?? existing.includesTransfer,
       includesInsurance: data.includesInsurance ?? existing.includesInsurance,
+      includesExcursion: data.includesExcursion ?? existing.includesExcursion,
       notes: data.notes ?? existing.notes,
     });
 
@@ -385,6 +388,7 @@ export class OffersService {
       includesHotel: data.includesHotel !== false,
       includesTransfer: !!data.includesTransfer,
       includesInsurance: !!data.includesInsurance,
+      includesExcursion: !!data.includesExcursion,
       notes: data.notes || '',
     };
 
@@ -580,6 +584,7 @@ export class OffersService {
       includesHotel: !!offer.includesHotel,
       includesTransfer: !!offer.includesTransfer,
       includesInsurance: !!offer.includesInsurance,
+      includesExcursion: !!offer.includesExcursion,
       notes: ov.notes || offer.notes || undefined,
       status: 'DRAFT',
     });

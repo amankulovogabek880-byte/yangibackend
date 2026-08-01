@@ -24,6 +24,7 @@ import type { WebhookEvent } from '../phone-providers/provider.interface';
 import { CallDirection, CallStatus } from '../../prisma-types';;
 import { FollowUpsModule, FollowUpsService } from '../followups/followups.module';
 import { TranscriptionModule, TranscriptionService } from '../transcription/transcription.module';
+import { CALL_SCORING_RUBRIC } from './call-scoring-rubric';
 
 // E'tiroz turlari — statistikani izchil yig'ish uchun yopiq ro'yxat
 // (Claude javobni shu kategoriyalardan birortasiga moslashtiradi)
@@ -83,20 +84,27 @@ export class CallsService {
     return (process.env.ANTHROPIC_API_KEY || '').trim();
   }
   /**
-   * XARAJATNI KAMAYTIRISH (v29): standart model endi ARZONROQ Haiku.
-   * DIQQAT: bu funksiya (qo'ng'iroq tahlili) sotuv bahosi, xato tahlili
-   * va "idealResponse" kabi nozikroq baholash ham beradi — Sonnet'ga
-   * qaraganda Haiku biroz sodda tahlil berishi mumkin. Agar tahlil
-   * sifati (masalan `mistakes`/`overallScore`) yetarli chuqur chiqmasa,
-   * .env'da FAQAT shu funksiya uchun ANTHROPIC_MODEL_CALLS=claude-sonnet-5
-   * qo'shish kifoya — kodga tegish shart emas.
+   * XARAJATNI KAMAYTIRISH (v29, mustahkamlandi v36): standart model —
+   * ARZONROQ Haiku. Bu qo'ng'iroq TAHLILI eng KO'P chaqiriladigan AI
+   * funksiya (har bir qo'ng'iroqdan keyin avtomatik ishlaydi), shuning
+   * uchun narx bu yerda eng muhim.
+   *
+   * ⚠️ MUHIM (v36 TUZATISH): ilgari bu yerda `process.env.ANTHROPIC_MODEL`
+   * (umumiy, boshqa modullar — masalan kunlik brifing — bilan BIRGA
+   * ishlatiladigan) ham "zaxira" sifatida o'qilardi. Bu XATARLI edi: agar
+   * boshqa funksiya uchun (masalan brifing sifatini oshirish uchun)
+   * .env'ga umumiy `ANTHROPIC_MODEL=claude-sonnet-5` qo'yilsa, bu HAR BIR
+   * qo'ng'iroq tahliliga ham "sezilmagan holda" qimmat Sonnet modelini
+   * ishlatib yuborardi — aynan shu narsa kutilmagan yuqori xarajatning
+   * (masalan 1 soatda $1+ ) eng ehtimoliy sababi bo'lishi mumkin.
+   *
+   * ENDI: faqat shu funksiyaga xos `ANTHROPIC_MODEL_CALLS` o'qiladi.
+   * Boshqa hech qanday umumiy o'zgaruvchi buni endi o'zgartira olmaydi —
+   * qo'ng'iroq tahlili har doim Haiku bilan ishlaydi, agar siz ANIQ shu
+   * nom bilan (`ANTHROPIC_MODEL_CALLS`) boshqacha model ko'rsatmasangiz.
    */
   private get anthropicModel() {
-    return (
-      process.env.ANTHROPIC_MODEL_CALLS ||
-      process.env.ANTHROPIC_MODEL ||
-      'claude-haiku-4-5-20251001'
-    ).trim();
+    return (process.env.ANTHROPIC_MODEL_CALLS || 'claude-haiku-4-5-20251001').trim();
   }
   isAiConfigured(): boolean {
     return !!this.anthropicKey;
@@ -201,17 +209,19 @@ export class CallsService {
 
     const system = `Sen O'zbekistondagi sayohat agentligi uchun ishlaydigan, ko'p yillik tajribaga ega sotuv menejeri va call-markaz auditorisan. Senga agent va mijoz o'rtasidagi telefon suhbati matni beriladi. Sen uni FAQAT matnga asoslanib, hech narsa to'qib chiqarmasdan tahlil qilasan. Har doim FAQAT o'zbek tilida, lotin alifbosida yozasan.
 
+${CALL_SCORING_RUBRIC}
+
 Qattiq qoidalar:
 1. Xulosa (summary) 2-3 gapdan oshmasin: mijoz nima haqida so'radi, qanday e'tiroz/shubha bildirdi, keyingi qadam nima bo'lishi kerak.
 2. E'tirozlarni FAQAT quyidagi kategoriyalardan tanlab belgila (agar suhbatda e'tiroz bo'lmasa — bo'sh massiv qaytar):
 ${categoriesList}
 3. Har bir e'tiroz uchun mijozning aslidagi gapiga yaqin qisqa "quote" ber (matndan, 15 so'zdan oshmasin).
 4. Keyingi qadam (nextAction) — aniq, bajarish mumkin bo'lgan harakat bo'lsin (masalan "3 kundan keyin narx bo'yicha qayta bog'laning va 5% chegirma taklif qiling"), daysUntilDue — necha kundan keyin bajarilishi kerakligi (1-14 oralig'ida butun son).
-5. Agent feedback — agentning gaplashish sifatini xolisona baholaysan (1-10 ball): savol berish, tinglash, e'tirozga javob berish, yakunlash ko'nikmalari. Kuchli va yaxshilash kerak bo'lgan tomonlarni QISQA (har biri 1 jumla) ko'rsat. Haqoratli emas, konstruktiv bo'l.
+5. Agent feedback — yuqoridagi "AI QAYSI NUQTALAR BO'YICHA BAHOLASHI KERAK" bo'limidagi 6 ta mezonga qarab, agentning gaplashish sifatini xolisona (1-10 ball) baholaysan. Kuchli va yaxshilash kerak bo'lgan tomonlarni QISQA (har biri 1 jumla) ko'rsat. Haqoratli emas, konstruktiv bo'l.
 6. Sotuvga yaqinlik (saleReadiness) — mijoz sotib olishga qanchalik yaqinligini 1-10 ballda baholaysan (1 = umuman qiziqmadi, 10 = deyarli rozi bo'ldi/to'lovga tayyor). missedInfo — agent aytishi kerak bo'lib, aytmay qoldirgan MUHIM ma'lumot bo'lsa qisqa yoz (masalan narx, sana, hujjatlar), bo'lmasa bo'sh qoldir. whatWouldClose — mijozni aynan nima ishontirib, sotuvni yakunlagan bo'lardi (1 qisqa, aniq jumla).
 7. bestPhrase — agent ayntan shu suhbatda ishlatgan ENG KUCHLI/samarali gap yoki so'z birikmasi bo'lsa, uni AYNAN o'sha holicha (quote) ko'rsat (masalan mijozni ishontirgan yoki e'tirozni yaxshi yopgan gap). Bunday gap yo'q bo'lsa — bo'sh qoldir, o'ylab topma.
 8. Agar suhbat juda qisqa yoki mazmunsiz bo'lsa (masalan javob bermadi), buni halol yoz — o'ylab topma.
-9. overallScore — suhbatning umumiy sifatini 0-100 ballda baho (agent ko'nikmasi + mijozning qiziqishi + natija birgalikda hisobga olinadi; bu feedback.score'dan mustaqil, umumiyroq ko'rsatkich).
+9. overallScore — "MUKAMMAL SUHBAT" bo'limiga qanchalik yaqin bo'lganiga qarab, suhbatning umumiy sifatini 0-100 ballda baho (agent ko'nikmasi + mijozning qiziqishi + natija birgalikda hisobga olinadi; bu feedback.score'dan mustaqil, umumiyroq ko'rsatkich).
 10. churnRisk — ushbu mijozni butunlay yo'qotish xavfini 0-100% da baho (0 = xavf yo'q, 100 = deyarli aniq ketadi) — mijozning kayfiyati, e'tirozlari va javob berish tezligiga qarab.
 11. saleProbability — mijoz YAQIN ORADA (masalan 30 kun ichida) sotib olish ehtimolini 0-100% da baho.
 12. mistakes — agent yo'l qo'ygan ENG MUHIM xatolar ro'yxati (ko'pi bilan 5 ta, kam bo'lsa kamroq, umuman bo'lmasa bo'sh massiv). Har biri: { "mistake": "agent nima xato qildi (1 qisqa jumla)", "idealResponse": "agent o'rniga aynan qanday gapirishi/javob berishi kerak edi (tayyor, ishlatsa bo'ladigan gap)" }. O'ylab topma — faqat suhbatda haqiqatan sodir bo'lgan narsalarga asoslan.

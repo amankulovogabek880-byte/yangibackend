@@ -170,6 +170,7 @@ export class BookingsService {
         includesMeals: !!data.includesMeals,
         includesTransfer: !!data.includesTransfer,
         includesInsurance: !!data.includesInsurance,
+        includesExcursion: !!data.includesExcursion,
 
         // Hotel
         hotelName: data.hotelName,

@@ -410,17 +410,41 @@ export class ClientsService {
   // v14: mijozga ixtiyoriy "key = value" ma'lumotlar. preferences.customFields
   // ichida saqlanadi. MAVJUD preferences (offers/travelInfo) bilan birlashtiriladi —
   // hech narsa yo'qolmaydi. fields = [{ key, value }, ...]
+  //
+  // v35: Maydon NOMLARINI (savollarni) faqat ADMIN/MANAGER belgilay oladi va
+  // o'zgartira oladi — qo'shish, o'chirish, qayta nomlash shu rollarga xos.
+  // AGENT esa faqat MAVJUD maydonlarning QIYMATINI (javobini) to'ldira oladi;
+  // uning so'rovida kelgan yangi/o'zgartirilgan `key`lar e'tiborga olinmaydi,
+  // shunda frontenddagi cheklov chetlab o'tilsa ham (masalan to'g'ridan-to'g'ri
+  // API chaqiruvi orqali) server tomonda himoya saqlanib qoladi.
   async setCustomFields(tenantId: string, id: string, userId: string, role: string, fields: any) {
     await this.findOne(tenantId, id, userId, role);
     const client = await this.prisma.client.findFirst({ where: { id, tenantId } });
     if (!client) throw new NotFoundException('Mijoz topilmadi');
     const prefs: any = (client as any).preferences || {};
-    prefs.customFields = Array.isArray(fields)
+    const submitted: { key: string; value: string }[] = Array.isArray(fields)
       ? fields
           .filter((f: any) => f && (f.key || f.value))
           .map((f: any) => ({ key: String(f.key || '').slice(0, 100), value: String(f.value || '').slice(0, 500) }))
           .slice(0, 50)
       : [];
+
+    const isAdmin = role !== 'AGENT';
+    if (isAdmin) {
+      // Admin/manager: to'liq erkin — maydon qo'shish, o'chirish, nomini
+      // o'zgartirish, qiymatini o'zgartirish — hammasi ruxsat etilgan.
+      prefs.customFields = submitted;
+    } else {
+      // Agent: faqat MAVJUD maydonlarning qiymatini to'ldira oladi. Nomlar
+      // (savollar) tuzilmasi — soni, tartibi, matni — o'zgarishsiz qoladi.
+      const existing: { key: string; value: string }[] = Array.isArray(prefs.customFields) ? prefs.customFields : [];
+      const submittedByKey = new Map(submitted.map((f) => [f.key, f.value]));
+      prefs.customFields = existing.map((f) => ({
+        key: f.key,
+        value: submittedByKey.has(f.key) ? (submittedByKey.get(f.key) as string) : f.value,
+      }));
+    }
+
     await this.prisma.client.update({ where: { id }, data: { preferences: prefs } });
     return { ok: true, customFields: prefs.customFields };
   }

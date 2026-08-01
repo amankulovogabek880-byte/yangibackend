@@ -1527,98 +1527,101 @@ export class ReportsService {
     // AGENT KESIMIDA (o'rtacha bahosi, eng ko'p uchragan e'tirozi, kayfiyat
     // taqsimoti). Foydalanuvchi so'ragan "qaysi hodim qanchalik ishlayotgani,
     // nega sotolmayapti" — aynan shu agent-darajasidagi AI tahlil.
-    // Faqat bitta agentga filtr qilinmagan bo'lsa (ya'ni admin/manager
-    // BARCHASINI ko'rayotganda) hisoblanadi.
-    let byAgent: any[] | undefined;
-    if (!agentId) {
-      const rows = await this.prisma.call.findMany({
-        where,
-        select: {
-          agentId: true, status: true, duration: true, recordingUrl: true,
-          aiAnalyzedAt: true, aiObjections: true, aiSentiment: true, aiFeedback: true,
-          agent: { select: { id: true, name: true } },
-        },
-      });
-      const agentMap: Record<string, {
-        agentId: string; agentName: string; totalCalls: number; answered: number;
-        totalDurationSec: number; recordingsCount: number;
-        aiAnalyzedCount: number; aiScoreSum: number; aiScoreN: number;
-        aiObjectionCounts: Record<string, { category: string; label: string; count: number }>;
-        aiSentiment: { positive: number; neutral: number; negative: number };
-        bestPhrases: string[]; missedInfos: string[]; whatWouldCloseList: string[]; improvements: string[];
-        saleReadinessSum: number; saleReadinessN: number;
-      }> = {};
-      for (const c of rows) {
-        const aId = c.agentId || 'unassigned';
-        const aName = c.agent?.name || "Agentsiz";
-        if (!agentMap[aId]) {
-          agentMap[aId] = {
-            agentId: aId, agentName: aName, totalCalls: 0, answered: 0,
-            totalDurationSec: 0, recordingsCount: 0,
-            aiAnalyzedCount: 0, aiScoreSum: 0, aiScoreN: 0,
-            aiObjectionCounts: {},
-            aiSentiment: { positive: 0, neutral: 0, negative: 0 },
-            bestPhrases: [], missedInfos: [], whatWouldCloseList: [], improvements: [],
-            saleReadinessSum: 0, saleReadinessN: 0,
-          };
-        }
-        const entry = agentMap[aId];
-        entry.totalCalls++;
-        if (c.status === 'COMPLETED') entry.answered++;
-        entry.totalDurationSec += c.duration || 0;
-        if (c.recordingUrl) entry.recordingsCount++;
+    //
+    // v23 TUZATISH: ilgari bu FAQAT `agentId` berilmaganda (ya'ni admin
+    // BARCHA agentlarni ko'rayotganda) hisoblanardi — agar bitta agentga
+    // filtr qilingan bo'lsa (masalan agent o'zining "Qo'ng'iroqlarim"
+    // sahifasini ochsa, backend uni avtomatik o'z ID'siga filtrlaydi),
+    // `byAgent` UMUMAN QAYTMASDI — shu sabab agent o'zining yozuvlari va
+    // koching (AI feedback) xulosasini HECH QACHON ko'RA OLMASDI. Endi
+    // har doim hisoblanadi — `where` allaqachon to'g'ri agentga filtrlangan
+    // bo'lsa, natijada shunchaki 1 ta agent chiqadi.
+    const rows = await this.prisma.call.findMany({
+      where,
+      select: {
+        agentId: true, status: true, duration: true, recordingUrl: true,
+        aiAnalyzedAt: true, aiObjections: true, aiSentiment: true, aiFeedback: true,
+        agent: { select: { id: true, name: true } },
+      },
+    });
+    const agentMap: Record<string, {
+      agentId: string; agentName: string; totalCalls: number; answered: number;
+      totalDurationSec: number; recordingsCount: number;
+      aiAnalyzedCount: number; aiScoreSum: number; aiScoreN: number;
+      aiSaleReadinessSum: number; aiSaleReadinessN: number;
+      aiObjectionCounts: Record<string, { category: string; label: string; count: number }>;
+      aiSentiment: { positive: number; neutral: number; negative: number };
+      aiBestPhrases: string[]; aiMissedInfos: string[]; aiImprovements: string[]; aiWhatWouldClose: string[];
+    }> = {};
+    for (const c of rows) {
+      const aId = c.agentId || 'unassigned';
+      const aName = c.agent?.name || "Agentsiz";
+      if (!agentMap[aId]) {
+        agentMap[aId] = {
+          agentId: aId, agentName: aName, totalCalls: 0, answered: 0,
+          totalDurationSec: 0, recordingsCount: 0,
+          aiAnalyzedCount: 0, aiScoreSum: 0, aiScoreN: 0,
+          aiSaleReadinessSum: 0, aiSaleReadinessN: 0,
+          aiObjectionCounts: {},
+          aiSentiment: { positive: 0, neutral: 0, negative: 0 },
+          aiBestPhrases: [], aiMissedInfos: [], aiImprovements: [], aiWhatWouldClose: [],
+        };
+      }
+      const entry = agentMap[aId];
+      entry.totalCalls++;
+      if (c.status === 'COMPLETED') entry.answered++;
+      entry.totalDurationSec += c.duration || 0;
+      if (c.recordingUrl) entry.recordingsCount++;
 
-        if ((c as any).aiAnalyzedAt) {
-          entry.aiAnalyzedCount++;
-          const fb = (c as any).aiFeedback as any;
-          if (fb?.score) { entry.aiScoreSum += Number(fb.score); entry.aiScoreN++; }
-          // v22: koching (o'qitish) uchun — agent ishlatgan eng kuchli gaplar,
-          // aytmay qoldirgan ma'lumotlar, mijozni yakunlashi mumkin bo'lgan
-          // takliflar va yaxshilash kerak nuqtalar — HAR BIR qo'ng'iroqdan
-          // emas, endi AGENT DARAJASIDA jamlab ko'rsatiladi.
-          if (fb?.bestPhrase) entry.bestPhrases.push(fb.bestPhrase);
-          if (fb?.saleReadiness?.missedInfo) entry.missedInfos.push(fb.saleReadiness.missedInfo);
-          if (fb?.saleReadiness?.whatWouldClose) entry.whatWouldCloseList.push(fb.saleReadiness.whatWouldClose);
-          if (fb?.saleReadiness?.score) { entry.saleReadinessSum += Number(fb.saleReadiness.score); entry.saleReadinessN++; }
-          if (Array.isArray(fb?.improvements)) entry.improvements.push(...fb.improvements);
-          const sentiment = (c as any).aiSentiment as string | null;
-          if (sentiment && sentiment in entry.aiSentiment) (entry.aiSentiment as any)[sentiment]++;
-          const objList = (c as any).aiObjections as any[] | null;
-          if (Array.isArray(objList)) {
-            for (const o of objList) {
-              if (!o?.category) continue;
-              if (!entry.aiObjectionCounts[o.category]) {
-                entry.aiObjectionCounts[o.category] = { category: o.category, label: OBJECTION_CATEGORIES[o.category] || o.category, count: 0 };
-              }
-              entry.aiObjectionCounts[o.category].count++;
+      if ((c as any).aiAnalyzedAt) {
+        entry.aiAnalyzedCount++;
+        const fb = (c as any).aiFeedback as any;
+        if (fb?.score) { entry.aiScoreSum += Number(fb.score); entry.aiScoreN++; }
+        if (fb?.saleReadiness?.score) { entry.aiSaleReadinessSum += Number(fb.saleReadiness.score); entry.aiSaleReadinessN++; }
+        if (fb?.bestPhrase && entry.aiBestPhrases.length < 5) entry.aiBestPhrases.push(fb.bestPhrase);
+        if (fb?.saleReadiness?.missedInfo && entry.aiMissedInfos.length < 5) entry.aiMissedInfos.push(fb.saleReadiness.missedInfo);
+        if (fb?.saleReadiness?.whatWouldClose && entry.aiWhatWouldClose.length < 5) entry.aiWhatWouldClose.push(fb.saleReadiness.whatWouldClose);
+        if (Array.isArray(fb?.improvements)) {
+          for (const imp of fb.improvements) {
+            if (imp && entry.aiImprovements.length < 5) entry.aiImprovements.push(imp);
+          }
+        }
+        const sentiment = (c as any).aiSentiment as string | null;
+        if (sentiment && sentiment in entry.aiSentiment) (entry.aiSentiment as any)[sentiment]++;
+        const objList = (c as any).aiObjections as any[] | null;
+        if (Array.isArray(objList)) {
+          for (const o of objList) {
+            if (!o?.category) continue;
+            if (!entry.aiObjectionCounts[o.category]) {
+              entry.aiObjectionCounts[o.category] = { category: o.category, label: OBJECTION_CATEGORIES[o.category] || o.category, count: 0 };
             }
+            entry.aiObjectionCounts[o.category].count++;
           }
         }
       }
-      byAgent = Object.values(agentMap)
-        .map((a) => {
-          const sortedObj = Object.values(a.aiObjectionCounts).sort((x, y) => y.count - x.count);
-          return {
-            agentId: a.agentId,
-            agentName: a.agentName,
-            totalCalls: a.totalCalls,
-            answered: a.answered,
-            totalDurationSec: a.totalDurationSec,
-            recordingsCount: a.recordingsCount,
-            aiAnalyzedCount: a.aiAnalyzedCount,
-            aiAvgScore: a.aiScoreN > 0 ? Math.round((a.aiScoreSum / a.aiScoreN) * 10) / 10 : null,
-            aiTopObjection: sortedObj[0] || null,
-            aiSentiment: a.aiSentiment,
-            // v22: koching paneli uchun — oxirgi 5 tasi
-            aiAvgSaleReadiness: a.saleReadinessN > 0 ? Math.round((a.saleReadinessSum / a.saleReadinessN) * 10) / 10 : null,
-            aiBestPhrases: a.bestPhrases.slice(-5),
-            aiMissedInfos: a.missedInfos.slice(-5),
-            aiWhatWouldClose: a.whatWouldCloseList.slice(-5),
-            aiImprovements: a.improvements.slice(-5),
-          };
-        })
-        .sort((a, b) => b.totalDurationSec - a.totalDurationSec);
     }
+    const byAgent = Object.values(agentMap)
+      .map((a) => {
+        const sortedObj = Object.values(a.aiObjectionCounts).sort((x, y) => y.count - x.count);
+        return {
+          agentId: a.agentId,
+          agentName: a.agentName,
+          totalCalls: a.totalCalls,
+          answered: a.answered,
+          totalDurationSec: a.totalDurationSec,
+          recordingsCount: a.recordingsCount,
+          aiAnalyzedCount: a.aiAnalyzedCount,
+          aiAvgScore: a.aiScoreN > 0 ? Math.round((a.aiScoreSum / a.aiScoreN) * 10) / 10 : null,
+          aiAvgSaleReadiness: a.aiSaleReadinessN > 0 ? Math.round((a.aiSaleReadinessSum / a.aiSaleReadinessN) * 10) / 10 : null,
+          aiTopObjection: sortedObj[0] || null,
+          aiSentiment: a.aiSentiment,
+          aiBestPhrases: a.aiBestPhrases,
+          aiMissedInfos: a.aiMissedInfos,
+          aiImprovements: a.aiImprovements,
+          aiWhatWouldClose: a.aiWhatWouldClose,
+        };
+      })
+      .sort((a, b) => b.totalDurationSec - a.totalDurationSec);
 
     // v15: AI tahlil qilingan qo'ng'iroqlar — e'tirozlar va agent baholari
     const analyzed = await this.prisma.call.findMany({
@@ -1654,7 +1657,7 @@ export class ReportsService {
     return {
       summary: { total, answered, noAnswer: total - answered, conversionRate: total > 0 ? Math.round(answered / total * 100) : 0 },
       byDay: Object.values(byDayMap),
-      ...(byAgent ? { byAgent } : {}),
+      byAgent,
       aiAnalytics: {
         analyzedCount: analyzed.length,
         objections: sortedObjections,

@@ -780,6 +780,7 @@ model Booking {
   includesMeals   Boolean @default(false)
   includesTransfer Boolean @default(false)
   includesInsurance Boolean @default(false)
+  includesExcursion Boolean @default(false)
 
   // ── HOTEL ──
   hotelName    String?
