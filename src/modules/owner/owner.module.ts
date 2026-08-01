@@ -8,6 +8,7 @@ import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser, Roles } from '../../common/decorators';
 import { hashPassword } from '../auth/auth.service';
 import { BackupService } from '../backup/backup.service';
+import { TranscriptionModule, TranscriptionService } from '../transcription/transcription.module';
 import { safeEnum } from '../../common/utils/helpers';
 import { TenantStatus, SubscriptionPlan } from '../../prisma-types';;
 
@@ -303,6 +304,7 @@ export class OwnerController {
   constructor(
     private svc: OwnerService,
     private backup: BackupService,
+    private transcription: TranscriptionService,
   ) {}
 
   @Get('stats')
@@ -358,9 +360,29 @@ export class OwnerController {
   recentLogins(@Query('limit') limit?: string) {
     return this.svc.getRecentLogins(limit ? parseInt(limit) : 50);
   }
+
+  /**
+   * v37: Ovozni-matnga o'girish (STT) uchun qaysi provayder "asosiy"
+   * ekanini ko'rish/o'zgartirish — GROQ (arzon) yoki OPENAI. Ikkalasi
+   * ham .env'da kaliti bo'lsa, ishlamay qolgani o'rniga avtomatik
+   * ikkinchisiga o'tiladi (zaxira sifatida).
+   */
+  @Get('stt-provider')
+  getSttProvider() {
+    return this.transcription.getSttProviderSetting();
+  }
+
+  @Patch('stt-provider')
+  setSttProvider(@Body() body: { provider: 'groq' | 'openai' }) {
+    if (body.provider !== 'groq' && body.provider !== 'openai') {
+      throw new BadRequestException('provider "groq" yoki "openai" bo\'lishi kerak');
+    }
+    return this.transcription.setSttProvider(body.provider);
+  }
 }
 
 @Module({
+  imports: [TranscriptionModule],
   controllers: [OwnerController],
   providers: [OwnerService, BackupService],
 })

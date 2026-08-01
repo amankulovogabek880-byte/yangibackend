@@ -471,7 +471,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
     // Endi: konfiguratsiya yo'q bo'lsa ham, navbatdagi qo'ng'iroqlarga
     // ANIQ sabab yoziladi (`Call.aiError`) — bu UI'da ko'rinadi.
     const missingConfig: string[] = [];
-    if (!this.transcription.isConfigured()) missingConfig.push("OPENAI_API_KEY (Whisper — audio matnga o'girish uchun)");
+    if (!this.transcription.isConfigured()) missingConfig.push("GROQ_API_KEY yoki OPENAI_API_KEY (audio matnga o'girish uchun)");
     if (!this.anthropicKey) missingConfig.push('ANTHROPIC_API_KEY (Claude — tahlil uchun)');
 
     // Faqat oxirgi 48 soatda tugagan, yozuvi bor, hali matni yo'q, hali

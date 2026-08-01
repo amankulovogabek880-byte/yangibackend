@@ -319,6 +319,20 @@ enum AutomationAction {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// PLATFORM SETTING — v37
+// ═══════════════════════════════════════════════════════════════
+// Butun platforma (barcha tenantlar) uchun umumiy, ish vaqtida
+// (restart/deploy qilmasdan) o'zgartirilishi mumkin bo'lgan
+// sozlamalar — key/value ko'rinishida. Masalan: qaysi ovozni-matnga
+// o'girish provayderi (Groq/OpenAI) ishlatilsin. Faqat PLATFORM_OWNER
+// roli o'zgartira oladi (owner.module.ts orqali).
+model PlatformSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+// ═══════════════════════════════════════════════════════════════
 // TENANT (Kompaniya)
 // ═══════════════════════════════════════════════════════════════
 
