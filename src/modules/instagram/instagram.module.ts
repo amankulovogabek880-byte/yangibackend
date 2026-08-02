@@ -16,6 +16,29 @@ import { EncryptionService } from '../../common/encryption/encryption.service';
 import { normalizePhone, phoneVariants } from '../../common/utils/helpers';
 import { swallow } from '../../common/utils/swallow';
 
+/**
+ * Instagram webhook imzosi uchun App Secret.
+ *
+ * TUZATILDI: bu joyda ilgari to'g'ridan-to'g'ri `process.env.INSTAGRAM_APP_SECRET`
+ * ishlatilardi. Lekin bu CRM'da Instagram uchun ALOHIDA OAuth oqimi yo'q —
+ * ulanish faqat FACEBOOK_APP_ID/SECRET orqali ("Facebook orqali ulash"
+ * tugmasi) amalga oshadi, ya'ni aksariyat foydalanuvchilarda Facebook va
+ * Instagram BITTA Meta App'da. `env.validation.ts` xuddi shu holat uchun
+ * `META_SINGLE_APP=true` bo'lsa FACEBOOK_APP_SECRET fallback sifatida
+ * ishlashini ogohlantirishida nazarda tutgan, lekin haqiqiy webhook
+ * tekshiruv kodi bu fallbackni amalga OSHIRMAGAN edi. Natijada
+ * INSTAGRAM_APP_SECRET sozlanmagan (yoki bo'sh) bo'lsa, `verifyMetaSignature`
+ * har doim "APP_SECRET sozlanmagan" deb JIMGINA 403 qaytarardi — Meta buni
+ * qayta-qayta urinib, oxiri tashlab yuborardi, va Instagram "ulangan" deb
+ * ko'rinsa ham DM'lar hech qachon Chat bo'limiga tushmasdi.
+ */
+function getInstagramAppSecret(): string | undefined {
+  const ig = process.env.INSTAGRAM_APP_SECRET;
+  if (ig) return ig;
+  if (process.env.META_SINGLE_APP === 'true') return process.env.FACEBOOK_APP_SECRET;
+  return undefined;
+}
+
 // Meta Graph API versiyasi — bitta joyda turadi.
 // Eskirsa (masalan v23 -> v25) faqat shu qatorni o'zgartiring.
 const GRAPH_API_VERSION = 'v23.0';
@@ -285,7 +308,7 @@ export class InstagramService {
     // (development'dagi META_WEBHOOK_SKIP_SIGNATURE production'da
     //  ishlamaydi — canSkipSignature() ichida qattiq shart bor).
     if (!canSkipSignature()) {
-      const sig = verifyMetaSignature(rawBody, signature, process.env.INSTAGRAM_APP_SECRET);
+      const sig = verifyMetaSignature(rawBody, signature, getInstagramAppSecret());
       if (!sig.ok) {
         this.logger.warn(`Instagram webhook RAD ETILDI: ${sig.reason}`);
         throw new ForbiddenException();
