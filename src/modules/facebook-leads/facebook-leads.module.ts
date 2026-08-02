@@ -1307,7 +1307,7 @@ export class FacebookLeadsService {
     }
   }
 
-  async getOAuthStartUrl(tenantId: string, userId?: string) {
+  async getOAuthStartUrl(tenantId: string, userId?: string, origin?: string) {
     const appId = process.env.FACEBOOK_APP_ID;
     const redirectUri = process.env.FACEBOOK_OAUTH_REDIRECT_URI;
     if (!appId || !redirectUri) {
@@ -1317,6 +1317,13 @@ export class FacebookLeadsService {
     }
 
     const nonce = crypto.randomBytes(16).toString('hex');
+
+    // Qaysi sozlamalar tab'idan ulanish boshlangani ('facebook' | 'instagram').
+    // TUZATILDI: ilgari bu umuman kuzatilmasdi va callback HAR DOIM
+    // `tab=facebook`ga qaytarardi — Instagram tab'idan "Facebook orqali
+    // ulash" bosilsa ham, foydalanuvchi Facebook Ads tab'ida qolib
+    // qolardi va Instagram ulanish holatini o'z ko'zi bilan ko'rmasdi.
+    const originTab = origin === 'instagram' ? 'instagram' : 'facebook';
 
     // Nonce foydalanuvchi bo'yicha saqlanadi — bir agentlikda ikki admin
     // bir vaqtda ulasa bir-birining oqimini buzmaydi.
@@ -1328,7 +1335,7 @@ export class FacebookLeadsService {
       },
     });
 
-    const state = this.signState({ tenantId, userId, nonce, ts: Date.now() });
+    const state = this.signState({ tenantId, userId, nonce, ts: Date.now(), origin: originTab });
     const scope = [
       'pages_show_list',
       'pages_read_engagement',
@@ -1363,14 +1370,20 @@ export class FacebookLeadsService {
     cookieNonce?: string,
   ): Promise<string> {
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
-    const redirectBase = `${frontendUrl}/settings?tab=facebook`;
+
+    // TUZATILDI: ilgari bu yerda `tab=facebook` qattiq yozilgan edi, shuning
+    // uchun Instagram tab'idan ulansa ham natija doim Facebook Ads tab'ida
+    // ko'rsatilardi. Endi `getOAuthStartUrl`da saqlangan `origin` state
+    // ichidan o'qib, foydalanuvchi boshlagan tab'ga aynan qaytariladi.
+    const payload = this.verifyState(state);
+    const originTab = payload?.origin === 'instagram' ? 'instagram' : 'facebook';
+    const redirectBase = `${frontendUrl}/settings?tab=${originTab}`;
 
     if (oauthError) {
       this.logger.warn(`Facebook OAuth: admin rad etdi yoki xato qaytdi: ${oauthError}`);
       return `${redirectBase}&fb=denied`;
     }
 
-    const payload = this.verifyState(state);
     if (!payload?.tenantId) {
       this.logger.warn("Facebook OAuth: 'state' yaroqsiz yoki muddati o'tgan");
       return `${redirectBase}&fb=error`;
@@ -1510,14 +1523,20 @@ export class FacebookLeadsService {
           pageName: pages[0].name,
         });
         // Instagram DM ham shu bitta tugma orqali ulanadi
-        await this.instagram
-          .saveConfig(payload.tenantId, {
+        let instagramConnected = false;
+        let instagramError = '';
+        try {
+          await this.instagram.saveConfig(payload.tenantId, {
             accessToken: pages[0].access_token,
             pageId: pages[0].id,
-          })
-          .catch((e: any) =>
-            this.logger.warn(`Instagram ulanmadi (Facebook ishlayapti): ${e?.message}`),
-          );
+          });
+          instagramConnected = true;
+        } catch (e: any) {
+          instagramError = e?.message || '';
+          this.logger.warn(`Instagram ulanmadi (Facebook ishlayapti): ${instagramError}`);
+        }
+        const igParam = `&ig=${instagramConnected ? '1' : '0'}` +
+          (instagramError ? `&igMsg=${encodeURIComponent(instagramError)}` : '');
 
         this.logger.log(
           `Facebook OAuth: tenant ${payload.tenantId} uchun Page "${pages[0].name}" ulandi`,
@@ -1534,9 +1553,9 @@ export class FacebookLeadsService {
             w.errorType === 'NO_ADMIN_ACCESS'
               ? 'connected_no_admin_access'
               : 'connected_subscribe_failed';
-          return `${redirectBase}&fb=${fbCode}&fbMsg=${encodeURIComponent(w.message || '')}`;
+          return `${redirectBase}&fb=${fbCode}&fbMsg=${encodeURIComponent(w.message || '')}${igParam}`;
         }
-        return `${redirectBase}&fb=success`;
+        return `${redirectBase}&fb=success${igParam}`;
       }
 
       await this.savePendingPages(payload.tenantId, pages);
@@ -2028,8 +2047,12 @@ export class FacebookLeadsController {
   @Get('oauth/start-url')
   @UseGuards(RolesGuard)
   @Roles('TENANT_ADMIN')
-  async getOAuthStartUrl(@CurrentUser() u: any, @Res({ passthrough: true }) res: Response) {
-    const result: any = await this.svc.getOAuthStartUrl(u.tenantId, u.sub);
+  async getOAuthStartUrl(
+    @CurrentUser() u: any,
+    @Query('origin') origin: string,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const result: any = await this.svc.getOAuthStartUrl(u.tenantId, u.sub, origin);
 
     // Cookie QO'SHIMCHA himoya sifatida qo'yiladi. Brauzer uni bloklasa
     // (Safari ITP / third-party cookie) oqim baribir ishlaydi — asosiy
