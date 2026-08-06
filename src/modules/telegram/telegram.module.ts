@@ -75,10 +75,31 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       const tempBot = new TelegramBot(token, { polling: false });
       await tempBot.deleteWebhook({ drop_pending_updates: true });
     } catch {}
-    const bot = new TelegramBot(token, { polling: true });
+    const bot = new TelegramBot(token, {
+      polling: {
+        params: {
+          // Telegram standart holatda "message_reaction" yangilanishlarini
+          // YUBORMAYDI — ularni olish uchun aniq so'rab olish shart.
+          // Eski xatti-harakat buzilmasin uchun avvalgi ishlatilgan turlar
+          // ham ro'yxatga kiritildi.
+          allowed_updates: JSON.stringify([
+            'message', 'edited_message', 'channel_post', 'edited_channel_post',
+            'callback_query', 'my_chat_member', 'chat_member',
+            'message_reaction', 'message_reaction_count',
+          ]),
+        },
+      },
+    });
     bot.on('message', (msg) =>
       this.handleIncoming(msg, accountId, tenantId, bot).catch((e) =>
         this.logger.error(`handle: ${e.message}`),
+      ),
+    );
+    // Xabarga bosilgan reaksiya (emoji/stiker) — mijoz agentning xabariga
+    // "❤️", "👍" va h.k. reaksiya bosganda shu yerga keladi.
+    bot.on('message_reaction' as any, (upd: any) =>
+      this.handleReaction(upd, accountId, tenantId, bot).catch((e) =>
+        this.logger.error(`reaction: ${e.message}`),
       ),
     );
     let lastErrorTime = 0;
@@ -197,6 +218,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       const contentType =
         ext === 'ogg' ? 'audio/ogg'
         : ext === 'jpg' ? 'image/jpeg'
+        : ext === 'webp' ? 'image/webp'
         : ext === 'mp4' ? 'video/mp4'
         : 'application/octet-stream';
       return await uploadBufferToStorage(Buffer.from(resp.data), `tg_in_${key}_${Date.now()}.${ext}`, contentType);
@@ -216,6 +238,104 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     if (msg.contact) return 'CONTACT';
     if (msg.forward_from || msg.forward_from_chat) return 'FORWARD';
     return 'TEXT';
+  }
+
+  // ─── Xabarga bosilgan reaksiya (emoji/stiker) ──────────────────────────────
+  // Telegram bu yangilanishlarni standart holatda yubormaydi (startBot()dagi
+  // allowed_updates'ga qarang). Mavjud MessageType enumiga yangi qiymat
+  // qo'shmaslik uchun (schema migratsiyasiz ishlashi uchun) reaksiya mavjud
+  // "SYSTEM" turi bilan, oddiy xabar sifatida suhbat ichida ko'rsatiladi.
+  private reactionKey(r: any): string {
+    if (r?.type === 'emoji') return `emoji:${r.emoji}`;
+    if (r?.type === 'custom_emoji') return `custom:${r.custom_emoji_id}`;
+    return 'paid';
+  }
+
+  private async reactionToEmoji(r: any, bot: TelegramBot): Promise<string> {
+    if (r?.type === 'emoji') return r.emoji;
+    if (r?.type === 'paid') return '⭐';
+    if (r?.type === 'custom_emoji') {
+      try {
+        const stickers = await (bot as any).getCustomEmojiStickers([r.custom_emoji_id]);
+        return stickers?.[0]?.emoji || '✨';
+      } catch { return '✨'; }
+    }
+    return '✨';
+  }
+
+  private async handleReaction(
+    update: any, // TelegramBot.MessageReactionUpdated (eski typings'da yo'q)
+    accountId: string,
+    tenantId: string,
+    bot: TelegramBot,
+  ) {
+    if (!update?.chat) return;
+    const chatId = normalizeChatId(update.chat.id, 'bot', update.chat.type !== 'private');
+
+    const conv = await this.prisma.conversation.findFirst({
+      where: { tenantId, channel: 'TELEGRAM', externalChatId: chatId },
+    });
+    if (!conv) return; // hali suhbat yo'q — e'tiborsiz qoldiramiz
+
+    // Faqat YANGI qo'shilgan reaksiyalarni ko'rsatamiz (olib tashlanganini emas)
+    const oldKeys = new Set((update.old_reaction || []).map((r: any) => this.reactionKey(r)));
+    const added = (update.new_reaction || []).filter((r: any) => !oldKeys.has(this.reactionKey(r)));
+    if (!added.length) return;
+
+    // Qaysi xabarga reaksiya bosilganini topamiz — bo'lsa, shu xabarga
+    // "javob" sifatida bog'laymiz (replyToId).
+    const reactedMsg = update.message_id
+      ? await this.prisma.message.findFirst({
+          where: { conversationId: conv.id, externalMsgId: String(update.message_id) },
+        })
+      : null;
+
+    for (const r of added) {
+      const emoji = await this.reactionToEmoji(r, bot);
+      const text = `${emoji} reaksiya bildirdi`;
+
+      const newMsg = await this.prisma.message.create({
+        data: {
+          conversationId: conv.id,
+          direction: 'INBOUND',
+          messageType: 'SYSTEM',
+          text,
+          replyToId: reactedMsg?.id || (update.message_id ? String(update.message_id) : null),
+        },
+      });
+
+      await this.prisma.conversation.update({
+        where: { id: conv.id },
+        data: {
+          lastMessageAt: new Date(),
+          lastMessageText: text.slice(0, 200),
+          lastMessageType: 'SYSTEM',
+          unreadCount: { increment: 1 },
+          isResolved: false,
+        },
+      });
+
+      try {
+        this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'message:new', newMsg);
+        this.realtime.emitToConversation(conv.id, 'message:new', newMsg);
+        this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'conversation:updated', {
+          conversationId: conv.id,
+          lastMessageText: text.slice(0, 200),
+          lastMessageAt: new Date(),
+        });
+      } catch {}
+
+      if (conv.assignedAgentId) {
+        await this.notifications.create({
+          tenantId, userId: conv.assignedAgentId,
+          type: 'NEW_MESSAGE',
+          title: '💬 Reaksiya',
+          body: text,
+          link: `/inbox?conv=${conv.id}`,
+          metadata: { conversationId: conv.id },
+        }).catch(() => {});
+      }
+    }
   }
 
   private async handleIncoming(
@@ -351,6 +471,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       } else if (messageType === 'DOCUMENT' && msg.document) {
         const ext = msg.document.file_name?.split('.').pop() || 'bin';
         fileUrl = await this.saveIncomingFile(bot, msg.document.file_id, ext, chatId);
+      } else if (messageType === 'STICKER' && msg.sticker) {
+        // Animatsion (.tgs) va video (.webm) stikerlarni oddiy rasm sifatida
+        // ko'rsatib bo'lmaydi — faqat statik (webp) stikerlar yuklab olinadi.
+        // Animatsion/video stikerlarda emoji fallback sifatida matn ko'rsatiladi.
+        if (!msg.sticker.is_animated && !msg.sticker.is_video) {
+          fileUrl = await this.saveIncomingFile(bot, msg.sticker.file_id, 'webp', chatId);
+        }
       }
     } catch (e: any) {
       this.logger.warn(`Inbound media yuklashda xato: ${e?.message || e}`);
@@ -362,17 +489,19 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         externalMsgId: String(msg.message_id),
         direction: 'INBOUND',
         messageType,
-        text: msg.text || msg.caption || null,
+        text: msg.text || msg.caption || (msg.sticker?.emoji ? msg.sticker.emoji : null),
         fileUrl,
         duration,
       },
     });
 
+    const previewText = msg.text || msg.caption ||
+      (msg.sticker?.emoji ? `${msg.sticker.emoji} stiker` : `[${messageType}]`);
     await this.prisma.conversation.update({
       where: { id: conv.id },
       data: {
         lastMessageAt: new Date(),
-        lastMessageText: (msg.text || msg.caption || `[${messageType}]`).slice(0, 200),
+        lastMessageText: previewText.slice(0, 200),
         lastMessageType: messageType,
         unreadCount: { increment: 1 },
         isResolved: false,
@@ -387,7 +516,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       this.realtime.emitToConversation(conv.id, 'message:new', newMsg);
       this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'conversation:updated', {
         conversationId: conv.id,
-        lastMessageText: (msg.text || msg.caption || `[${messageType}]`).slice(0, 200),
+        lastMessageText: previewText.slice(0, 200),
         lastMessageAt: new Date(),
       });
     } catch {}
@@ -406,7 +535,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           tenantId, userId: conv.assignedAgentId,
           type: 'NEW_MESSAGE',
           title: '💬 Yangi xabar',
-          body: (msg.text || msg.caption || `[${messageType}]`).slice(0, 100),
+          body: previewText.slice(0, 100),
           link: `/inbox?conv=${conv.id}`,
           metadata: { conversationId: conv.id },
         }).catch(() => {});
