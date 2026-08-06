@@ -606,6 +606,13 @@ model Client {
   pipelineStage    PipelineStage @default(NEW_LEAD)
   pipelineStageAt  DateTime      @default(now())
   lostReason       LostReason?
+  // v33.2: maxsus (tenant o'zi qo'shgan) bosqichlar uchun. pipelineStage
+  // ENUM bo'lgani sabab ixtiyoriy bosqich nomini saqlay olmaydi — shuning
+  // uchun mijoz "maxsus" ustunda bo'lsa, customStageId to'ldiriladi va
+  // pipelineStage eng yaqin mos ENUM qiymatida (hisobot/filtr uchun) qoladi.
+  // Custom bosqich o'chirilsa, mijoz o'chmaydi — customStageId shunchaki null bo'ladi.
+  customStageId    String?
+  customStage      CustomStage?  @relation(fields: [customStageId], references: [id], onDelete: SetNull)
 
   // ── Speed-to-lead o'lchash (v14) ──
   // Facebook/Instagram leadlarida birinchi javob tezligi konversiyaning
@@ -658,6 +665,7 @@ model Client {
   @@index([tenantId, status])
   @@index([tenantId, source])
   @@index([tenantId, pipelineStage])
+  @@index([tenantId, customStageId])
   @@index([tenantId, tier])
   @@index([phone])
   @@unique([tenantId, phone])
@@ -731,6 +739,7 @@ model CustomStage {
   isClosing  Boolean  @default(false)
   isLost     Boolean  @default(false)
   createdAt  DateTime @default(now())
+  clients    Client[] // v33.2: shu maxsus bosqichda turgan mijozlar
 
   @@index([pipelineId, order])
   @@map("custom_stages")

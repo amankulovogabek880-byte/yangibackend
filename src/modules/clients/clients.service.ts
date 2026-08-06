@@ -501,10 +501,15 @@ export class ClientsService {
    * 3) tenant'ning mavjud CustomStage'lari (nomi bo'yicha)
    * Topilmasa chaqiruvchi tomon yangi CustomStage yaratadi (createMissingStages).
    */
-  private importResolveKnownStage(
-    raw: string,
-    existingStagesByName: Map<string, string>,
-  ): string | null {
+  /**
+   * MUHIM: bu funksiya faqat haqiqiy PipelineStage ENUM qiymatlarini
+   * qaytaradi (yoki topilmasa — null). Client.pipelineStage bazada
+   * qat'iy enum (10 ta fixed qiymat) — "CUSTOM_<id>" kabi ixtiyoriy
+   * satr yozilsa Prisma PrismaClientValidationError beradi va
+   * frontendda umumiy "Ma'lumot formati noto'g'ri" xatosi chiqadi.
+   * Shu sabab bu yerda CustomStage'larga umuman murojaat qilinmaydi.
+   */
+  private importResolveKnownStage(raw: string): string | null {
     const norm = this.importNormText(raw);
     if (!norm) return 'NEW_LEAD';
 
@@ -515,8 +520,7 @@ export class ClientsService {
     ];
     if (ENUM_VALUES.includes(upper)) return upper;
     if (IMPORT_STAGE_ALIASES[norm]) return IMPORT_STAGE_ALIASES[norm];
-    if (existingStagesByName.has(norm)) return existingStagesByName.get(norm)!;
-    return null; // topilmadi — yangi CustomStage kerak bo'ladi
+    return null; // topilmadi — NEW_LEAD'ga tushadi, asl nomi notes'ga yoziladi
   }
 
   /**
@@ -572,6 +576,14 @@ export class ClientsService {
     const dataRows = rawRows.slice(1).filter((r) => r.some((c) => c && c.trim()));
 
     // 2) Kerakli ma'lumotlarni oldindan yuklab olamiz (har qatorda so'rov yubormaslik uchun)
+    //    ESLATMA (v33.2): Client.pipelineStage bazada qat'iy ENUM (10 ta fixed
+    //    qiymat) — unga "CUSTOM_<id>" kabi ixtiyoriy satr yozib bo'lmaydi
+    //    (Prisma validatsiya xatosi berardi — shu bug import doim
+    //    "Ma'lumot formati noto'g'ri" bilan tugashiga sabab bo'lgan edi).
+    //    Endi buning uchun alohida customStageId ustuni bor: fayldagi
+    //    noma'lum bosqich nomi tenant pipeline'ida yangi CustomStage
+    //    sifatida yaratiladi va mijozga customStageId orqali bog'lanadi;
+    //    pipelineStage esa hisobot/filtr moslligi uchun NEW_LEAD'da qoladi.
     const [existingStages, tenantUsers, lastStage] = await Promise.all([
       this.prisma.customStage.findMany({ where: { tenantId }, select: { id: true, name: true } }),
       this.prisma.user.findMany({ where: { tenantId }, select: { id: true, name: true, email: true } }),
@@ -581,9 +593,9 @@ export class ClientsService {
         select: { order: true, pipelineId: true },
       }),
     ]);
-    const existingStagesByName = new Map<string, string>();
+    const existingStagesByName = new Map<string, string>(); // normText -> CustomStage.id
     for (const s of existingStages) {
-      existingStagesByName.set(this.importNormText(s.name), 'CUSTOM_' + s.id);
+      existingStagesByName.set(this.importNormText(s.name), s.id);
     }
     const usersByKey = new Map<string, string>();
     for (const u of tenantUsers) {
@@ -599,7 +611,11 @@ export class ClientsService {
         const raw = (row[colMap.stage] || '').trim();
         if (!raw) continue;
         const norm = this.importNormText(raw);
-        if (this.importResolveKnownStage(raw, existingStagesByName) === null && !unknownStageNames.has(norm)) {
+        if (
+          this.importResolveKnownStage(raw) === null &&
+          !existingStagesByName.has(norm) &&
+          !unknownStageNames.has(norm)
+        ) {
           unknownStageNames.set(norm, raw);
         }
       }
@@ -616,21 +632,20 @@ export class ClientsService {
       }
       if (pipelineId) {
         let order = (lastStage?.order ?? 0) + 1;
-        const toCreate = Array.from(unknownStageNames.entries()).map(([norm, raw]) => ({
+        const toCreateStages = Array.from(unknownStageNames.entries()).map(([norm, raw]) => ({
           tenantId,
           pipelineId: pipelineId as string,
           name: raw,
           color: '#94a3b8', // import orqali qo'shilgan bosqichlar — neytral rang
           order: order++,
         }));
-        await this.prisma.customStage.createMany({ data: toCreate });
-        // Endi yangi yaratilganlarni existingStagesByName'ga qo'shamiz
+        await this.prisma.customStage.createMany({ data: toCreateStages });
         const created = await this.prisma.customStage.findMany({
-          where: { tenantId, pipelineId, name: { in: toCreate.map((t) => t.name) } },
+          where: { tenantId, pipelineId, name: { in: toCreateStages.map((t) => t.name) } },
           select: { id: true, name: true },
         });
         for (const s of created) {
-          existingStagesByName.set(this.importNormText(s.name), 'CUSTOM_' + s.id);
+          existingStagesByName.set(this.importNormText(s.name), s.id);
         }
       }
     }
@@ -666,9 +681,19 @@ export class ClientsService {
       }
 
       const stageRaw = get('stage');
-      const stage = stageRaw
-        ? (this.importResolveKnownStage(stageRaw, existingStagesByName) || 'NEW_LEAD')
-        : 'NEW_LEAD';
+      let stage = 'NEW_LEAD';
+      let customStageId: string | null = null;
+      if (stageRaw) {
+        const resolved = this.importResolveKnownStage(stageRaw);
+        if (resolved) {
+          stage = resolved;
+        } else {
+          // Tanilmagan bosqich — tenant pipeline'iga CustomStage sifatida
+          // qo'shilgan (yuqorida), shu yerda faqat id orqali bog'laymiz.
+          // pipelineStage NEW_LEAD'da qoladi — hisobot/filtr moslashuvi uchun.
+          customStageId = existingStagesByName.get(this.importNormText(stageRaw)) || null;
+        }
+      }
 
       const tagsRaw = get('tags');
       const tags = tagsRaw ? tagsRaw.split(/[,;]/).map((t) => t.trim()).filter(Boolean) : [];
@@ -700,13 +725,14 @@ export class ClientsService {
         preferences,
         pipelineStage: stage as any,
         pipelineStageAt: now,
+        customStageId,
         leadScore: 0,
         firstContactAt: now,
         lastContactAt: now,
       });
     });
 
-    // 5) Ommaviy yozish — 500 tadan bo'laklarga bo'lib (2000+ qator uchun tezkor va ishonchli).
+    // 4) Ommaviy yozish — 500 tadan bo'laklarga bo'lib (2000+ qator uchun tezkor va ishonchli).
     //    skipDuplicates: true — shu tenant ichida telefon raqami allaqachon
     //    mavjud bo'lgan mijozlar avtomatik o'tkazib yuboriladi (xato bermaydi).
     const CHUNK = 500;
