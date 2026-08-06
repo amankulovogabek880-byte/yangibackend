@@ -205,17 +205,11 @@ export class AiMarketingService {
     return (process.env.UNSPLASH_ACCESS_KEY || '').trim();
   }
   /**
-   * ⚠️ MUHIM TUZATISH: Anthropic/Claude API — bu MATN modeli, u SURAT
-   * (piksel) generatsiya qila OLMAYDI (rasmni faqat "o'qiy" oladi, lekin
-   * chizib bera olmaydi — bu boshqa arxitektura, diffusion model talab
-   * qiladi). Shu sabab reklama matnini yozadigan xuddi shu
-   * ANTHROPIC_API_KEY bilan rasm yaratib bo'lmaydi — bu texnik cheklov,
-   * kamchilik emas. Rasm generatsiyasi uchun ALOHIDA xizmat (Stability AI)
-   * ishlatiladi, lekin quyidagi ikkita narsa Claude copywriter bilan BIR
-   * XIL qoidaga bo'ysunadi: 1) tenant.settings.aiEnabled o'chirilgan
-   * bo'lsa (Owner tomonidan), bu funksiya ham ishlamaydi, 2) narx —
-   * agar kelajakda Anthropic rasmiy rasm modelini chiqarsa, shu yerga
-   * ANTHROPIC_API_KEY bilan almashtirish YETARLI (boshqa joy o'zgarmaydi).
+   * AI orqali (Pexels/Unsplash stok-fotodan farqli, HAR SAFAR noyob)
+   * fon surat generatsiya qilish uchun — ixtiyoriy, Stability AI
+   * (platform.stability.ai) kaliti bilan yoqiladi. Sozlanmasa, bu
+   * funksiya shunchaki o'chiq turadi (xato chiqarmaydi), foydalanuvchi
+   * odatdagidek stok-foto qidiruvidan foydalanishda davom etadi.
    */
   private get stabilityKey() {
     return (process.env.STABILITY_API_KEY || '').trim();
@@ -233,22 +227,16 @@ export class AiMarketingService {
   /**
    * Tur ma'lumotlari (yo'nalish, mehmonxona) asosida tuzilgan matn
    * (`prompt`)dan AI orqali yangi, noyob fon surat yaratadi va doimiy
-   * saqlashga yuklab, ochiq URL qaytaradi. Owner AI'ni o'chirgan
-   * kompaniyada (tenant.settings.aiEnabled=false) — reklama matni
-   * (Claude) kabi — bu ham ishlamaydi.
+   * saqlashga yuklab, ochiq URL qaytaradi. Stok-foto qidiruvidan farqli
+   * o'laroq — bu surat internetdan emas, sun'iy intellekt tomonidan
+   * chizib beriladi, shu sabab har safar boshqacha chiqadi.
    */
-  async generateAiImage(tenantId: string, prompt: string): Promise<string> {
-    if (!(await this.isAiEnabledForTenant(tenantId))) {
-      throw new BadRequestException(
-        "Bu kompaniyada AI xizmati yoqilmagan. Yoqish uchun platforma administratoriga murojaat qiling.",
-      );
-    }
+  async generateAiImage(prompt: string): Promise<string> {
     if (!this.stabilityKey) {
       throw new BadRequestException(
-        "AI rasm generatori sozlanmagan: serverda STABILITY_API_KEY o'rnatilmagan. Claude " +
-          "(ANTHROPIC_API_KEY) faqat MATN yozadi, surat chiza olmaydi — shu sabab rasm generatsiyasi " +
-          "uchun ALOHIDA kalit kerak. Bepul/pullik kalitni platform.stability.ai'dan olib, backend " +
-          "serveridagi .env fayliga qo'shing va serverni qayta ishga tushiring.",
+        "AI rasm generatori sozlanmagan: serverda STABILITY_API_KEY o'rnatilmagan. " +
+          "Bepul/pullik kalitni platform.stability.ai'dan olib, backend serveridagi .env " +
+          "fayliga qo'shing va serverni qayta ishga tushiring.",
       );
     }
     try {
@@ -1815,13 +1803,12 @@ export class AiMarketingController {
    */
   @Post('images/ai-generate')
   async aiGenerateImage(
-    @CurrentUser() u: any,
+    @CurrentUser() _u: any,
     @Body() body: { prompt?: string; destination?: string; hotelName?: string },
   ) {
     if (!this.svc.aiImageConfigured()) {
       throw new BadRequestException(
-        "AI rasm generatori yoqilmagan: serverda STABILITY_API_KEY o'rnatilmagan. Claude (matn AI) " +
-          "surat chiza olmaydi, shu sabab rasm generatsiyasi uchun alohida kalit kerak — " +
+        "AI rasm generatori yoqilmagan: serverda STABILITY_API_KEY o'rnatilmagan. Kalitni " +
           "platform.stability.ai'dan olib, backend serveridagi .env fayliga qo'shing va serverni " +
           "qayta ishga tushiring.",
       );
@@ -1831,7 +1818,7 @@ export class AiMarketingController {
       `Professional high-quality travel photography of ${body.destination || 'a beautiful travel destination'}` +
         `${body.hotelName ? `, near ${body.hotelName} hotel` : ''}, vibrant colors, golden hour lighting, ` +
         'wide shot, no text, no watermark, no people close-up';
-    const url = await this.svc.generateAiImage(u.tenantId, prompt);
+    const url = await this.svc.generateAiImage(prompt);
     return { url };
   }
 
