@@ -527,7 +527,19 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         conversationId, agentId,
         direction: 'OUTBOUND',
         messageType: 'TEXT',
-        text, isInternal, isRead: true,
+        // v15 FIX: avval bu yerda HAR DOIM `isRead: true` yozilardi — ya'ni
+        // bot orqali yuborilgan xabar bazaga yozilgan ONDA "o'qildi" (✓✓)
+        // belgisi darhol chiqardi, garchi Telegram Bot API'da mijoz xabarni
+        // haqiqatan o'qiganini bilishning HECH QANDAY yo'li yo'q. Bu
+        // frontendda ko'rsatilayotgan "o'qildi/o'qilmadi" belgisini butunlay
+        // yolg'on qilib qo'yardi. Endi faqat ICHKI (isInternal) izohlar
+        // "o'qilgan" deb belgilanadi (ular mijozga ko'rinmaydi, bu yerda
+        // ahamiyatsiz) — mijozga ketgan xabar esa haqiqiy o'qilgan-o'qilmagan
+        // holatini bilmagunimizcha `false` bo'lib qoladi. Shaxsiy (MTProto)
+        // akkaunt orqali ketgan xabarlar uchun bu holat keyinchalik haqiqiy
+        // Telegram "o'qildi" signalidan (UpdateReadHistoryOutbox) kelib
+        // avtomatik yangilanadi — pastdagi `startListening()`ga qarang.
+        text, isInternal, isRead: isInternal,
       },
       include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
     });
@@ -634,7 +646,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         fileUrl: data.fileUrl,
         fileMimeType: data.mimeType,
         caption: data.caption,
-        isRead: true,
+        // v15 FIX: bot orqali "o'qildi" holatini bilib bo'lmaydi — xatoan
+        // darhol `true` qo'yilmasin (yuqoridagi sendMessage'dagi izohga qarang).
+        isRead: false,
       },
       include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
     });

@@ -15,7 +15,7 @@ import {
   Module, Injectable, Controller,
   Post, Get, Delete, Body, Param,
   UseGuards, BadRequestException, NotFoundException,
-  OnModuleInit, Logger,
+  OnModuleInit, OnModuleDestroy, Logger,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiBody } from '@nestjs/swagger';
 import { TelegramClient } from 'telegram';
@@ -45,8 +45,17 @@ const activeSessions = new Map<string, TelegramClient>();
 const pendingAuth = new Map<string, { phoneCodeHash: string; client: TelegramClient; phone: string }>();
 
 @Injectable()
-export class UserTelegramService implements OnModuleInit {
+export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger('UserTelegramService');
+  // v15 FIX: MTProto ulanishi tarmoq uzilishi / Telegram serverining vaqtinchalik
+  // muammosi tufayli JIMGINA "o'lik" holatga tushib qolishi mumkin — bunday
+  // holatda tinglovchi hech qanday xato bermaydi, lekin YANGI kiruvchi xabarlarni
+  // UMUMAN qabul qilmay qo'yadi. Agent CRM'ni ochmagan payt shu holat yuz bersa,
+  // o'sha vaqt oralig'ida kelgan xabarlar CRM'ga MUTLAQO kelmaydi (aynan
+  // "CRM'dan chiqib ketsam xabar kelmayapti" shikoyatining asosiy sababi).
+  // Shu sabab har 5 daqiqada barcha faol sessiyalarning haqiqatan tirikligini
+  // tekshirib, o'lik bo'lsa avtomatik qayta ulanamiz.
+  private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private prisma: PrismaService,
@@ -71,6 +80,44 @@ export class UserTelegramService implements OnModuleInit {
       }
     } catch (e) {
       this.logger.warn('Could not restore sessions on init');
+    }
+
+    // v15: davriy salomatlik tekshiruvi (yuqoridagi izohga qarang)
+    this.healthCheckTimer = setInterval(
+      () => this.healthCheckSessions().catch((e: any) =>
+        this.logger.warn(`Health-check xato: ${e?.message || e}`)),
+      5 * 60 * 1000,
+    );
+  }
+
+  async onModuleDestroy() {
+    if (this.healthCheckTimer) clearInterval(this.healthCheckTimer);
+  }
+
+  /**
+   * v15: har bir faol (yoki faol bo'lishi kerak) shaxsiy Telegram sessiyasini
+   * tekshiradi — agar xotirada yo'q yoki `isUserAuthorized()` yolg'on qaytarsa
+   * (ulanish "o'lik"), DB'dagi saqlangan tokendan avtomatik qayta ulanadi.
+   */
+  private async healthCheckSessions() {
+    const accounts = await this.prisma.telegramAccount.findMany({
+      where: { isPersonal: true, sessionData: { not: null }, isActive: true },
+    });
+    for (const acc of accounts) {
+      const client = activeSessions.get(acc.id);
+      let healthy = false;
+      if (client) {
+        healthy = await client.isUserAuthorized().catch(() => false);
+      }
+      if (!healthy) {
+        this.logger.warn(`Shaxsiy Telegram sessiyasi (${acc.name || acc.id}) uzilgan — qayta ulanmoqda...`);
+        if (client) {
+          try { await client.disconnect(); } catch {}
+          activeSessions.delete(acc.id);
+        }
+        await this.restoreSession(acc).catch((e: any) =>
+          this.logger.error(`Qayta ulanish muvaffaqiyatsiz (${acc.id}): ${e?.message || e}`));
+      }
     }
   }
 
@@ -639,8 +686,128 @@ export class UserTelegramService implements OnModuleInit {
         // (kulrang) rangda chiqardi. Filtrni olib tashlab, ikkala yo'nalishni
         // ham ushlaymiz — pastdagi isOut tekshiruvi endi ishga tushadi.
       }, new NewMessage({}));
+
+      // v15: XOM (raw) update'larni ham tinglaymiz — bular NewMessage
+      // filtridan o'tmaydi, lekin "o'qildi" va "onlayn/oflayn" holatini
+      // aynan shular orqali bilib olamiz:
+      //   • UpdateReadHistoryOutbox — suhbatdosh BIZNING xabarimizni
+      //     qaysi ID'gacha o'qiganini bildiradi (haqiqiy "✓✓ o'qildi").
+      //   • UpdateUserStatus — foydalanuvchi onlayn/oflayn bo'lganda keladi.
+      // eventBuilder berilmasa, GramJS callback'ga har bir XOM Update
+      // obyektini (filtrsiz) uzatadi.
+      client.addEventHandler(async (update: any) => {
+        this.handleRawUpdate(update, acc).catch((e: any) =>
+          this.logger.warn(`handleRawUpdate xato: ${e?.message || e}`));
+      });
     } catch (e: any) {
       this.logger.warn('startListening error: ' + e.message);
+    }
+  }
+
+  /**
+   * v15: "o'qildi" (read receipt) va onlayn/oflayn holatini real vaqtda
+   * ushlab, CRM'ga socket orqali jonli yetkazadi.
+   */
+  private async handleRawUpdate(update: any, acc: any) {
+    if (!update?.className) return;
+    const tenantId = acc.tenantId;
+
+    if (update.className === 'UpdateReadHistoryOutbox') {
+      const peer = update.peer;
+      const isGroupOrChannel = peer?.className === 'PeerChat' || peer?.className === 'PeerChannel';
+      const rawId = peer?.userId ?? peer?.chatId ?? peer?.channelId;
+      if (rawId === undefined || rawId === null) return;
+      const chatId = normalizeChatId(String(rawId), 'gramjs', isGroupOrChannel);
+
+      const conv = await this.prisma.conversation.findFirst({
+        where: { tenantId, channel: 'TELEGRAM', externalChatId: chatId },
+      });
+      if (!conv) return;
+
+      const maxId = Number(update.maxId) || 0;
+      if (!maxId) return;
+
+      // Faqat shu suhbatning hali "o'qilmagan" deb belgilangan OUTBOUND
+      // xabarlaridan maxId'gacha bo'lganlarini "o'qildi" qilamiz.
+      const candidates = await this.prisma.message.findMany({
+        where: { conversationId: conv.id, direction: 'OUTBOUND', isRead: false, externalMsgId: { not: null } },
+        select: { id: true, externalMsgId: true },
+      });
+      const toMark = candidates
+        .filter((m) => {
+          const n = Number(m.externalMsgId);
+          return Number.isFinite(n) && n <= maxId;
+        })
+        .map((m) => m.id);
+      if (!toMark.length) return;
+
+      await this.prisma.message.updateMany({ where: { id: { in: toMark } }, data: { isRead: true } });
+
+      const payload = { conversationId: conv.id, messageIds: toMark };
+      this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'message:read', payload);
+      this.realtime.emitToConversation(conv.id, 'message:read', payload);
+      return;
+    }
+
+    if (update.className === 'UpdateUserStatus') {
+      const uid = update.userId !== undefined && update.userId !== null ? String(update.userId) : '';
+      if (!uid) return;
+      const status = update.status;
+      let isOnline = false;
+      let lastSeenAt: string | null = null;
+      if (status?.className === 'UserStatusOnline') {
+        isOnline = true;
+      } else if (status?.className === 'UserStatusOffline') {
+        lastSeenAt = status.wasOnline ? new Date(status.wasOnline * 1000).toISOString() : null;
+      } else {
+        // UserStatusRecently / LastWeek / LastMonth / Empty — aniq vaqt yo'q
+        return;
+      }
+
+      const conv = await this.prisma.conversation.findFirst({
+        where: { tenantId, channel: 'TELEGRAM', externalChatId: uid, chatType: 'private' } as any,
+      });
+      if (!conv) return;
+
+      const payload = { conversationId: conv.id, isOnline, lastSeenAt };
+      this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'user:online', payload);
+      this.realtime.emitToConversation(conv.id, 'user:online', payload);
+    }
+  }
+
+  /**
+   * v15: suhbat ochilganda boshlang'ich onlayn/oflayn holatini olish uchun
+   * (keyingi o'zgarishlar `UpdateUserStatus` orqali jonli — socket'da keladi).
+   * Faqat shaxsiy (private) suhbatlar uchun ma'noli — guruh/kanalda "onlayn"
+   * tushunchasi yo'q.
+   */
+  async getPeerStatus(tenantId: string, conversationId: string): Promise<{ isOnline: boolean; lastSeenAt: string | null }> {
+    const conv = await this.prisma.conversation.findFirst({ where: { id: conversationId, tenantId } });
+    if (!conv) throw new NotFoundException('Suhbat topilmadi');
+    if ((conv as any).chatType && (conv as any).chatType !== 'private') {
+      return { isOnline: false, lastSeenAt: null };
+    }
+
+    const account = await this.getSharedAccount(tenantId);
+    if (!account) return { isOnline: false, lastSeenAt: null };
+
+    let client = activeSessions.get(account.id);
+    if (!client || !(await client.isUserAuthorized().catch(() => false))) {
+      client = (await this.restoreSession(account)) || undefined;
+      if (!client) return { isOnline: false, lastSeenAt: null };
+    }
+
+    try {
+      const entity: any = await client.getEntity(conv.externalChatId);
+      const status = entity?.status;
+      if (status?.className === 'UserStatusOnline') return { isOnline: true, lastSeenAt: null };
+      if (status?.className === 'UserStatusOffline') {
+        return { isOnline: false, lastSeenAt: status.wasOnline ? new Date(status.wasOnline * 1000).toISOString() : null };
+      }
+      return { isOnline: false, lastSeenAt: null };
+    } catch (e: any) {
+      this.logger.warn(`getPeerStatus xato (conv=${conversationId}): ${e?.message || e}`);
+      return { isOnline: false, lastSeenAt: null };
     }
   }
 
@@ -1205,6 +1372,13 @@ export class UserTelegramController {
   @Get('me')
   getMyAccount(@CurrentUser() u: any) {
     return this.svc.getMyAccount(u.tenantId, u.id || u.sub);
+  }
+
+  // v15: suhbat ochilganda mijozning onlayn/oflayn holatini olish
+  @ApiOperation({ summary: "Mijozning onlayn/oflayn holatini olish (shaxsiy akkaunt orqali)" })
+  @Get('status/:conversationId')
+  getPeerStatus(@Param('conversationId') conversationId: string, @CurrentUser() u: any) {
+    return this.svc.getPeerStatus(u.tenantId, conversationId);
   }
 
   @Delete('me')
