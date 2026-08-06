@@ -1093,6 +1093,11 @@ model Message {
   isDelivered    Boolean          @default(false)
   isFailed       Boolean          @default(false)
   errorMessage   String?
+  // v16: Telegramda xabarga bosilgan reaksiya(lar) — masalan mijoz agentning
+  // xabariga ❤️ yoki 👍 bosishi mumkin. Bir nechta reaksiya/foydalanuvchi
+  // bo'lishi mumkin bo'lgani uchun JSON massiv sifatida saqlanadi:
+  // [{ emoji: "❤️", userId: "123456", date: "2026-08-07T10:00:00.000Z" }]
+  reactions      Json?
   createdAt      DateTime         @default(now())
 
   @@index([conversationId, createdAt])

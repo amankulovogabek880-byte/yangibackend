@@ -78,15 +78,19 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     const bot = new TelegramBot(token, {
       polling: {
         params: {
-          // Telegram standart holatda "message_reaction" yangilanishlarini
-          // YUBORMAYDI — ularni olish uchun aniq so'rab olish shart.
-          // Eski xatti-harakat buzilmasin uchun avvalgi ishlatilgan turlar
-          // ham ro'yxatga kiritildi.
-          allowed_updates: JSON.stringify([
+          // v16 FIX: Telegram Bot API 7.0'dan buyon "message_reaction"
+          // (xabarga bosilgan ❤️/👍 kabi reaksiya) yangilanishlari FAQAT
+          // shu yerda ANIQ so'ralsa yuboriladi — shu sabab reaksiyalar
+          // ilgari botga umuman yetib kelmasdi. Qolgan turlar Telegramning
+          // standart to'plamini takrorlaydi, shu bilan avvalgi xatti-harakat
+          // buzilmaydi.
+          allowed_updates: [
             'message', 'edited_message', 'channel_post', 'edited_channel_post',
-            'callback_query', 'my_chat_member', 'chat_member',
+            'inline_query', 'chosen_inline_result', 'callback_query',
+            'shipping_query', 'pre_checkout_query', 'poll', 'poll_answer',
+            'my_chat_member', 'chat_join_request',
             'message_reaction', 'message_reaction_count',
-          ]),
+          ],
         },
       },
     });
@@ -95,10 +99,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         this.logger.error(`handle: ${e.message}`),
       ),
     );
-    // Xabarga bosilgan reaksiya (emoji/stiker) — mijoz agentning xabariga
-    // "❤️", "👍" va h.k. reaksiya bosganda shu yerga keladi.
-    bot.on('message_reaction' as any, (upd: any) =>
-      this.handleReaction(upd, accountId, tenantId, bot).catch((e) =>
+    // v16: mijoz (yoki agent) Telegramda biror xabarga reaksiya (emoji/stiker)
+    // bossa — buni ham inboxda ko'rsatamiz.
+    bot.on('message_reaction', (reaction: any) =>
+      this.handleReaction(reaction, tenantId).catch((e) =>
         this.logger.error(`reaction: ${e.message}`),
       ),
     );
@@ -138,7 +142,23 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     this.bots.set(accountId, bot);
   }
 
-  /** Round-robin: pick agent with least active conversations */
+  /**
+   * Round-robin: navbat bo'yicha agent tanlash.
+   *
+   * v16 FIX: ilgari "eng kam FAOL (isResolved=false) suhbatga ega agent"
+   * mezoni ishlatilardi. Bu quyidagi og'ir xatoga olib kelardi: agar bir
+   * necha agentda bir vaqtning o'zida FAOL suhbatlar soni TENG bo'lsa
+   * (masalan barchasi 0 — kun boshida yoki barcha suhbatlar yopilgan
+   * bo'lsa), `sort()` barqaror (stable) bo'lgani uchun tenglik HAR DOIM
+   * ro'yxatdagi BIRINCHI agent foydasiga hal qilinardi. Natijada yangi
+   * Telegram leadlar deyarli doim faqat BITTA (birinchi) agentga tushardi.
+   * Endi `/modules/v9/round-robin.module.ts`dagi bilan BIR XIL, isbotlangan
+   * "lastAssignedAt eng eski (yoki hali umuman olmagan) — navbat shunga"
+   * mezonidan foydalanamiz: har safar tanlangan agentning lastAssignedAt
+   * darhol yangilanadi, shu sabab tenglik holati deyarli yuzaga kelmaydi va
+   * leadlar barcha agentlar orasida haqiqiy aylanma (round-robin) tarzda
+   * taqsimlanadi.
+   */
   private async pickAgent(tenantId: string): Promise<string | null> {
     let agents = await this.prisma.user.findMany({
       where: {
@@ -146,7 +166,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         // v14: pauza qilingan agent (ta'til/kasal) lead OLMAYDI
         isPausedFromAssignment: false,
       },
-      select: { id: true },
+      select: { id: true, lastAssignedAt: true },
     });
     // v10 MUAMMO 5 BONUS FIX: agar tenant'da hali AGENT/MANAGER rolidagi
     // hech kim bo'lmasa (masalan kichik/yangi agentlik — faqat egasi
@@ -158,20 +178,29 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     if (!agents.length) {
       agents = await this.prisma.user.findMany({
         where: { tenantId, role: 'TENANT_ADMIN', status: 'ACTIVE' },
-        select: { id: true },
+        select: { id: true, lastAssignedAt: true },
       });
     }
     if (!agents.length) return null;
-    const counts = await Promise.all(
-      agents.map(async (a) => ({
-        id: a.id,
-        cnt: await this.prisma.conversation.count({
-          where: { tenantId, assignedAgentId: a.id, isResolved: false },
-        }),
-      })),
-    );
-    counts.sort((a, b) => a.cnt - b.cnt);
-    return counts[0].id;
+
+    agents.sort((a, b) => {
+      const at = a.lastAssignedAt ? new Date(a.lastAssignedAt).getTime() : 0;
+      const bt = b.lastAssignedAt ? new Date(b.lastAssignedAt).getTime() : 0;
+      return at - bt;
+    });
+    const chosen = agents[0];
+
+    // Tanlangandan so'ng darhol navbatni yangilaymiz — aks holda ketma-ket
+    // ikkita yangi lead kelsa, ikkalasi ham hali eskirmagan bir xil agentga
+    // tushib qolishi mumkin edi.
+    await this.prisma.user.update({
+      where: { id: chosen.id },
+      data: { lastAssignedAt: new Date() },
+    }).catch((e: any) => {
+      this.logger.warn(`pickAgent: lastAssignedAt yangilanmadi (agent=${chosen.id}): ${e?.message || e}`);
+    });
+
+    return chosen.id;
   }
 
   // ─── Telegram bot orqali profil rasmini yuklab olish ──────────────────────
@@ -228,6 +257,23 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  // v16: suhbatlar ro'yxatida oxirgi xabar matn bo'lmasa (rasm/stiker/fayl...),
+  // ilgari xom `[STICKER]`, `[PHOTO]` kabi texnik kod ko'rsatilardi. Endi
+  // odam o'qiy oladigan, emoji bilan qisqa yorliq chiqadi.
+  private previewLabel(messageType: MessageType): string {
+    const map: Partial<Record<MessageType, string>> = {
+      PHOTO: '📷 Rasm',
+      VIDEO: '🎥 Video',
+      VOICE: '🎤 Ovozli xabar',
+      DOCUMENT: '📎 Fayl',
+      STICKER: '🌟 Stiker',
+      LOCATION: '📍 Joylashuv',
+      CONTACT: '👤 Kontakt',
+      FORWARD: '↪️ Uzatilgan xabar',
+    };
+    return map[messageType] || `[${messageType}]`;
+  }
+
   private inferType(msg: TelegramBot.Message): MessageType {
     if (msg.photo) return 'PHOTO';
     if (msg.document) return 'DOCUMENT';
@@ -240,102 +286,62 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     return 'TEXT';
   }
 
-  // ─── Xabarga bosilgan reaksiya (emoji/stiker) ──────────────────────────────
-  // Telegram bu yangilanishlarni standart holatda yubormaydi (startBot()dagi
-  // allowed_updates'ga qarang). Mavjud MessageType enumiga yangi qiymat
-  // qo'shmaslik uchun (schema migratsiyasiz ishlashi uchun) reaksiya mavjud
-  // "SYSTEM" turi bilan, oddiy xabar sifatida suhbat ichida ko'rsatiladi.
-  private reactionKey(r: any): string {
-    if (r?.type === 'emoji') return `emoji:${r.emoji}`;
-    if (r?.type === 'custom_emoji') return `custom:${r.custom_emoji_id}`;
-    return 'paid';
-  }
-
-  private async reactionToEmoji(r: any, bot: TelegramBot): Promise<string> {
-    if (r?.type === 'emoji') return r.emoji;
-    if (r?.type === 'paid') return '⭐';
-    if (r?.type === 'custom_emoji') {
-      try {
-        const stickers = await (bot as any).getCustomEmojiStickers([r.custom_emoji_id]);
-        return stickers?.[0]?.emoji || '✨';
-      } catch { return '✨'; }
-    }
-    return '✨';
-  }
-
-  private async handleReaction(
-    update: any, // TelegramBot.MessageReactionUpdated (eski typings'da yo'q)
-    accountId: string,
-    tenantId: string,
-    bot: TelegramBot,
-  ) {
-    if (!update?.chat) return;
-    const chatId = normalizeChatId(update.chat.id, 'bot', update.chat.type !== 'private');
+  /**
+   * v16: Telegramda mijoz (yoki agent) biror xabarga reaksiya (❤️, 👍, 🔥...)
+   * bossa/olib tashlasa keladigan yangilanishni qayta ishlaydi. Telegram har
+   * safar shu foydalanuvchining O'SHA xabar uchun JORIY (to'liq) reaksiyalar
+   * ro'yxatini yuboradi — "bittasini qo'sh/o'chir" emas — shu sabab avval
+   * saqlangan ro'yxatdan shu foydalanuvchining eski yozuvi olib tashlanib,
+   * o'rniga yangisi qo'yiladi (bo'sh bo'lsa — reaksiya olib tashlangan degani).
+   */
+  private async handleReaction(reaction: any, tenantId: string) {
+    const chatId = reaction?.chat?.id !== undefined ? String(reaction.chat.id) : '';
+    const externalMsgId = reaction?.message_id !== undefined ? String(reaction.message_id) : '';
+    if (!chatId || !externalMsgId) return;
 
     const conv = await this.prisma.conversation.findFirst({
       where: { tenantId, channel: 'TELEGRAM', externalChatId: chatId },
     });
-    if (!conv) return; // hali suhbat yo'q — e'tiborsiz qoldiramiz
+    if (!conv) return;
 
-    // Faqat YANGI qo'shilgan reaksiyalarni ko'rsatamiz (olib tashlanganini emas)
-    const oldKeys = new Set((update.old_reaction || []).map((r: any) => this.reactionKey(r)));
-    const added = (update.new_reaction || []).filter((r: any) => !oldKeys.has(this.reactionKey(r)));
-    if (!added.length) return;
+    const msg = await this.prisma.message.findFirst({
+      where: { conversationId: conv.id, externalMsgId },
+    });
+    if (!msg) return;
 
-    // Qaysi xabarga reaksiya bosilganini topamiz — bo'lsa, shu xabarga
-    // "javob" sifatida bog'laymiz (replyToId).
-    const reactedMsg = update.message_id
-      ? await this.prisma.message.findFirst({
-          where: { conversationId: conv.id, externalMsgId: String(update.message_id) },
-        })
-      : null;
+    const actorId = reaction?.user?.id !== undefined
+      ? String(reaction.user.id)
+      : reaction?.actor_chat?.id !== undefined ? String(reaction.actor_chat.id) : undefined;
 
-    for (const r of added) {
-      const emoji = await this.reactionToEmoji(r, bot);
-      const text = `${emoji} reaksiya bildirdi`;
+    const toEmoji = (r: any): string => {
+      if (r?.type === 'emoji') return r.emoji;
+      if (r?.type === 'paid') return '⭐';
+      return '🎨'; // custom_emoji — brauzerda render qila olmaymiz, o'rnini bosuvchi belgi
+    };
 
-      const newMsg = await this.prisma.message.create({
-        data: {
-          conversationId: conv.id,
-          direction: 'INBOUND',
-          messageType: 'SYSTEM',
-          text,
-          replyToId: reactedMsg?.id || (update.message_id ? String(update.message_id) : null),
-        },
+    const newReaction = Array.isArray(reaction?.new_reaction) ? reaction.new_reaction : [];
+    const existing: any[] = Array.isArray((msg as any).reactions) ? (msg as any).reactions : [];
+    const filtered = actorId ? existing.filter((r: any) => r.userId !== actorId) : existing;
+    const added = newReaction.map((r: any) => ({
+      emoji: toEmoji(r),
+      userId: actorId,
+      date: new Date().toISOString(),
+    }));
+    const updatedReactions = [...filtered, ...added];
+
+    await this.prisma.message.update({
+      where: { id: msg.id },
+      data: { reactions: updatedReactions } as any,
+    });
+
+    try {
+      this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'message:reaction', {
+        conversationId: conv.id, messageId: msg.id, reactions: updatedReactions,
       });
-
-      await this.prisma.conversation.update({
-        where: { id: conv.id },
-        data: {
-          lastMessageAt: new Date(),
-          lastMessageText: text.slice(0, 200),
-          lastMessageType: 'SYSTEM',
-          unreadCount: { increment: 1 },
-          isResolved: false,
-        },
+      this.realtime.emitToConversation(conv.id, 'message:reaction', {
+        conversationId: conv.id, messageId: msg.id, reactions: updatedReactions,
       });
-
-      try {
-        this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'message:new', newMsg);
-        this.realtime.emitToConversation(conv.id, 'message:new', newMsg);
-        this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'conversation:updated', {
-          conversationId: conv.id,
-          lastMessageText: text.slice(0, 200),
-          lastMessageAt: new Date(),
-        });
-      } catch {}
-
-      if (conv.assignedAgentId) {
-        await this.notifications.create({
-          tenantId, userId: conv.assignedAgentId,
-          type: 'NEW_MESSAGE',
-          title: '💬 Reaksiya',
-          body: text,
-          link: `/inbox?conv=${conv.id}`,
-          metadata: { conversationId: conv.id },
-        }).catch(() => {});
-      }
-    }
+    } catch {}
   }
 
   private async handleIncoming(
@@ -472,11 +478,17 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         const ext = msg.document.file_name?.split('.').pop() || 'bin';
         fileUrl = await this.saveIncomingFile(bot, msg.document.file_id, ext, chatId);
       } else if (messageType === 'STICKER' && msg.sticker) {
-        // Animatsion (.tgs) va video (.webm) stikerlarni oddiy rasm sifatida
-        // ko'rsatib bo'lmaydi — faqat statik (webp) stikerlar yuklab olinadi.
-        // Animatsion/video stikerlarda emoji fallback sifatida matn ko'rsatiladi.
+        // v16 FIX: sticker turi aniqlanardi (STICKER), lekin fayl HECH QACHON
+        // yuklab olinmasdi — shu sabab agent inboxda stikerni umuman ko'ra
+        // olmasdi (bo'sh xabar bo'lib ko'rinardi). Statik stikerlar (.webp)
+        // to'g'ridan-to'g'ri yuklanadi. Animatsion (.tgs/Lottie) yoki video
+        // (.webm) stikerlar oddiy <img>/<video>da to'g'ri ochilmagani uchun,
+        // ular uchun Telegram taqdim etadigan JPG preview (thumb) olinadi —
+        // shunda agent hech bo'lmasa qaysi stiker yuborilganini ko'radi.
         if (!msg.sticker.is_animated && !msg.sticker.is_video) {
           fileUrl = await this.saveIncomingFile(bot, msg.sticker.file_id, 'webp', chatId);
+        } else if (msg.sticker.thumb?.file_id) {
+          fileUrl = await this.saveIncomingFile(bot, msg.sticker.thumb.file_id, 'jpg', chatId);
         }
       }
     } catch (e: any) {
@@ -489,19 +501,17 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         externalMsgId: String(msg.message_id),
         direction: 'INBOUND',
         messageType,
-        text: msg.text || msg.caption || (msg.sticker?.emoji ? msg.sticker.emoji : null),
+        text: msg.text || msg.caption || null,
         fileUrl,
         duration,
       },
     });
 
-    const previewText = msg.text || msg.caption ||
-      (msg.sticker?.emoji ? `${msg.sticker.emoji} stiker` : `[${messageType}]`);
     await this.prisma.conversation.update({
       where: { id: conv.id },
       data: {
         lastMessageAt: new Date(),
-        lastMessageText: previewText.slice(0, 200),
+        lastMessageText: (msg.text || msg.caption || this.previewLabel(messageType)).slice(0, 200),
         lastMessageType: messageType,
         unreadCount: { increment: 1 },
         isResolved: false,
@@ -516,7 +526,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       this.realtime.emitToConversation(conv.id, 'message:new', newMsg);
       this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'conversation:updated', {
         conversationId: conv.id,
-        lastMessageText: previewText.slice(0, 200),
+        lastMessageText: (msg.text || msg.caption || this.previewLabel(messageType)).slice(0, 200),
         lastMessageAt: new Date(),
       });
     } catch {}
@@ -535,7 +545,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           tenantId, userId: conv.assignedAgentId,
           type: 'NEW_MESSAGE',
           title: '💬 Yangi xabar',
-          body: previewText.slice(0, 100),
+          body: (msg.text || msg.caption || this.previewLabel(messageType)).slice(0, 100),
           link: `/inbox?conv=${conv.id}`,
           metadata: { conversationId: conv.id },
         }).catch(() => {});
