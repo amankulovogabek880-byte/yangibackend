@@ -69,11 +69,10 @@ export class PipelineService {
       include: { stages: { orderBy: { order: 'asc' } } },
       orderBy: { createdAt: 'asc' },
     });
-    // Add pipelineType based on name pattern (no DB column needed)
+    // Add pipelineType based on isDefault flag (renaming a pipeline no longer breaks this)
     return pipelines.map(pl => ({
       ...pl,
-      pipelineType: pl.name.includes('Sayohat') || pl.name.includes('Post') || pl.name.includes('POST')
-        ? 'POST_SALE' : 'NEW_SALE',
+      pipelineType: pl.isDefault ? 'NEW_SALE' : 'POST_SALE',
       color: pl.isDefault ? '#3d7eff' : '#10b981',
     }));
   }
@@ -181,18 +180,28 @@ export class PipelineService {
       });
       if (!pipeline) throw new NotFoundException('Pipeline topilmadi');
 
+      // Faqat DEFAULT (sotuvgacha) pipeline "kelib tushgan" lidlarni o'ziga
+      // tortadi va bosqich NOMI orqali global enum'ga moslashtiradi. Boshqa
+      // (post-sale/custom) voronkalar lidni faqat customStageId to'g'ri
+      // mos kelganda ko'rsatadi — status/nom qanday bo'lishidan qat'iy nazar.
+      const isDefaultPipeline = !!pipeline.isDefault;
+
       const columns = (pipeline.stages || []).map((stage: any) => {
         // Map stage name to PipelineStage enum value
         const stageEnumKey = V10_STAGE_KEYS[stage.name] || null;
         const isFirstStage = (pipeline.stages || []).sort((a: any, b: any) => a.order - b.order)[0]?.id === stage.id;
         const stageClients = clients.filter((c: any) => {
-          if (stageEnumKey) return c.pipelineStage === stageEnumKey;
-          if (c.customStageId === stage.id) return true;
-          // First column catches: NEW_LEAD and any unrecognized stages
-          if (isFirstStage && (c.pipelineStage === 'NEW_LEAD' || !clients.some((cl: any) =>
+          // Lid biror maxsus bosqichda (customStageId) tursa — faqat o'sha
+          // aniq ID mos kelgan ustunda ko'rinadi. Eski/qoldiq pipelineStage
+          // qiymati (masalan avvalgi "COMPLETED") boshqa voronkada uni
+          // qayta chiqarib yubormasligi uchun bu tekshiruv birinchi turadi.
+          if (c.customStageId) return c.customStageId === stage.id;
+          if (isDefaultPipeline && stageEnumKey) return c.pipelineStage === stageEnumKey;
+          // First column catches unmatched/new leads — faqat DEFAULT pipelineda.
+          if (isDefaultPipeline && isFirstStage && (c.pipelineStage === 'NEW_LEAD' || !clients.some((cl: any) =>
             (pipeline.stages || []).some((s: any) => {
               const k = V10_STAGE_KEYS[s.name];
-              return cl.id === c.id && (cl.customStageId === s.id || (k && cl.pipelineStage === k));
+              return cl.id === c.id && (k && cl.pipelineStage === k);
             })
           ))) return true;
           return false;
@@ -208,8 +217,8 @@ export class PipelineService {
         };
       });
 
-      // Add pipelineType based on name
-      const pipelineType = pipeline.name.includes('Sayohat') ? 'POST_SALE' : 'NEW_SALE';
+      // Add pipelineType based on isDefault flag (nom o'zgarsa ham buzilmaydi)
+      const pipelineType = isDefaultPipeline ? 'NEW_SALE' : 'POST_SALE';
       return { pipeline: { ...pipeline, pipelineType, color: pipeline.isDefault ? '#3d7eff' : '#10b981' }, columns };
     }
 
@@ -226,7 +235,9 @@ export class PipelineService {
       color: STAGE_COLORS[stage] || '#64748b',
       isClosing: TERMINAL_STAGES.includes(stage),
       stageKey: stage,
-      clients: clients.filter((c) => c.pipelineStage === stage).map((c) => this.mapClient(c)),
+      // Lid customStageId'ga ega bo'lsa (maxsus/post-sale bosqichda), eski
+      // pipelineStage qiymati orqali bu yerda qayta chiqib qolmasligi kerak.
+      clients: clients.filter((c: any) => !c.customStageId && c.pipelineStage === stage).map((c) => this.mapClient(c)),
       count: 0,
       totalValue: 0,
     }));
@@ -241,12 +252,17 @@ export class PipelineService {
       const customStages = await this.prisma.customStage.findMany({
         where: { tenantId },
         orderBy: { order: 'asc' },
+        include: { pipeline: { select: { isDefault: true } } },
       });
-      for (const cs of customStages) {
-        const stageEnumKey = V10_STAGE_KEYS[cs.name];
+      for (const cs of customStages as any[]) {
+        // Faqat DEFAULT pipelinega tegishli bosqichlar nom orqali global
+        // enum'ga moslanadi (nom to'qnashuvi boshqa voronkalardan lid
+        // tortib chiqarmasin uchun); boshqalari faqat o'z ID'si bilan.
+        const isDefaultPipelineStage = !!cs.pipeline?.isDefault;
+        const stageEnumKey = isDefaultPipelineStage ? V10_STAGE_KEYS[cs.name] : null;
         const csClients = clients.filter((c: any) =>
           c.customStageId === cs.id ||
-          (stageEnumKey && c.pipelineStage === stageEnumKey)
+          (!c.customStageId && stageEnumKey && c.pipelineStage === stageEnumKey)
         ).map((c: any) => this.mapClient(c));
         (stages as any[]).push({
           stage: `CUSTOM_${cs.id}`,
@@ -379,7 +395,58 @@ export class PipelineService {
       }, 3000);
     }
 
+    // Auto-transition: sotuvgacha bo'lgan (default) voronkaning yopiluvchi
+    // bosqichiga (masalan "To'landi" / COMPLETED) yetgan lid avtomatik
+    // ravishda sotuvdan keyingi (POST_SALE) voronkaning birinchi bosqichiga
+    // (customStageId orqali) ko'chiriladi.
+    await this.maybeAdvanceToPostSalePipeline(tenantId, clientId, toStage);
+
     return this.prisma.client.findUnique({ where: { id: clientId } });
+  }
+
+  // ─── Sotuv yopilganda: pre-sale → post-sale voronkaga avtomatik ko'chirish ──
+  private async maybeAdvanceToPostSalePipeline(tenantId: string, clientId: string, toStage: string) {
+    try {
+      let dealWon = false;
+
+      if (toStage.startsWith('CUSTOM_')) {
+        const stageId = toStage.slice('CUSTOM_'.length);
+        const cs = await this.prisma.customStage.findFirst({
+          where: { id: stageId, tenantId },
+          include: { pipeline: true },
+        });
+        // Faqat DEFAULT (pre-sale) pipelinening "isClosing" (va "isLost" emas)
+        // bosqichi haqiqiy sotuv yakunlanishi hisoblanadi.
+        if (cs && cs.isClosing && !cs.isLost && cs.pipeline?.isDefault) dealWon = true;
+      } else if (toStage === 'COMPLETED') {
+        dealWon = true;
+      }
+
+      if (!dealWon) return;
+
+      const postSalePipeline = await this.prisma.pipeline.findFirst({
+        where: { tenantId, isDefault: false },
+        include: { stages: { orderBy: { order: 'asc' } } },
+      });
+      if (!postSalePipeline || !postSalePipeline.stages?.length) return;
+
+      const firstStage = postSalePipeline.stages[0];
+      await this.prisma.client.update({
+        where: { id: clientId },
+        data: { customStageId: firstStage.id, pipelineStageAt: new Date() },
+      });
+
+      await this.prisma.clientTimeline.create({
+        data: {
+          clientId, userId: null, type: 'stage_change',
+          title: `Sotuv yakunlandi → "${postSalePipeline.name}" voronkasiga o'tkazildi`,
+          description: `Bosqich: ${firstStage.name}`,
+          metadata: { from: toStage, to: `CUSTOM_${firstStage.id}`, auto: true },
+        } as any,
+      }).catch(swallow('mijoz tarixi'));
+    } catch (e) {
+      this.logger.warn(`Post-sale auto-transition xatosi: ${e}`);
+    }
   }
 
   // ─── Call attempts (stored in preferences JSON) ────────────────────────────
