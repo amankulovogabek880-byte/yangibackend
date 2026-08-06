@@ -319,6 +319,86 @@ export class FacebookLeadsService {
     }
   }
 
+  /**
+   * 🩹 TUZATISH: Facebook Page'ga bog'langan Instagram professional
+   * (Business/Creator) akkaunt ID'sini topadi.
+   *
+   * Ilgari bu yerda TEKSHIRUVSIZ to'g'ridan-to'g'ri Facebook Page ID'ning
+   * o'zi `instagram.saveConfig`ga `pageId` sifatida yuborilardi. Bu ikki
+   * jihatdan noto'g'ri edi:
+   *   1) Agar Page'ga Instagram akkaunt umuman bog'lanmagan bo'lsa —
+   *      baribir "Instagram ulandi" deb ko'rsatilardi (soxta muvaffaqiyat),
+   *      chunki hech qanday tekshiruv yo'q edi.
+   *   2) Instagram Messaging webhook'lari (object=instagram) `entry.id`
+   *      sifatida Facebook Page ID'ni EMAS — aynan shu Instagram akkaunt
+   *      ID'sini yuboradi. Demak FB Page ID saqlansa, `findTenantByPageId`
+   *      hech qachon mos tenant topa olmasdi va DM'lar Chat bo'limiga
+   *      HECH QACHON tushmasdi — garchi ulanish "muvaffaqiyatli" ko'ringan
+   *      taqdirda ham.
+   *
+   * Endi shu funksiya Graph API orqali haqiqiy bog'langan Instagram
+   * akkauntni so'raydi va topilmasa ANIQ xabar bilan rad etadi — soxta
+   * "ulandi" holatiga yo'l qo'ymaydi.
+   */
+  private async findLinkedInstagramAccount(
+    pageId: string,
+    pageAccessToken: string,
+  ): Promise<{ id: string; username?: string } | null> {
+    try {
+      const url =
+        `https://graph.facebook.com/${GRAPH_API_VERSION}/${pageId}` +
+        `?fields=instagram_business_account{id,username}` +
+        `&access_token=${encodeURIComponent(pageAccessToken)}`;
+      const res = await fetch(url);
+      const json: any = await res.json().catch(() => ({}));
+      const acc = json?.instagram_business_account;
+      if (!res.ok) {
+        this.logger.warn('Instagram business account so\'rovi xato: ' + JSON.stringify(json));
+        return null;
+      }
+      if (!acc?.id) return null;
+      return { id: acc.id, username: acc.username };
+    } catch (e: any) {
+      this.logger.warn(`Instagram business account qidirishda xato: ${e.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Tanlangan Facebook Page uchun Instagram DM ulanishini sinaydi va
+   * natija (ulandi/yo'q + admin ko'radigan sabab) qaytaradi. Ikkala joyda
+   * (bitta Page avtomatik oqimi va qo'lda Page tanlash oqimi) ishlatiladi
+   * — mantiq ikki marta yozilmasligi uchun.
+   */
+  private async connectInstagramForPage(
+    tenantId: string,
+    pageId: string,
+    pageAccessToken: string,
+  ): Promise<{ connected: boolean; error: string }> {
+    try {
+      const igAccount = await this.findLinkedInstagramAccount(pageId, pageAccessToken);
+      if (!igAccount) {
+        return {
+          connected: false,
+          error:
+            "Bu Facebook Page'ga Instagram professional (Business yoki Creator) akkaunt " +
+            "bog'lanmagan. Instagram ilovasida: Sozlamalar → Hisob turi → Professional " +
+            "akkauntga o'ting, so'ng uni aynan shu Facebook Page'ga bog'lang va \"Facebook " +
+            "orqali ulash\"ni qaytadan bosing.",
+        };
+      }
+      await this.instagram.saveConfig(tenantId, {
+        accessToken: pageAccessToken,
+        pageId: igAccount.id,
+      });
+      return { connected: true, error: '' };
+    } catch (e: any) {
+      const msg = e?.message || '';
+      this.logger.warn(`Instagram ulanmadi (Facebook ishlayapti): ${msg}`);
+      return { connected: false, error: msg };
+    }
+  }
+
   // ─────────────────────────────────────────────────────────────────
   // WEBHOOK
   // ─────────────────────────────────────────────────────────────────
@@ -1523,18 +1603,8 @@ export class FacebookLeadsService {
           pageName: pages[0].name,
         });
         // Instagram DM ham shu bitta tugma orqali ulanadi
-        let instagramConnected = false;
-        let instagramError = '';
-        try {
-          await this.instagram.saveConfig(payload.tenantId, {
-            accessToken: pages[0].access_token,
-            pageId: pages[0].id,
-          });
-          instagramConnected = true;
-        } catch (e: any) {
-          instagramError = e?.message || '';
-          this.logger.warn(`Instagram ulanmadi (Facebook ishlayapti): ${instagramError}`);
-        }
+        const { connected: instagramConnected, error: instagramError } =
+          await this.connectInstagramForPage(payload.tenantId, pages[0].id, pages[0].access_token);
         const igParam = `&ig=${instagramConnected ? '1' : '0'}` +
           (instagramError ? `&igMsg=${encodeURIComponent(instagramError)}` : '');
 
@@ -1621,13 +1691,8 @@ export class FacebookLeadsService {
       pageName: found.name,
     });
 
-    let instagramConnected = false;
-    try {
-      await this.instagram.saveConfig(tenantId, { accessToken: plainToken, pageId: found.id });
-      instagramConnected = true;
-    } catch (e: any) {
-      this.logger.warn(`Instagram ulanmadi (Facebook ishlayapti): ${e?.message}`);
-    }
+    const { connected: instagramConnected, error: instagramError } =
+      await this.connectInstagramForPage(tenantId, found.id, plainToken);
 
     await this.patchSettings(tenantId, { facebookOAuthPending: null });
 
@@ -1635,7 +1700,7 @@ export class FacebookLeadsService {
       .then(() => this.drainQueue())
       .catch(swallow("boshlang'ich backfill"));
 
-    return { ...(result as any), instagramConnected };
+    return { ...(result as any), instagramConnected, instagramError };
   }
 
   // ─────────────────────────────────────────────────────────────────
