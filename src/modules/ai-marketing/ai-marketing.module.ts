@@ -82,9 +82,18 @@ export interface TourAdInput {
   // Tayyor dizayn uslubi (TurMaker'dagi "bir nechta shablon" g'oyasi):
   // "classic" — standart (nishon + urg'u chiplari + narx chip'i),
   // "minimal" — sodda, kamroq element, yumshoqroq qorong'ilashuv,
-  // "bold" — pastda to'liq kenglikdagi rangli chiziq, yirik narx.
+  // "bold" — pastda to'liq kenglikdagi rangli chiziq, yirik narx,
+  // "gallery" — "rasm ustiga rasm": fon surat ustiga QO'SHIMCHA 1-2 ta
+  // (masalan mehmonxona binosi + xona) surat, kichraytirilgan, dumaloq
+  // burchakli panel sifatida qo'yiladi (pastdagi `galleryImages`dan).
   // Berilmasa "classic".
-  bannerTheme?: 'classic' | 'minimal' | 'bold';
+  bannerTheme?: 'classic' | 'minimal' | 'bold' | 'gallery';
+
+  // "gallery" temasi uchun: fon surat ustiga qo'shimcha qo'yiladigan
+  // 1-2 ta surat URL'i (masalan mehmonxona binosi, xona ichi). Har
+  // biri avtomatik kichraytirilib, dumaloq burchakli panel sifatida
+  // banner ustiga joylanadi. Boshqa temalar bu maydonni e'tiborsiz qoldiradi.
+  galleryImages?: string[];
 
   // ─────────────────────────────────────────────────────────────
   // ERKIN JOYLASHTIRISH (drag & drop) — foydalanuvchi jonli
@@ -195,9 +204,73 @@ export class AiMarketingService {
   private get unsplashKey() {
     return (process.env.UNSPLASH_ACCESS_KEY || '').trim();
   }
+  /**
+   * ⚠️ MUHIM TUZATISH: Anthropic/Claude API — bu MATN modeli, u SURAT
+   * (piksel) generatsiya qila OLMAYDI (rasmni faqat "o'qiy" oladi, lekin
+   * chizib bera olmaydi — bu boshqa arxitektura, diffusion model talab
+   * qiladi). Shu sabab reklama matnini yozadigan xuddi shu
+   * ANTHROPIC_API_KEY bilan rasm yaratib bo'lmaydi — bu texnik cheklov,
+   * kamchilik emas. Rasm generatsiyasi uchun ALOHIDA xizmat (Stability AI)
+   * ishlatiladi, lekin quyidagi ikkita narsa Claude copywriter bilan BIR
+   * XIL qoidaga bo'ysunadi: 1) tenant.settings.aiEnabled o'chirilgan
+   * bo'lsa (Owner tomonidan), bu funksiya ham ishlamaydi, 2) narx —
+   * agar kelajakda Anthropic rasmiy rasm modelini chiqarsa, shu yerga
+   * ANTHROPIC_API_KEY bilan almashtirish YETARLI (boshqa joy o'zgarmaydi).
+   */
+  private get stabilityKey() {
+    return (process.env.STABILITY_API_KEY || '').trim();
+  }
 
   isConfigured(): boolean {
     return !!this.anthropicKey;
+  }
+
+  /** AI orqali fon surat generatsiya qilish serverda sozlanganmi. */
+  aiImageConfigured(): boolean {
+    return !!this.stabilityKey;
+  }
+
+  /**
+   * Tur ma'lumotlari (yo'nalish, mehmonxona) asosida tuzilgan matn
+   * (`prompt`)dan AI orqali yangi, noyob fon surat yaratadi va doimiy
+   * saqlashga yuklab, ochiq URL qaytaradi. Owner AI'ni o'chirgan
+   * kompaniyada (tenant.settings.aiEnabled=false) — reklama matni
+   * (Claude) kabi — bu ham ishlamaydi.
+   */
+  async generateAiImage(tenantId: string, prompt: string): Promise<string> {
+    if (!(await this.isAiEnabledForTenant(tenantId))) {
+      throw new BadRequestException(
+        "Bu kompaniyada AI xizmati yoqilmagan. Yoqish uchun platforma administratoriga murojaat qiling.",
+      );
+    }
+    if (!this.stabilityKey) {
+      throw new BadRequestException(
+        "AI rasm generatori sozlanmagan: serverda STABILITY_API_KEY o'rnatilmagan. Claude " +
+          "(ANTHROPIC_API_KEY) faqat MATN yozadi, surat chiza olmaydi — shu sabab rasm generatsiyasi " +
+          "uchun ALOHIDA kalit kerak. Bepul/pullik kalitni platform.stability.ai'dan olib, backend " +
+          "serveridagi .env fayliga qo'shing va serverni qayta ishga tushiring.",
+      );
+    }
+    try {
+      const form = new FormData();
+      form.append('prompt', prompt);
+      form.append('output_format', 'png');
+      form.append('aspect_ratio', '1:1');
+      const res = await fetch('https://api.stability.ai/v2beta/stable-image/generate/core', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.stabilityKey}`, Accept: 'image/*' },
+        body: form as any,
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status} ${errText.slice(0, 200)}`);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      return await uploadBufferToStorage(buf, `ai-bg-${Date.now()}.png`, 'image/png');
+    } catch (e: any) {
+      this.logger.error(`AI rasm generatsiyasida xato: ${e.message}`);
+      throw new BadRequestException(`AI rasm yaratib bo'lmadi: ${e.message}`);
+    }
   }
 
   /**
@@ -895,7 +968,7 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
     width = 1080,
     height = width,
     logo?: { dataUri: string; size: number },
-    theme: 'classic' | 'minimal' | 'bold' = 'classic',
+    theme: 'classic' | 'minimal' | 'bold' | 'gallery' = 'classic',
   ): string {
     const safeColor = /^#[0-9a-fA-F]{3,8}$/.test(accentColor) ? accentColor : '#FF6A2B';
     const isRu = input.adLanguage === 'ru';
@@ -1128,6 +1201,35 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
   }
 
   /**
+   * "gallery" temasi uchun: berilgan URL'dagi suratni `w`×`h`ga
+   * (kichraytirib/kesib, "cover" rejimida) moslaydi va dumaloq
+   * burchakli (radius `r`) shaffof-fonli PNG buferga aylantiradi —
+   * shu holda asosiy banner ustiga to'g'ridan-to'g'ri qo'yish mumkin
+   * ("rasm ustiga rasm"). Yuklab bo'lmasa yoki xato chiqsa — `null`
+   * qaytaradi (banner baribir, shu suratsiz, muvaffaqiyatli chiqadi).
+   */
+  private async buildRoundedImage(url: string, w: number, h: number, r: number): Promise<Buffer | null> {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const buf = Buffer.from(await res.arrayBuffer());
+      const resized = await sharp(buf)
+        .resize(w, h, { fit: 'cover', position: 'attention' })
+        .toBuffer();
+      const mask = Buffer.from(
+        `<svg width="${w}" height="${h}"><rect x="0" y="0" width="${w}" height="${h}" rx="${r}" ry="${r}" fill="#fff"/></svg>`,
+      );
+      return await sharp(resized)
+        .composite([{ input: mask, blend: 'dest-in' }])
+        .png()
+        .toBuffer();
+    } catch (e: any) {
+      this.logger.warn(`Galereya suratini tayyorlashda xato (o'tkazib yuborildi): ${e.message}`);
+      return null;
+    }
+  }
+
+  /**
    * Fon surati + matn qatlamini birlashtirib, tayyor 1080×1080
    * banner (PNG) yaratadi va doimiy saqlashga (Supabase/mahalliy
    * disk) yuklab, ochiq URL qaytaradi.
@@ -1195,14 +1297,43 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
     // uslubi bilan) matn qatlamini qo'shamiz
     const width = 1080;
     const height = input.bannerFormat === 'story' ? 1920 : 1080;
-    const theme: 'classic' | 'minimal' | 'bold' =
-      input.bannerTheme === 'minimal' || input.bannerTheme === 'bold' ? input.bannerTheme : 'classic';
+    const theme: 'classic' | 'minimal' | 'bold' | 'gallery' =
+      input.bannerTheme === 'minimal' || input.bannerTheme === 'bold' || input.bannerTheme === 'gallery'
+        ? input.bannerTheme
+        : 'classic';
+
+    // "gallery" temasi: fon surat ustiga QO'SHIMCHA 1-2 ta surat
+    // (masalan mehmonxona binosi + xona) — kichraytirilgan, dumaloq
+    // burchakli panel sifatida, o'ng tomonda, matn bilan to'qnashmaydigan
+    // (yuqori-o'rta) hududda joylanadi. Har bir surat ALOHIDA yuklanadi —
+    // biri topilmasa ham banner qolganlari bilan muvaffaqiyatli chiqadi.
+    const galleryLayers: sharp.OverlayOptions[] = [];
+    if (theme === 'gallery' && input.galleryImages?.length) {
+      const panelW = Math.round(width * 0.38);
+      const panelH = Math.round(height * 0.155);
+      const panelX = width - panelW - 60;
+      let panelY = Math.round(height * 0.3);
+      const urls = input.galleryImages.filter((u) => typeof u === 'string' && u.trim()).slice(0, 2);
+      for (const imgUrl of urls) {
+        const rounded = await this.buildRoundedImage(imgUrl.trim(), panelW, panelH, 22);
+        if (rounded) {
+          const frame = Buffer.from(
+            `<svg width="${panelW + 16}" height="${panelH + 16}">` +
+              `<rect width="${panelW + 16}" height="${panelH + 16}" rx="28" fill="#000000" fill-opacity="0.28"/></svg>`,
+          );
+          galleryLayers.push({ input: frame, left: panelX - 8, top: panelY - 8 });
+          galleryLayers.push({ input: rounded, left: panelX, top: panelY });
+          panelY += panelH + 20;
+        }
+      }
+    }
+
     let pngBuffer: Buffer;
     try {
       const svg = this.buildBannerSvg(input, template.primaryColor, width, height, logo, theme);
       pngBuffer = await sharp(bgBuffer)
         .resize(width, height, { fit: 'cover', position: 'attention' })
-        .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
+        .composite([...galleryLayers, { input: Buffer.from(svg), top: 0, left: 0 }])
         .png({ quality: 90 })
         .toBuffer();
     } catch (e: any) {
@@ -1449,6 +1580,185 @@ Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki
       throw new BadRequestException(`Facebook'ga yuborib bo'lmadi: ${e.message}`);
     }
   }
+
+  // ─────────────────────────────────────────────────────────────
+  // ✅ INSTAGRAM: avtomatik joylash — bog'langan Facebook sahifasi
+  // orqali (alohida Instagram login SHART EMAS). Instagram Business/
+  // Creator hisobi Meta tomonidan doim biror Facebook sahifasiga
+  // ULANGAN holda ishlaydi — shu sahifaning Page Access Token'i bilan
+  // Meta'ning "Content Publishing API"siga (2 bosqich: konteyner
+  // yaratish → chop etish) so'rov yuboramiz.
+  //
+  // SHART: ilova Meta App Review'da `instagram_basic` va
+  // `instagram_content_publish` ruxsatlarini olgan bo'lishi kerak
+  // (hozircha `facebook-leads` integratsiyasi faqat lead-ruxsatlarni
+  // so'ragan edi — bu YANGI, qo'shimcha ruxsat, Meta App Review orqali
+  // alohida so'raladi). Ruxsat hali tasdiqlanmagan bo'lsa, Meta aniq
+  // xato qaytaradi — shu xato quyida tushunarli qilib ko'rsatiladi.
+  // ─────────────────────────────────────────────────────────────
+  async sendToInstagram(
+    tenantId: string,
+    data: { photoUrl: string; caption: string },
+  ): Promise<{ postId: string }> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true, facebookPageId: true },
+    });
+    const s: any = tenant?.settings || {};
+    const pageId = tenant?.facebookPageId || s.facebookPageId;
+    const encToken = s.facebookPageAccessToken;
+
+    if (!pageId || !encToken) {
+      throw new BadRequestException(
+        "Facebook sahifasi ulanmagan (Instagram shu sahifa orqali ishlaydi). Avval Sozlamalar → " +
+          "Facebook Ads bo'limida sahifangizni ulang, so'ng o'sha sahifaga Instagram Business " +
+          "hisobingizni bog'lang.",
+      );
+    }
+    const accessToken = this.encryption.decrypt(encToken);
+    if (!accessToken) {
+      throw new BadRequestException(
+        "Facebook tokeni o'qib bo'lmadi — Sozlamalar → Facebook Ads'da sahifani qaytadan ulang.",
+      );
+    }
+
+    try {
+      // 1) Shu sahifaga bog'langan Instagram Business hisobini topamiz
+      const igRes = await fetch(
+        `https://graph.facebook.com/v23.0/${pageId}?fields=instagram_business_account` +
+          `&access_token=${encodeURIComponent(accessToken)}`,
+      );
+      const igJ: any = await igRes.json().catch(() => ({}));
+      const igUserId = igJ?.instagram_business_account?.id;
+      if (!igRes.ok || !igUserId) {
+        throw new Error(
+          "Bu Facebook sahifasiga Instagram Business/Creator hisobi bog'lanmagan. Instagram " +
+            "ilovasida: Sozlamalar → Hisob turi → Professional hisobga o'ting, so'ng uni shu " +
+            'Facebook sahifasiga ulang (Meta Business Suite orqali ham qilsa bo\'ladi).',
+        );
+      }
+
+      // 2) Media konteyner yaratamiz (rasm URL'i + caption)
+      const createRes = await fetch(`https://graph.facebook.com/v23.0/${igUserId}/media`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          image_url: data.photoUrl,
+          caption: data.caption,
+          access_token: accessToken,
+        }),
+      });
+      const createJ: any = await createRes.json().catch(() => ({}));
+      if (!createRes.ok || !createJ?.id) {
+        const msg = createJ?.error?.message || `HTTP ${createRes.status}`;
+        if (/permission|scope|OAuthException|content_publish/i.test(msg)) {
+          throw new Error(
+            `${msg}. Ilova Meta'dan "instagram_content_publish" ruxsatini olishi kerak — bu ` +
+              "Meta App Review orqali alohida so'raladi (hozirgi ruxsatlarga qo'shimcha).",
+          );
+        }
+        throw new Error(msg);
+      }
+
+      // 3) Konteynerni chop etamiz — shu payt post haqiqatan Instagram feed'iga tushadi
+      const pubRes = await fetch(`https://graph.facebook.com/v23.0/${igUserId}/media_publish`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ creation_id: createJ.id, access_token: accessToken }),
+      });
+      const pubJ: any = await pubRes.json().catch(() => ({}));
+      if (!pubRes.ok || !pubJ?.id) {
+        const msg = pubJ?.error?.message || `HTTP ${pubRes.status}`;
+        throw new Error(msg);
+      }
+      return { postId: pubJ.id };
+    } catch (e: any) {
+      this.logger.error(`Instagram'ga yuborishda xato: ${e.message}`);
+      throw new BadRequestException(`Instagram'ga yuborib bo'lmadi: ${e.message}`);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // 🚀 BITTA TUGMA: tur ma'lumotlaridan banner yaratadi va TANLANGAN
+  // barcha kanallarga (Telegram/Facebook/Instagram) BIR so'rovda
+  // joylaydi — masalan tur yaratish oynasidan to'g'ridan-to'g'ri
+  // chaqirish uchun mo'ljallangan. Har bir kanal ALOHIDA-ALOHIDA
+  // urinadi: biri xato bersa ham (masalan Instagram ulanmagan bo'lsa),
+  // boshqalari (Telegram/Facebook) baribir yuboriladi — natija VA xato
+  // har bir kanal uchun alohida qaytadi, chaqiruvchi tomon aniq
+  // qaysi kanal muvaffaqiyatli bo'lganini ko'ra oladi.
+  // ─────────────────────────────────────────────────────────────
+  async publishTour(
+    tenantId: string,
+    body: {
+      input: TourAdInput;
+      telegram?: { chatId: string; telegramAccountId?: string; caption?: string; useTemplate?: boolean };
+      facebook?: { caption?: string };
+      instagram?: { caption?: string };
+    },
+  ): Promise<{
+    bannerUrl: string;
+    results: { telegram?: { messageId: number }; facebook?: { postId: string }; instagram?: { postId: string } };
+    errors: { telegram?: string; facebook?: string; instagram?: string };
+  }> {
+    const banner = await this.generateBanner(tenantId, body.input);
+    const results: any = {};
+    const errors: any = {};
+
+    // AI copywriter matnini kerak bo'lgandagina va FAQAT BIR MARTA
+    // so'raymiz (bir nechta kanal caption bermagan bo'lsa ham qayta-qayta
+    // so'ramaslik uchun) — AI o'chiq/sozlanmagan bo'lsa ham xato tashlamaydi,
+    // shunchaki `null` qaytadi, shunda oddiy matn (fallback) ishlatiladi.
+    let cachedPosts: TourAdOutput['posts'] | null | undefined;
+    const getPosts = async () => {
+      if (cachedPosts === undefined) {
+        cachedPosts = await this.generatePosts(body.input).catch(() => null);
+      }
+      return cachedPosts;
+    };
+    const fallbackCaption = () =>
+      `${body.input.destination}${body.input.hotelName ? ` — ${body.input.hotelName}` : ''}\n` +
+      `💰 ${Math.round(body.input.price).toLocaleString('ru-RU')} ${body.input.currency || 'USD'}`;
+
+    if (body.telegram?.chatId) {
+      try {
+        let caption = body.telegram.caption;
+        if (!caption && body.telegram.useTemplate !== false) {
+          const rendered = await this.renderTelegramTemplate(tenantId, body.input);
+          caption = rendered.text;
+        }
+        if (!caption) caption = (await getPosts())?.telegram || fallbackCaption();
+        results.telegram = await this.sendToTelegram(tenantId, {
+          chatId: body.telegram.chatId,
+          photoUrl: banner.bannerUrl,
+          caption,
+          telegramAccountId: body.telegram.telegramAccountId,
+        });
+      } catch (e: any) {
+        errors.telegram = e?.message || "Telegram'ga yuborib bo'lmadi";
+      }
+    }
+
+    if (body.facebook) {
+      try {
+        const caption = body.facebook.caption || (await getPosts())?.facebook || fallbackCaption();
+        results.facebook = await this.sendToFacebookPage(tenantId, { photoUrl: banner.bannerUrl, caption });
+      } catch (e: any) {
+        errors.facebook = e?.message || "Facebook'ga yuborib bo'lmadi";
+      }
+    }
+
+    if (body.instagram) {
+      try {
+        const caption = body.instagram.caption || (await getPosts())?.instagram || fallbackCaption();
+        results.instagram = await this.sendToInstagram(tenantId, { photoUrl: banner.bannerUrl, caption });
+      } catch (e: any) {
+        errors.instagram = e?.message || "Instagram'ga yuborib bo'lmadi";
+      }
+    }
+
+    return { bannerUrl: banner.bannerUrl, results, errors };
+  }
 }
 
 @Controller('ai-marketing')
@@ -1496,6 +1806,33 @@ export class AiMarketingController {
       ? await this.svc.findImages(body.query, body.count || 16)
       : [];
     return Array.from(new Set([...libraryPhotos, ...stockPhotos]));
+  }
+
+  /**
+   * Stok-foto qidirish o'rniga — AI orqali tur ma'lumotlariga mos
+   * YANGI, noyob fon surat generatsiya qiladi (ixtiyoriy funksiya,
+   * serverda STABILITY_API_KEY sozlangan bo'lishi kerak).
+   */
+  @Post('images/ai-generate')
+  async aiGenerateImage(
+    @CurrentUser() u: any,
+    @Body() body: { prompt?: string; destination?: string; hotelName?: string },
+  ) {
+    if (!this.svc.aiImageConfigured()) {
+      throw new BadRequestException(
+        "AI rasm generatori yoqilmagan: serverda STABILITY_API_KEY o'rnatilmagan. Claude (matn AI) " +
+          "surat chiza olmaydi, shu sabab rasm generatsiyasi uchun alohida kalit kerak — " +
+          "platform.stability.ai'dan olib, backend serveridagi .env fayliga qo'shing va serverni " +
+          "qayta ishga tushiring.",
+      );
+    }
+    const prompt =
+      body.prompt?.trim() ||
+      `Professional high-quality travel photography of ${body.destination || 'a beautiful travel destination'}` +
+        `${body.hotelName ? `, near ${body.hotelName} hotel` : ''}, vibrant colors, golden hour lighting, ` +
+        'wide shot, no text, no watermark, no people close-up';
+    const url = await this.svc.generateAiImage(u.tenantId, prompt);
+    return { url };
   }
 
   // ── MEHMONXONA RASM KUTUBXONASI ──
@@ -1618,6 +1955,45 @@ export class AiMarketingController {
     if (!body?.photoUrl) throw new BadRequestException("Rasm URL'i kerak");
     if (!body?.caption) throw new BadRequestException('Post matni (caption) kerak');
     return this.svc.sendToFacebookPage(u.tenantId, body);
+  }
+
+  /**
+   * Tayyor bannerni bog'langan Instagram Business/Creator hisobiga
+   * avtomatik joylaydi (Facebook sahifasi orqali — batafsil izoh
+   * `AiMarketingService.sendToInstagram`da).
+   */
+  @Post('send/instagram')
+  sendInstagram(@CurrentUser() u: any, @Body() body: { photoUrl: string; caption: string }) {
+    if (!body?.photoUrl) throw new BadRequestException("Rasm URL'i kerak");
+    if (!body?.caption) throw new BadRequestException('Post matni (caption) kerak');
+    return this.svc.sendToInstagram(u.tenantId, body);
+  }
+
+  /**
+   * 🚀 BIR TUGMA: banner yaratadi va tanlangan kanallarga (Telegram/
+   * Facebook/Instagram) bitta so'rovda joylaydi — tur yaratish oynasidan
+   * to'g'ridan-to'g'ri chaqirish uchun mo'ljallangan. Har bir kanal
+   * alohida urinadi, biri xato bersa ham qolganlari yuboriladi.
+   */
+  @Post('publish')
+  publish(
+    @CurrentUser() u: any,
+    @Body()
+    body: {
+      input: TourAdInput;
+      telegram?: { chatId: string; telegramAccountId?: string; caption?: string; useTemplate?: boolean };
+      facebook?: { caption?: string } | boolean;
+      instagram?: { caption?: string } | boolean;
+    },
+  ) {
+    if (!body?.input?.destination) throw new BadRequestException("Yo'nalish (destination) kiritilishi shart");
+    if (!body?.input?.price) throw new BadRequestException('Narx kiritilishi shart');
+    return this.svc.publishTour(u.tenantId, {
+      input: body.input,
+      telegram: body.telegram,
+      facebook: body.facebook === true ? {} : body.facebook || undefined,
+      instagram: body.instagram === true ? {} : body.instagram || undefined,
+    });
   }
 
   // ── TARIX (History) ──
