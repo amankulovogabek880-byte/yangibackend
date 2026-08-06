@@ -11,12 +11,17 @@ import {
   Body,
   Query,
   UseGuards,
+  UseInterceptors,
+  UploadedFile,
+  BadRequestException,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { ClientsService } from './clients.service';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { RoundRobinModule } from '../v9/round-robin.module';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
-import { CurrentUser } from '../../common/decorators';
+import { RolesGuard } from '../../common/guards/roles.guard';
+import { CurrentUser, Roles } from '../../common/decorators';
 
 @Controller('clients')
 @UseGuards(JwtAuthGuard)
@@ -73,6 +78,29 @@ export class ClientsController {
   @Post()
   create(@Body() body: any, @CurrentUser() u: any) {
     return this.svc.create(u.tenantId, u.sub, body);
+  }
+
+  /**
+   * v33: Excel (.xlsx) yoki CSV fayldan ko'p sonli lead import qilish.
+   * Mijoz CRM'ga o'tganda eski tizimidan (Excel/Google Sheets/boshqa CRM)
+   * 1000-2000+ lead ko'chiriladi — har biri ALOHIDA mijoz bo'lib yaraladi,
+   * oldingi turgan bosqichi (stage) saqlanib qoladi. Ommaviy operatsiya
+   * bo'lgani uchun faqat ADMIN/MANAGER chaqira oladi.
+   *
+   * Fayl ustunlari (sarlavha qatorida, tartib muhim emas):
+   *   Ism* | Telefon | Telefon2 | Email | Manba | Bosqich | Shahar | Davlat |
+   *   Yo'nalish | Byudjet | Izoh | Teglar | Agent
+   * (* — majburiy, boshqalari ixtiyoriy)
+   */
+  @Post('import')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN', 'MANAGER')
+  @UseInterceptors(FileInterceptor('file', {
+    limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB — bir necha ming qatorga yetadi
+  }))
+  importLeads(@UploadedFile() file: Express.Multer.File, @CurrentUser() u: any) {
+    if (!file) throw new BadRequestException("Fayl yuklanmadi (.xlsx yoki .csv kerak, 'file' maydonida)");
+    return this.svc.importLeads(u.tenantId, u.sub, file);
   }
 
   @Put(':id')

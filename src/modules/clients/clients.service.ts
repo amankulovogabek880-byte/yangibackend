@@ -31,6 +31,80 @@ const SOURCES: LeadSource[] = [
 ];
 const LANGUAGES: Language[] = ['UZ', 'RU', 'EN'];
 
+// ─── v33: Bulk import (Excel/CSV) — eski tizimdan ko'chirilgan leadlar ───────
+// Turfirma CRM'ni o'rnatganda odatda 1000-2000+ eski lead bo'ladi — hammasi
+// alohida mijoz sifatida import qilinishi va OLDINGI turgan bosqichi (stage)
+// saqlanib qolishi kerak. Fayldagi ustun nomlari turlicha bo'lishi mumkin
+// (o'zbekcha/ruscha/inglizcha) — shuning uchun sinonimlar lug'ati orqali
+// moslashtiriladi.
+const IMPORT_HEADER_ALIASES: Record<string, string[]> = {
+  fullName: ["to'liq ism", 'toliq ism', 'ism', 'f.i.o', 'fio', 'name', 'full name', 'client', 'имя', 'фио', 'клиент', 'mijoz', 'mijoz ismi'],
+  phone: ['telefon', 'telefon raqami', 'tel', 'raqam', 'phone', 'phone number', 'телефон', 'номер'],
+  phone2: ['telefon2', "qo'shimcha telefon", 'qoshimcha telefon', 'phone2', 'телефон2'],
+  email: ['email', 'e-mail', 'почта'],
+  source: ['manba', 'source', 'источник'],
+  stage: ['bosqich', 'stage', 'status', 'holat', 'стадия', 'статус', 'этап'],
+  notes: ['izoh', 'izohlar', 'note', 'notes', 'comment', 'комментарий', 'примечание'],
+  city: ['shahar', 'city', 'город'],
+  country: ['davlat', 'country', 'страна'],
+  destination: ["yo'nalish", 'yonalish', 'destination', 'направление'],
+  budget: ['byudjet', 'budget', 'бюджет'],
+  tags: ['teglar', 'tags', 'метки', 'tegi'],
+  agent: ['agent', 'menejer', 'менеджер', 'manager', "mas'ul"],
+};
+
+const IMPORT_STAGE_ALIASES: Record<string, string> = {
+  'yangi lid': 'NEW_LEAD',
+  'yangi': 'NEW_LEAD',
+  'aloqa ornatildi': 'CONTACTED',
+  'aloqa qilindi': 'CONTACTED',
+  'aloqa ornatilmadi': 'INTERESTED',
+  'qiziqdi': 'INTERESTED',
+  'taklif yuborildi': 'OFFER_SENT',
+  'taklif': 'OFFER_SENT',
+  'qayta aloqa': 'NEGOTIATION',
+  'muzokara': 'NEGOTIATION',
+  'offisga chaqirildi': 'DEPOSIT_PAID',
+  'keldi': 'CONFIRMED',
+  'tasdiqlandi': 'CONFIRMED',
+  'kelmadi': 'TRAVELING',
+  'sayohatda': 'TRAVELING',
+  'avans tolandi': 'DEPOSIT_PAID',
+  'avans': 'DEPOSIT_PAID',
+  'tolandi': 'COMPLETED',
+  "to'liq tolandi": 'COMPLETED',
+  'yakunlandi': 'COMPLETED',
+  "yoqotildi": 'LOST',
+  'bekor qilindi': 'LOST',
+  'sayohatga ketuvchilar': 'CONFIRMED',
+  'sayohatdagilar': 'TRAVELING',
+  'sayohatdan qaytganlar': 'COMPLETED',
+};
+
+const IMPORT_SOURCE_ALIASES: Record<string, string> = {
+  'telegram': 'TELEGRAM',
+  'instagram': 'INSTAGRAM',
+  'insta': 'INSTAGRAM',
+  'whatsapp': 'WHATSAPP',
+  'vatsap': 'WHATSAPP',
+  'tavsiya': 'REFERRAL',
+  'referral': 'REFERRAL',
+  "do'stdan": 'REFERRAL',
+  'ofisga keldi': 'WALKIN',
+  'ofis': 'WALKIN',
+  'walkin': 'WALKIN',
+  'sayt': 'WEBSITE',
+  'website': 'WEBSITE',
+  'veb sayt': 'WEBSITE',
+  "qo'ngiroq": 'CALL',
+  'qongiroq': 'CALL',
+  'call': 'CALL',
+  'facebook': 'FACEBOOK',
+  'fb': 'FACEBOOK',
+  'google': 'GOOGLE_ADS',
+  'google ads': 'GOOGLE_ADS',
+};
+
 @Injectable()
 export class ClientsService {
   private readonly logger = new Logger('Clients');
@@ -369,6 +443,296 @@ export class ClientsService {
     void this.cache.invalidateReports(tenantId);
 
     return client;
+  }
+
+  // ─── v33: Bulk import (Excel/CSV) ──────────────────────────────────────────
+
+  /** Matnni solishtirish uchun normallashtiradi: kichik harf, apostroflarsiz, bo'sh joylar yig'ilgan */
+  private importNormText(s: any): string {
+    return String(s ?? '')
+      .trim()
+      .toLowerCase()
+      .replace(/['`ʼ’‘]/g, '')
+      .replace(/\s+/g, ' ');
+  }
+
+  /** ExcelJS katak qiymatini oddiy matnga aylantiradi (rich text, formula, sana va h.k.) */
+  private importCellText(v: any): string {
+    if (v === null || v === undefined) return '';
+    if (v instanceof Date) return v.toISOString().slice(0, 10);
+    if (typeof v === 'object') {
+      if (Array.isArray((v as any).richText)) {
+        return (v as any).richText.map((t: any) => t.text).join('');
+      }
+      if ((v as any).text !== undefined) return String((v as any).text);
+      if ((v as any).result !== undefined) return String((v as any).result);
+      return '';
+    }
+    return String(v);
+  }
+
+  /** Sarlavha qatoridan ustun indekslarini sinonimlar lug'ati orqali topadi */
+  private importMatchColumns(headers: string[]): Record<string, number> {
+    const map: Record<string, number> = {};
+    const normHeaders = headers.map((h) => this.importNormText(h));
+    for (const [field, aliases] of Object.entries(IMPORT_HEADER_ALIASES)) {
+      const normAliases = aliases.map((a) => this.importNormText(a));
+      let foundIdx = normHeaders.findIndex((h) => h && normAliases.includes(h));
+      if (foundIdx === -1) {
+        foundIdx = normHeaders.findIndex((h) => h && normAliases.some((a) => h.includes(a)));
+      }
+      if (foundIdx !== -1) map[field] = foundIdx;
+    }
+    return map;
+  }
+
+  private importResolveSource(raw: string): LeadSource {
+    const norm = this.importNormText(raw);
+    if (!norm) return 'OTHER';
+    const upper = raw.trim().toUpperCase();
+    if ((SOURCES as string[]).includes(upper)) return upper as LeadSource;
+    return (IMPORT_SOURCE_ALIASES[norm] as LeadSource) || 'OTHER';
+  }
+
+  /**
+   * Faylda ko'rsatilgan bosqich (stage) matnini topadi:
+   * 1) enum kaliti (masalan "CONTACTED")
+   * 2) standart o'zbekcha nomlar lug'ati
+   * 3) tenant'ning mavjud CustomStage'lari (nomi bo'yicha)
+   * Topilmasa chaqiruvchi tomon yangi CustomStage yaratadi (createMissingStages).
+   */
+  private importResolveKnownStage(
+    raw: string,
+    existingStagesByName: Map<string, string>,
+  ): string | null {
+    const norm = this.importNormText(raw);
+    if (!norm) return 'NEW_LEAD';
+
+    const upper = raw.trim().toUpperCase().replace(/\s+/g, '_');
+    const ENUM_VALUES = [
+      'NEW_LEAD', 'CONTACTED', 'INTERESTED', 'OFFER_SENT', 'NEGOTIATION',
+      'DEPOSIT_PAID', 'CONFIRMED', 'TRAVELING', 'COMPLETED', 'LOST',
+    ];
+    if (ENUM_VALUES.includes(upper)) return upper;
+    if (IMPORT_STAGE_ALIASES[norm]) return IMPORT_STAGE_ALIASES[norm];
+    if (existingStagesByName.has(norm)) return existingStagesByName.get(norm)!;
+    return null; // topilmadi — yangi CustomStage kerak bo'ladi
+  }
+
+  /**
+   * Excel (.xlsx) yoki CSV fayldan lead'larni o'qib, har birini ALOHIDA
+   * mijoz sifatida yaratadi. Har bir lead o'zining oldingi bosqichida
+   * (stage) qoladi — fayldagi bosqich nomi mos kelmasa, tenant pipeline'iga
+   * yangi bosqich sifatida qo'shiladi (hech qanday tarixiy ma'lumot
+   * yo'qolmaydi). Faqat ADMIN/MANAGER chaqira oladi (controller darajasida
+   * cheklangan) — bu ommaviy operatsiya.
+   */
+  async importLeads(tenantId: string, userId: string, file: any) {
+    if (!file?.buffer?.length) {
+      throw new BadRequestException('Fayl bo\'sh yoki yuklanmadi');
+    }
+    const MAX_ROWS = 10000;
+    const ext = (file.originalname || '').split('.').pop()?.toLowerCase();
+
+    // 1) Faylni o'qish (.xlsx yoki .csv)
+    const ExcelJS = await import('exceljs');
+    const wb = new ExcelJS.Workbook();
+    let sheet: any;
+    try {
+      if (ext === 'csv' || file.mimetype === 'text/csv') {
+        const { Readable } = await import('stream');
+        sheet = await wb.csv.read(Readable.from(file.buffer));
+      } else {
+        await wb.xlsx.load(file.buffer);
+        sheet = wb.worksheets[0];
+      }
+    } catch (e) {
+      throw new BadRequestException('Faylni o\'qib bo\'lmadi — .xlsx yoki .csv formatida ekanini tekshiring');
+    }
+    if (!sheet) throw new BadRequestException('Faylda varaq topilmadi');
+
+    const rawRows: string[][] = [];
+    sheet.eachRow((row: any) => {
+      const vals = (row.values as any[]).slice(1).map((v) => this.importCellText(v));
+      rawRows.push(vals);
+    });
+    if (rawRows.length < 2) {
+      throw new BadRequestException('Faylda ma\'lumot topilmadi (sarlavha qatori + kamida 1 ta lead kerak)');
+    }
+    if (rawRows.length - 1 > MAX_ROWS) {
+      throw new BadRequestException(`Bir martada maksimal ${MAX_ROWS} qator import qilish mumkin — faylni bo'lib yuklang`);
+    }
+
+    const colMap = this.importMatchColumns(rawRows[0]);
+    if (colMap.fullName === undefined) {
+      throw new BadRequestException(
+        'Fayldan "Ism" (F.I.O / Name) ustuni topilmadi. Birinchi qator ustun sarlavhalari bo\'lishi kerak.',
+      );
+    }
+    const dataRows = rawRows.slice(1).filter((r) => r.some((c) => c && c.trim()));
+
+    // 2) Kerakli ma'lumotlarni oldindan yuklab olamiz (har qatorda so'rov yubormaslik uchun)
+    const [existingStages, tenantUsers, lastStage] = await Promise.all([
+      this.prisma.customStage.findMany({ where: { tenantId }, select: { id: true, name: true } }),
+      this.prisma.user.findMany({ where: { tenantId }, select: { id: true, name: true, email: true } }),
+      this.prisma.customStage.findFirst({
+        where: { tenantId },
+        orderBy: { order: 'desc' },
+        select: { order: true, pipelineId: true },
+      }),
+    ]);
+    const existingStagesByName = new Map<string, string>();
+    for (const s of existingStages) {
+      existingStagesByName.set(this.importNormText(s.name), 'CUSTOM_' + s.id);
+    }
+    const usersByKey = new Map<string, string>();
+    for (const u of tenantUsers) {
+      usersByKey.set(this.importNormText(u.email), u.id);
+      usersByKey.set(this.importNormText(u.name), u.id);
+    }
+
+    // 3) Fayldagi noma'lum bosqich nomlarini yig'ib, tenant pipeline'iga
+    //    bitta martada (createMany) yangi CustomStage sifatida qo'shamiz.
+    const unknownStageNames = new Map<string, string>(); // normText -> original raw
+    if (colMap.stage !== undefined) {
+      for (const row of dataRows) {
+        const raw = (row[colMap.stage] || '').trim();
+        if (!raw) continue;
+        const norm = this.importNormText(raw);
+        if (this.importResolveKnownStage(raw, existingStagesByName) === null && !unknownStageNames.has(norm)) {
+          unknownStageNames.set(norm, raw);
+        }
+      }
+    }
+    if (unknownStageNames.size > 0) {
+      let pipelineId = lastStage?.pipelineId;
+      if (!pipelineId) {
+        const pl = await this.prisma.pipeline.findFirst({
+          where: { tenantId },
+          orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
+          select: { id: true },
+        });
+        pipelineId = pl?.id;
+      }
+      if (pipelineId) {
+        let order = (lastStage?.order ?? 0) + 1;
+        const toCreate = Array.from(unknownStageNames.entries()).map(([norm, raw]) => ({
+          tenantId,
+          pipelineId: pipelineId as string,
+          name: raw,
+          color: '#94a3b8', // import orqali qo'shilgan bosqichlar — neytral rang
+          order: order++,
+        }));
+        await this.prisma.customStage.createMany({ data: toCreate });
+        // Endi yangi yaratilganlarni existingStagesByName'ga qo'shamiz
+        const created = await this.prisma.customStage.findMany({
+          where: { tenantId, pipelineId, name: { in: toCreate.map((t) => t.name) } },
+          select: { id: true, name: true },
+        });
+        for (const s of created) {
+          existingStagesByName.set(this.importNormText(s.name), 'CUSTOM_' + s.id);
+        }
+      }
+    }
+    const stagesCreated = Array.from(unknownStageNames.values());
+
+    // 4) Har bir qatorni Client yaratish uchun tayyorlaymiz
+    const now = new Date();
+    const errors: { row: number; reason: string }[] = [];
+    const seenPhonesInFile = new Set<string>();
+    const toCreate: any[] = [];
+
+    dataRows.forEach((row, idx) => {
+      const rowNum = idx + 2; // 1-qator sarlavha, ma'lumot 2-qatordan boshlanadi
+      const get = (field: string) => (colMap[field] !== undefined ? (row[colMap[field]] || '').trim() : '');
+
+      const fullName = get('fullName');
+      if (!fullName) {
+        errors.push({ row: rowNum, reason: 'Ism (F.I.O) bo\'sh' });
+        return;
+      }
+
+      let phone: string | null = null;
+      const rawPhone = get('phone');
+      if (rawPhone) {
+        phone = normalizePhone(rawPhone) || null;
+        if (phone) {
+          if (seenPhonesInFile.has(phone)) {
+            errors.push({ row: rowNum, reason: `Telefon takrorlandi faylda (${phone}) — o'tkazib yuborildi` });
+            return;
+          }
+          seenPhonesInFile.add(phone);
+        }
+      }
+
+      const stageRaw = get('stage');
+      const stage = stageRaw
+        ? (this.importResolveKnownStage(stageRaw, existingStagesByName) || 'NEW_LEAD')
+        : 'NEW_LEAD';
+
+      const tagsRaw = get('tags');
+      const tags = tagsRaw ? tagsRaw.split(/[,;]/).map((t) => t.trim()).filter(Boolean) : [];
+
+      const agentRaw = get('agent');
+      const assignedAgentId = agentRaw ? usersByKey.get(this.importNormText(agentRaw)) || null : null;
+
+      const destination = get('destination');
+      const budget = get('budget');
+      const preferences: any = {};
+      if (destination || budget) {
+        preferences.keyInfo = { destination: destination || '', budget: budget || '', budgetCurrency: 'USD' };
+      }
+
+      toCreate.push({
+        tenantId,
+        fullName,
+        phone,
+        phone2: get('phone2') || null,
+        email: get('email').toLowerCase() || null,
+        city: get('city') || null,
+        country: get('country') || null,
+        notes: get('notes') || null,
+        source: this.importResolveSource(get('source')),
+        tier: 'REGULAR',
+        language: 'UZ',
+        tags,
+        assignedAgentId,
+        preferences,
+        pipelineStage: stage as any,
+        pipelineStageAt: now,
+        leadScore: 0,
+        firstContactAt: now,
+        lastContactAt: now,
+      });
+    });
+
+    // 5) Ommaviy yozish — 500 tadan bo'laklarga bo'lib (2000+ qator uchun tezkor va ishonchli).
+    //    skipDuplicates: true — shu tenant ichida telefon raqami allaqachon
+    //    mavjud bo'lgan mijozlar avtomatik o'tkazib yuboriladi (xato bermaydi).
+    const CHUNK = 500;
+    let imported = 0;
+    for (let i = 0; i < toCreate.length; i += CHUNK) {
+      const chunk = toCreate.slice(i, i + CHUNK);
+      const res = await this.prisma.client.createMany({ data: chunk, skipDuplicates: true });
+      imported += res.count;
+    }
+    const duplicatesSkipped = toCreate.length - imported;
+
+    void this.cache.invalidateReports(tenantId);
+
+    this.logger.log(
+      `[IMPORT] Tenant: ${tenantId} | Fayl: ${file.originalname} | Jami qator: ${dataRows.length} | Import qilindi: ${imported} | Dublikat: ${duplicatesSkipped} | Xatolar: ${errors.length}`,
+    );
+
+    return {
+      ok: true,
+      totalRows: dataRows.length,
+      imported,
+      duplicatesSkipped,
+      invalidRows: errors.length,
+      errors: errors.slice(0, 50), // juda uzun bo'lmasin
+      stagesCreated, // yangi qo'shilgan bosqichlar nomi (agar bo'lsa)
+    };
   }
 
   async update(
