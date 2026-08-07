@@ -750,7 +750,14 @@ export class PipelineService {
     await Promise.all(finalOrder.map((id, i) =>
       this.prisma.customStage.updateMany({ where: { id, tenantId }, data: { order: i + 1 } })
     ));
-    return this.getCustomStages(tenantId);
+    // v37 FIX: ilgari bu yerda pipelineId berilmagani uchun getCustomStages
+    // TENANTNING BARCHA pipelinelaridagi bosqichlarni aralashtirib
+    // qaytarardi (masalan Presale'ni tartiblaganda javobda Postsale
+    // bosqichlari ham chiqib, frontendda ro'yxat buzilib ketardi). Endi
+    // qayta tartiblanayotgan bosqichlarning O'ZINING pipelineId'si orqali
+    // faqat O'SHA pipeline bosqichlari qaytariladi.
+    const pipelineId = stages[0]?.pipelineId;
+    return this.getCustomStages(tenantId, pipelineId);
   }
 
   async getHistory(tenantId: string, clientId: string) {
