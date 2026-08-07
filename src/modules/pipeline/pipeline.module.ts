@@ -647,15 +647,43 @@ export class PipelineService {
       if (!pl) throw new BadRequestException('Pipeline topilmadi');
       pipelineId = pl.id;
     }
-    const last = await this.prisma.customStage.findFirst({
+    const all = await this.prisma.customStage.findMany({
       where: { tenantId, pipelineId },
-      orderBy: { order: 'desc' },
+      orderBy: { order: 'asc' },
     });
+
+    let order = data.order;
+    if (order == null) {
+      // v36 FIX: yangi bosqich ilgari ro'yxat OXIRIGA (masalan "Yo'qotildi"dan
+      // ham keyin) qo'shilardi. "Sotildi" / "Yo'qotildi" kabi yopiluvchi
+      // (isClosing) yoki yo'qotilgan (isLost) bosqichlar HAR DOIM oxirida
+      // turishi kerak — shuning uchun yangi bosqich ana shu belgilangan
+      // bosqichlar guruhidan OLDIN qo'yiladi, nechta marta qo'shilishidan
+      // qat'i nazar (har safar ular oldiga suriladi).
+      const fixed = all.filter((s: any) => s.isClosing || s.isLost);
+      if (fixed.length) {
+        const insertAt = Math.min(...fixed.map((s: any) => s.order));
+        order = insertAt;
+        // insertAt va undan keyingi hamma bosqichlarni bittaga suramiz
+        await Promise.all(
+          all
+            .filter((s: any) => s.order >= insertAt)
+            .map((s: any) => this.prisma.customStage.update({
+              where: { id: s.id },
+              data: { order: s.order + 1 },
+            })),
+        );
+      } else {
+        const last = all[all.length - 1];
+        order = (last?.order ?? 0) + 1;
+      }
+    }
+
     return this.prisma.customStage.create({
       data: {
         tenantId, pipelineId, name: data.name,
         color: data.color || '#3d7eff',
-        order: data.order ?? ((last?.order ?? 0) + 1),
+        order,
         isClosing: data.isClosing || false,
       },
     });
@@ -681,7 +709,10 @@ export class PipelineService {
   async deleteCustomStage(tenantId: string, id: string) {
     const s = await this.prisma.customStage.findFirst({ where: { id, tenantId } });
     if (!s) throw new NotFoundException();
-    if (s.isClosing) throw new BadRequestException('Bu bosqich o\'chirilmaydi');
+    // v36 FIX: "Yo'qotildi" (isLost) bosqichi frontendda o'chirish tugmasi
+    // ko'rsatilmasa ham, backend uni himoya qilmasdi — API orqali to'g'ridan
+    // to'g'ri o'chirib bo'lardi. Endi isClosing bilan bir xil himoyalangan.
+    if (s.isClosing || s.isLost) throw new BadRequestException('Bu bosqich o\'chirilmaydi');
     await this.prisma.customStage.delete({ where: { id } });
     return { success: true };
   }
