@@ -62,8 +62,95 @@ export class PipelineService {
     private readonly cronLock: CronLockService,
   ) {}
 
+  // ─── v34 FIX: har bir tenant uchun ANIQ bitta "default" (kirish) pipeline
+  // kafolatlanadi ─────────────────────────────────────────────────────────
+  // MUAMMO EDI: agentlik o'z voronkasini o'ziga moslab tahrirlaganda (nom
+  // o'zgartirish/yangi pipeline yaratish) hech qanday joyda `isDefault: true`
+  // qo'yilmas edi (createPipeline har doim isDefault:false yozadi). Natijada
+  // getBoard() bu pipelineni "default" deb tanimay qoldi va yangi
+  // lead/mijozlar hech qaysi ustunga (hatto birinchisiga ham) tushmay,
+  // pipeline bo'sh ko'rinardi — garchi "Mijozlar" ro'yxatida bor bo'lsada.
+  // Bu funksiya har chaqirilganda avtomatik davolaydi: agar tenantda
+  // isDefault=true pipeline bo'lmasa — eng birinchi (eng eski) pipeline
+  // shunday deb belgilanadi; umuman pipeline bo'lmasa — standart bosqichlar
+  // bilan yangisi yaratiladi. Shu tufayli qo'lda DB'ga kirib tuzatish shart
+  // emas — muammo o'z-o'zidan tuzaladi.
+  async ensureDefaultPipeline(tenantId: string) {
+    let pipeline: any = await this.prisma.pipeline.findFirst({
+      where: { tenantId, isDefault: true },
+      include: { stages: { orderBy: { order: 'asc' } } },
+    });
+    if (pipeline) return pipeline;
+
+    const oldest = await this.prisma.pipeline.findFirst({
+      where: { tenantId },
+      orderBy: { createdAt: 'asc' },
+      include: { stages: { orderBy: { order: 'asc' } } },
+    });
+    if (oldest) {
+      await this.prisma.pipeline.update({ where: { id: oldest.id }, data: { isDefault: true } });
+      this.logger.log(`[PIPELINE HEAL] Tenant ${tenantId}: "${oldest.name}" default deb belgilandi`);
+      return { ...oldest, isDefault: true };
+    }
+
+    // Tenantda umuman pipeline yo'q — standart bosqichlar bilan yaratamiz.
+    const created: any = await this.createPipeline(tenantId, { name: 'Sotuvgacha', pipelineType: 'NEW_SALE' });
+    await this.prisma.pipeline.update({ where: { id: created.id }, data: { isDefault: true } });
+    return { ...created, isDefault: true };
+  }
+
+  // Yangi lead/mijoz yaratilganda qaysi pipeline/bosqichga tushishi kerakligini
+  // aniqlaydi (nomlar qanday bo'lishidan qat'iy nazar — har doim tenantning
+  // ANIQLANGAN default pipelinesining BIRINCHI bosqichi).
+  async getEntryStage(tenantId: string): Promise<{ pipelineId: string; stageId: string | null }> {
+    const pl = await this.ensureDefaultPipeline(tenantId);
+    const first = (pl.stages || []).slice().sort((a: any, b: any) => a.order - b.order)[0];
+    return { pipelineId: pl.id, stageId: first?.id || null };
+  }
+
+  // Klient profilida (mijozga kirganda) ko'rsatiladigan bosqich ro'yxati —
+  // agentlik voronkasini qanday tahrirlagan bo'lsa, ANIQ o'sha ro'yxat
+  // qaytariladi (frontendda qattiq kodlangan/eskirgan ro'yxat emas).
+  async getClientPipelineStages(tenantId: string, clientId: string) {
+    const client = await this.prisma.client.findFirst({ where: { id: clientId, tenantId } });
+    if (!client) throw new NotFoundException('Klient topilmadi');
+
+    let pipeline: any = null;
+    if ((client as any).customStageId) {
+      const cs = await this.prisma.customStage.findFirst({
+        where: { id: (client as any).customStageId, tenantId },
+        include: { pipeline: { include: { stages: { orderBy: { order: 'asc' } } } } },
+      });
+      pipeline = cs?.pipeline || null;
+    }
+    if (!pipeline) pipeline = await this.ensureDefaultPipeline(tenantId);
+
+    const stages = (pipeline.stages || []).map((s: any) => ({
+      key: `CUSTOM_${s.id}`, id: s.id, name: s.name, color: s.color,
+      isClosing: s.isClosing, isLost: s.isLost,
+    }));
+
+    let currentKey: string | null = (client as any).customStageId ? `CUSTOM_${(client as any).customStageId}` : null;
+    if (!currentKey) {
+      // Eski/legacy mijoz — customStageId hali qo'yilmagan. Nomi bo'yicha
+      // shu pipeline ichidan moslashtirishga harakat qilamiz, topilmasa
+      // birinchi bosqichga tushadi (deb ko'rsatiladi — bosilsa haqiqatan
+      // ham o'sha bosqichga o'tkaziladi).
+      const match = (pipeline.stages || []).find((s: any) => V10_STAGE_KEYS[s.name] === (client as any).pipelineStage);
+      currentKey = match ? `CUSTOM_${match.id}` : (stages[0]?.key || (client as any).pipelineStage);
+    }
+
+    return {
+      pipelineId: pipeline.id,
+      pipelineName: pipeline.name,
+      stages,
+      currentKey,
+    };
+  }
+
   // ─── Pipeline list (works with existing DB) ────────────────────────────────
   async listPipelines(tenantId: string) {
+    await this.ensureDefaultPipeline(tenantId); // v34: default belgisini davolaydi
     const pipelines = await this.prisma.pipeline.findMany({
       where: { tenantId },
       include: { stages: { orderBy: { order: 'asc' } } },
@@ -180,11 +267,18 @@ export class PipelineService {
       });
       if (!pipeline) throw new NotFoundException('Pipeline topilmadi');
 
+      // v34 FIX: pipeline.isDefault ustuniga ko'r-ko'rona ishonmaymiz — u
+      // hech qachon to'g'ri qo'yilmagan bo'lishi mumkin (aynan shu sabab
+      // pipeline "bo'sh" ko'rinardi). ensureDefaultPipeline avtomatik
+      // davolaydi va ANIQ default pipelineni qaytaradi; shu bilan solishtirib
+      // aniqlaymiz.
+      const healedDefault = await this.ensureDefaultPipeline(tenantId);
+      const isDefaultPipeline = pipeline.id === healedDefault.id;
+
       // Faqat DEFAULT (sotuvgacha) pipeline "kelib tushgan" lidlarni o'ziga
       // tortadi va bosqich NOMI orqali global enum'ga moslashtiradi. Boshqa
       // (post-sale/custom) voronkalar lidni faqat customStageId to'g'ri
       // mos kelganda ko'rsatadi — status/nom qanday bo'lishidan qat'iy nazar.
-      const isDefaultPipeline = !!pipeline.isDefault;
 
       const columns = (pipeline.stages || []).map((stage: any) => {
         // Map stage name to PipelineStage enum value
@@ -738,6 +832,11 @@ export class PipelineController {
 
   @Get('client/:id/history')
   history(@CurrentUser() u: any, @Param('id') id: string) { return this.svc.getHistory(u.tenantId, id); }
+
+  // v34: mijoz profilidagi bosqich tanlagichi endi shu real ro'yxatdan
+  // foydalanadi (frontendda qattiq kodlangan eski ro'yxat emas).
+  @Get('client/:id/stages')
+  clientStages(@CurrentUser() u: any, @Param('id') id: string) { return this.svc.getClientPipelineStages(u.tenantId, id); }
 
   @Patch('client/:id/stage')
   moveStage(@CurrentUser() u: any, @Param('id') id: string, @Body() body: any) {

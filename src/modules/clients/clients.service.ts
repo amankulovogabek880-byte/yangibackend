@@ -22,6 +22,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { RoundRobinService } from '../v9/round-robin.module';
 import { EncryptionService } from '../../common/encryption/encryption.service';
 import { CacheService } from '../../common/cache/cache.service';
+import { PipelineService } from '../pipeline/pipeline.module';
 
 const CLIENT_STATUSES: ClientStatus[] = ['ACTIVE', 'INACTIVE', 'BLACKLISTED'];
 const TIERS: ClientTier[] = ['REGULAR', 'SILVER', 'GOLD', 'VIP'];
@@ -115,6 +116,7 @@ export class ClientsService {
     private encryption: EncryptionService,
     private cache: CacheService,
     @Optional() private roundRobin: RoundRobinService,
+    @Optional() private pipeline?: PipelineService,
   ) {}
 
   /** Pasport va manzilni dekript qilib qaytaradi */
@@ -372,11 +374,28 @@ export class ClientsService {
       passportNo: data.passportNo,
     });
 
+    // v34 FIX: yangi lead tenantning ANIQLANGAN default (kirish) pipelinesining
+    // BIRINCHI bosqichiga to'g'ridan-to'g'ri bog'lanadi (customStageId orqali).
+    // Ilgari bu qilinmas edi — lead pipelineStage='NEW_LEAD' bilan "osilib"
+    // qolar, agentlik voronkani o'ziga moslab qayta nomlaganda esa hech qaysi
+    // ustunda ko'rinmas edi. Endi nomlar/bosqichlar qanday o'zgarsa ham, lead
+    // har doim ANIQ birinchi ustunga tushadi.
+    let entryStageId: string | null = null;
+    try {
+      if (this.pipeline) {
+        const entry = await this.pipeline.getEntryStage(tenantId);
+        entryStageId = entry.stageId;
+      }
+    } catch (e) {
+      this.logger.warn(`[CLIENTS] Pipeline entry-stage aniqlanmadi: ${e}`);
+    }
+
     // v9-SECURITY: Sanitize all string inputs
     const client = await this.prisma.client.create({
       data: {
         tenantId,
         fullName: fullName, // Already sanitized
+        customStageId: entryStageId,
         phone: phone || null, // ✅ OPTIONAL: Can be null for Telegram/Web
         phone2: data.phone2?.trim() || null,
         email: data.email?.trim().toLowerCase() || null,

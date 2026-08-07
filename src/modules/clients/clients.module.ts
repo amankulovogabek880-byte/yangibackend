@@ -19,6 +19,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { ClientsService } from './clients.service';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { RoundRobinModule } from '../v9/round-robin.module';
+import { PipelineModule } from '../pipeline/pipeline.module';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { CurrentUser, Roles } from '../../common/decorators';
@@ -182,7 +183,7 @@ export class ClientsController {
 
 @Global()
 @Module({
-  imports: [RoundRobinModule, EventEmitterModule.forRoot()],
+  imports: [RoundRobinModule, EventEmitterModule.forRoot(), PipelineModule],
   controllers: [ClientsController],
   providers: [ClientsService],
   exports: [ClientsService],
