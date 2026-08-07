@@ -499,32 +499,69 @@ export class PipelineService {
   }
 
   // ─── Sotuv yopilganda: pre-sale → post-sale voronkaga avtomatik ko'chirish ──
+  // v35 FIX: ilgari faqat DEFAULT pipelinening isClosing bosqichi (asl seed
+  // orqali "To'landi"ga qo'yilgan bayroq) ishlar edi. Lekin admin UI orqali
+  // o'zi qo'shgan bosqichlarda (masalan "Sold") isClosing belgilash imkoni
+  // umuman yo'q edi — shuning uchun "Sold"ga o'tkazilgan lead hech qachon
+  // keyingi voronkaga o'tmasdi. Endi:
+  //   1) updateCustomStage orqali istalgan bosqichni "yopiluvchi" deb
+  //      belgilash mumkin (frontendda checkbox qo'shildi);
+  //   2) agar pipelineda birorta bosqich ham ANIQ isClosing deb
+  //      belgilanmagan bo'lsa — o'sha pipelinening ENG OXIRGI (eng katta
+  //      order, isLost bo'lmagan) bosqichi avtomatik "yopiluvchi" deb
+  //      hisoblanadi (admin hech narsa sozlamasa ham ishlashi uchun);
+  //   3) "keyingi voronka" endi tasodifiy pipeline emas — xuddi shu
+  //      pipelinedan KEYIN yaratilgan (createdAt bo'yicha) ENG YAQIN
+  //      pipeline tanlanadi (bir nechta post-sale voronka bo'lsa ham,
+  //      "navbatdagisi"ga tushadi).
   private async maybeAdvanceToPostSalePipeline(tenantId: string, clientId: string, toStage: string) {
     try {
+      if (!toStage.startsWith('CUSTOM_') && toStage !== 'COMPLETED') return;
+
+      let sourcePipeline: any = null;
       let dealWon = false;
 
       if (toStage.startsWith('CUSTOM_')) {
         const stageId = toStage.slice('CUSTOM_'.length);
         const cs = await this.prisma.customStage.findFirst({
           where: { id: stageId, tenantId },
-          include: { pipeline: true },
+          include: { pipeline: { include: { stages: { orderBy: { order: 'asc' } } } } },
         });
-        // Faqat DEFAULT (pre-sale) pipelinening "isClosing" (va "isLost" emas)
-        // bosqichi haqiqiy sotuv yakunlanishi hisoblanadi.
-        if (cs && cs.isClosing && !cs.isLost && cs.pipeline?.isDefault) dealWon = true;
+        if (!cs || !cs.pipeline) return;
+        sourcePipeline = cs.pipeline;
+
+        if (cs.isLost) {
+          dealWon = false;
+        } else if (cs.isClosing) {
+          dealWon = true;
+        } else {
+          // Hech qaysi bosqich aniq isClosing deb belgilanmaganmi? Bo'lsa,
+          // shu pipelinening eng oxirgi (isLost bo'lmagan) bosqichini
+          // "yopiluvchi" deb hisoblaymiz.
+          const stages = (sourcePipeline.stages || []).filter((s: any) => !s.isLost);
+          const anyExplicit = stages.some((s: any) => s.isClosing);
+          if (!anyExplicit && stages.length) {
+            const maxOrder = Math.max(...stages.map((s: any) => s.order));
+            dealWon = cs.order === maxOrder;
+          }
+        }
       } else if (toStage === 'COMPLETED') {
         dealWon = true;
+        sourcePipeline = await this.ensureDefaultPipeline(tenantId);
       }
 
-      if (!dealWon) return;
+      if (!dealWon || !sourcePipeline) return;
 
-      const postSalePipeline = await this.prisma.pipeline.findFirst({
-        where: { tenantId, isDefault: false },
+      // "Keyingi" voronka — xuddi shu pipelinedan KEYIN yaratilgan eng yaqin
+      // pipeline (tenant ichida, shu pipelinedan boshqa).
+      const nextPipeline = await this.prisma.pipeline.findFirst({
+        where: { tenantId, id: { not: sourcePipeline.id }, createdAt: { gt: sourcePipeline.createdAt } },
+        orderBy: { createdAt: 'asc' },
         include: { stages: { orderBy: { order: 'asc' } } },
       });
-      if (!postSalePipeline || !postSalePipeline.stages?.length) return;
+      if (!nextPipeline || !nextPipeline.stages?.length) return;
 
-      const firstStage = postSalePipeline.stages[0];
+      const firstStage = nextPipeline.stages[0];
       await this.prisma.client.update({
         where: { id: clientId },
         data: { customStageId: firstStage.id, pipelineStageAt: new Date() },
@@ -533,7 +570,7 @@ export class PipelineService {
       await this.prisma.clientTimeline.create({
         data: {
           clientId, userId: null, type: 'stage_change',
-          title: `Sotuv yakunlandi → "${postSalePipeline.name}" voronkasiga o'tkazildi`,
+          title: `Sotuv yakunlandi → "${nextPipeline.name}" voronkasiga o'tkazildi`,
           description: `Bosqich: ${firstStage.name}`,
           metadata: { from: toStage, to: `CUSTOM_${firstStage.id}`, auto: true },
         } as any,
@@ -627,7 +664,18 @@ export class PipelineService {
   async updateCustomStage(tenantId: string, id: string, data: any) {
     const s = await this.prisma.customStage.findFirst({ where: { id, tenantId } });
     if (!s) throw new NotFoundException();
-    return this.prisma.customStage.update({ where: { id }, data: { name: data.name || s.name, color: data.color || s.color, order: data.order ?? s.order } });
+    // v35 FIX: ilgari isClosing/isLost bayroqlari e'tiborga olinmas edi —
+    // shu sabab admin UI'dan bosqichni "yopiluvchi" deb belgilay olmasdi.
+    return this.prisma.customStage.update({
+      where: { id },
+      data: {
+        name: data.name ?? s.name,
+        color: data.color ?? s.color,
+        order: data.order ?? s.order,
+        isClosing: typeof data.isClosing === 'boolean' ? data.isClosing : s.isClosing,
+        isLost: typeof data.isLost === 'boolean' ? data.isLost : s.isLost,
+      },
+    });
   }
 
   async deleteCustomStage(tenantId: string, id: string) {
