@@ -62,6 +62,21 @@ export class PipelineService {
     private readonly cronLock: CronLockService,
   ) {}
 
+  // v36 FIX: "Sotildi"/"Yo'qotildi" kabi belgilangan (isClosing/isLost)
+  // bosqichlar har doim ro'yxat OXIRIDA ko'rinishi kerak — bu HAR BIR
+  // pipeline (presale, postsale, custom — nomidan qat'iy nazar) uchun amal
+  // qiladi. Bazadagi `order` qiymati eski/noto'g'ri bo'lib qolgan bo'lsa ham
+  // (masalan avval xato bilan qo'shilgan bosqichlar), bu funksiya ko'rinishni
+  // har doim to'g'rilab beradi — DB'ni qo'lda tuzatish shart emas.
+  private sortStagesFixedLast(stages: any[]): any[] {
+    return [...(stages || [])].sort((a: any, b: any) => {
+      const af = (a.isClosing || a.isLost) ? 1 : 0;
+      const bf = (b.isClosing || b.isLost) ? 1 : 0;
+      if (af !== bf) return af - bf;
+      return a.order - b.order;
+    });
+  }
+
   // ─── v34 FIX: har bir tenant uchun ANIQ bitta "default" (kirish) pipeline
   // kafolatlanadi ─────────────────────────────────────────────────────────
   // MUAMMO EDI: agentlik o'z voronkasini o'ziga moslab tahrirlaganda (nom
@@ -104,7 +119,7 @@ export class PipelineService {
   // ANIQLANGAN default pipelinesining BIRINCHI bosqichi).
   async getEntryStage(tenantId: string): Promise<{ pipelineId: string; stageId: string | null }> {
     const pl = await this.ensureDefaultPipeline(tenantId);
-    const first = (pl.stages || []).slice().sort((a: any, b: any) => a.order - b.order)[0];
+    const first = this.sortStagesFixedLast(pl.stages || [])[0];
     return { pipelineId: pl.id, stageId: first?.id || null };
   }
 
@@ -280,10 +295,14 @@ export class PipelineService {
       // (post-sale/custom) voronkalar lidni faqat customStageId to'g'ri
       // mos kelganda ko'rsatadi — status/nom qanday bo'lishidan qat'iy nazar.
 
-      const columns = (pipeline.stages || []).map((stage: any) => {
+      // v36 FIX: ustunlar tartibi ham "isClosing/isLost — har doim oxirida"
+      // qoidasiga bo'ysunishi kerak (kanban ko'rinishida ham, modal ro'yxatida
+      // ham bir xil tartib bo'lishi uchun).
+      const orderedStages = this.sortStagesFixedLast(pipeline.stages || []);
+      const columns = orderedStages.map((stage: any) => {
         // Map stage name to PipelineStage enum value
         const stageEnumKey = V10_STAGE_KEYS[stage.name] || null;
-        const isFirstStage = (pipeline.stages || []).sort((a: any, b: any) => a.order - b.order)[0]?.id === stage.id;
+        const isFirstStage = orderedStages[0]?.id === stage.id;
         const stageClients = clients.filter((c: any) => {
           // Lid biror maxsus bosqichda (customStageId) tursa — faqat o'sha
           // aniq ID mos kelgan ustunda ko'rinadi. Eski/qoldiq pipelineStage
@@ -561,7 +580,7 @@ export class PipelineService {
       });
       if (!nextPipeline || !nextPipeline.stages?.length) return;
 
-      const firstStage = nextPipeline.stages[0];
+      const firstStage = this.sortStagesFixedLast(nextPipeline.stages)[0];
       await this.prisma.client.update({
         where: { id: clientId },
         data: { customStageId: firstStage.id, pipelineStageAt: new Date() },
@@ -634,7 +653,8 @@ export class PipelineService {
   async getCustomStages(tenantId: string, pipelineId?: string) {
     const where: any = { tenantId };
     if (pipelineId) where.pipelineId = pipelineId;
-    return this.prisma.customStage.findMany({ where, orderBy: { order: 'asc' } });
+    const stages = await this.prisma.customStage.findMany({ where, orderBy: { order: 'asc' } });
+    return this.sortStagesFixedLast(stages);
   }
 
   async createCustomStage(tenantId: string, data: {
@@ -718,7 +738,16 @@ export class PipelineService {
   }
 
   async reorderCustomStages(tenantId: string, orderedIds: string[]) {
-    await Promise.all(orderedIds.map((id, i) =>
+    // v36 FIX: qo'lda qayta tartiblashda ham "isClosing/isLost — har doim
+    // oxirida" qoidasi buzilmasligi kerak — kimdir tasodifan "Sotildi"ni
+    // o'rtaga tashlab qo'ymasin.
+    const stages: any[] = await this.prisma.customStage.findMany({ where: { tenantId, id: { in: orderedIds } } });
+    const byId = new Map<string, any>(stages.map((s: any) => [s.id, s]));
+    const requestedOrder = orderedIds.filter((id) => byId.has(id));
+    const normal = requestedOrder.filter((id) => !(byId.get(id).isClosing || byId.get(id).isLost));
+    const fixed = requestedOrder.filter((id) => byId.get(id).isClosing || byId.get(id).isLost);
+    const finalOrder = [...normal, ...fixed];
+    await Promise.all(finalOrder.map((id, i) =>
       this.prisma.customStage.updateMany({ where: { id, tenantId }, data: { order: i + 1 } })
     ));
     return this.getCustomStages(tenantId);

@@ -862,16 +862,26 @@ export class ClientsService {
   // erkin "Qo'shimcha ma'lumot" (key=value) qutisiga yozilardi — agentlar
   // buni har xil nom bilan yozardi ("Qayerga"/"Yo'nalish"/"Destination"),
   // shuning uchun bir xil ma'noli ma'lumot har xil ko'rinar, ro'yxatda
-  // qidirib bo'lmasdi. Endi QAT'IY 2 ta maydon — hamma mijozda bir xil.
+  // qidirib bo'lmasdi. Endi QAT'IY maydonlar — hamma mijozda bir xil.
+  // v36: erkin "Savol/Javob" qutisi (CustomFields) klient sahifasidan
+  // butunlay OLIB TASHLANDI — o'rniga AmoCRM uslubidagi sayohat
+  // ma'lumotlari (kim bilan, necha kishi, bolalar, sanalar, muddat)
+  // shu QAT'IY maydonlar to'plamiga qo'shildi.
   async setKeyInfo(tenantId: string, id: string, userId: string, role: string, body: any) {
     await this.findOne(tenantId, id, userId, role);
     const client = await this.prisma.client.findFirst({ where: { id, tenantId } });
     if (!client) throw new NotFoundException('Mijoz topilmadi');
     const prefs: any = (client as any).preferences || {};
+    const prev = prefs.keyInfo || {};
     prefs.keyInfo = {
-      destination: String(body?.destination || '').slice(0, 200),
-      budget: String(body?.budget || '').slice(0, 100),
-      budgetCurrency: ['USD', 'UZS', 'EUR'].includes(body?.budgetCurrency) ? body.budgetCurrency : 'USD',
+      destination: String(body?.destination ?? prev.destination ?? '').slice(0, 200),
+      companions: String(body?.companions ?? prev.companions ?? '').slice(0, 200),
+      peopleCount: String(body?.peopleCount ?? prev.peopleCount ?? '').slice(0, 20),
+      kids: String(body?.kids ?? prev.kids ?? '').slice(0, 200),
+      dates: String(body?.dates ?? prev.dates ?? '').slice(0, 100),
+      duration: String(body?.duration ?? prev.duration ?? '').slice(0, 50),
+      budget: String(body?.budget ?? prev.budget ?? '').slice(0, 100),
+      budgetCurrency: ['USD', 'UZS', 'EUR'].includes(body?.budgetCurrency) ? body.budgetCurrency : (prev.budgetCurrency || 'USD'),
     };
     await this.prisma.client.update({ where: { id }, data: { preferences: prefs } });
     return { ok: true, keyInfo: prefs.keyInfo };
