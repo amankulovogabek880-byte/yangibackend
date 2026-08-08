@@ -418,6 +418,9 @@ model Tenant {
   tourOperators    TourOperator[]
   marketplaceTours MarketplaceTour[]
 
+  // v40: AI Yordamchi ("Jarvis") — tool-use asosidagi CRM chat yordamchisi
+  aiConversations AiConversation[]
+
   @@index([status])
   @@map("tenants")
 }
@@ -514,6 +517,9 @@ model User {
   // v9: Approval Workflow
   requestedApprovals  ApprovalRequest[] @relation("ApprovalRequester")
   reviewedApprovals   ApprovalRequest[] @relation("ApprovalReviewer")
+
+  // v40: AI Yordamchi ("Jarvis") — agentning shaxsiy suhbatlari
+  aiConversations AiConversation[]
 
   @@unique([tenantId, email])
   @@index([tenantId, role, status])
@@ -1264,6 +1270,49 @@ model DailyBriefing {
   @@unique([tenantId, agentId, date])
   @@index([tenantId, date])
   @@map("daily_briefings")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// v40: AI YORDAMCHI ("JARVIS") — 1-BOSQICH: Read-only tool-use chat
+// ═══════════════════════════════════════════════════════════════
+//
+// Briefing'dan farqi: briefing bir tomonlama, kuniga bir marta
+// generatsiya qilingan matn. Jarvis esa AGENT bilan erkin, ko'p
+// bosqichli suhbat — Claude o'zi CRM ma'lumotini "tool_use" orqali
+// so'rab oladi (getClientInfo, listPipelineByStage va h.k. —
+// src/modules/ai-assistant/ai-assistant.tools.ts).
+//
+// Har bir suhbat BITTA agentga tegishli (userId) va tenant ichida
+// izolyatsiyalangan. AiMessage.toolCalls — audit uchun: qaysi tool
+// qanday parametr bilan chaqirilgani shu yerga yoziladi.
+model AiConversation {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId    String   // agent (suhbat egasi)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages AiMessage[]
+
+  @@index([tenantId, userId, updatedAt])
+  @@map("ai_conversations")
+}
+
+model AiMessage {
+  id             String         @id @default(cuid())
+  conversationId String
+  conversation   AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String         // "user" | "assistant"
+  content        String         @db.Text
+  // Audit: [{ name, input, resultSummary? }] — shu javobda chaqirilgan tool'lar
+  toolCalls      Json?
+  createdAt      DateTime       @default(now())
+
+  @@index([conversationId, createdAt])
+  @@map("ai_messages")
 }
 
 // ═══════════════════════════════════════════════════════════════

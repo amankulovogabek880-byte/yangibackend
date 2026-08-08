@@ -72,6 +72,8 @@ import { MarketplaceModule } from './modules/marketplace/marketplace.module';
 // lekin hech qayerda import qilinmagan edi — ya'ni /tour-search/* barcha
 // endpointlari production'da 404 qaytarardi, garchi kod to'liq yozilgan bo'lsa ham.
 import { TourSearchModule } from './modules/tour-search/tour-search.module';
+// v40: AI Yordamchi ("Jarvis") — tool-use asosidagi CRM chat yordamchisi (1-bosqich: read-only)
+import { AiAssistantModule } from './modules/ai-assistant/ai-assistant.module';
 
 @Module({
   imports: [
@@ -150,6 +152,7 @@ import { TourSearchModule } from './modules/tour-search/tour-search.module';
     ExchangeRateModule, // v10: CBU.uz valyuta kursi (offer/booking currency konvertatsiyasi)
     MarketplaceModule,  // v12: Turlar bozori
     TourSearchModule,   // v14: Jonli tur qidiruvi — ← YANGI (avval ro'yxatga olinmagan edi)
+    AiAssistantModule,  // v40: AI Yordamchi ("Jarvis") — ← YANGI
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
