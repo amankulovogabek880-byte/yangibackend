@@ -74,6 +74,8 @@ import { MarketplaceModule } from './modules/marketplace/marketplace.module';
 import { TourSearchModule } from './modules/tour-search/tour-search.module';
 // v40: AI Yordamchi ("Jarvis") — tool-use asosidagi CRM chat yordamchisi (1-bosqich: read-only)
 import { AiAssistantModule } from './modules/ai-assistant/ai-assistant.module';
+// v41: Jarvis Bot — har bir tenant uchun bitta ICHKI Telegram bot (tahlil/brifing push + admin savol-javob)
+import { JarvisBotModule } from './modules/jarvis-bot/jarvis-bot.module';
 
 @Module({
   imports: [
@@ -153,6 +155,7 @@ import { AiAssistantModule } from './modules/ai-assistant/ai-assistant.module';
     MarketplaceModule,  // v12: Turlar bozori
     TourSearchModule,   // v14: Jonli tur qidiruvi — ← YANGI (avval ro'yxatga olinmagan edi)
     AiAssistantModule,  // v40: AI Yordamchi ("Jarvis") — ← YANGI
+    JarvisBotModule,    // v41: Jarvis Bot (Telegram) — ← YANGI
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

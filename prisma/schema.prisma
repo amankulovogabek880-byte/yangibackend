@@ -421,6 +421,10 @@ model Tenant {
   // v40: AI Yordamchi ("Jarvis") — tool-use asosidagi CRM chat yordamchisi
   aiConversations AiConversation[]
 
+  // v41: Jarvis Bot — bitta tenant uchun bitta ICHKI Telegram bot
+  // (adminga tahlil/brifing yuboradi, admin bilan savol-javob qiladi)
+  jarvisBot JarvisBot?
+
   @@index([status])
   @@map("tenants")
 }
@@ -520,6 +524,9 @@ model User {
 
   // v40: AI Yordamchi ("Jarvis") — agentning shaxsiy suhbatlari
   aiConversations AiConversation[]
+
+  // v41: Jarvis Bot — foydalanuvchining o'z tenanti botiga ulanishi
+  jarvisBotLink JarvisBotLink?
 
   @@unique([tenantId, email])
   @@index([tenantId, role, status])
@@ -1890,6 +1897,75 @@ model TelegramPendingAuth {
 
   @@index([userId])
   @@map("telegram_pending_auth")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// JARVIS BOT — v41: har bir tenant uchun ALOHIDA ICHKI Telegram bot
+// ═══════════════════════════════════════════════════════════════
+//
+// MAQSAD: mijozlar bilan gaplashadigan `TelegramAccount` botlaridan
+// TAMOMILA FARQLI — bu faqat CRM XODIMLARI uchun ICHKI bot:
+//   1) Har bir qo'ng'iroq AI tahlili tugagach — ADMINGA yuboriladi.
+//   2) Har kuni ertalab har bir AGENTGA shaxsiy AI brifing, ADMINGA
+//      esa jamoaviy brifing yuboriladi (BriefingService orqali,
+//      keshlangan — qo'shimcha AI xarajat qilmaydi).
+//   3) Faqat ADMIN (TENANT_ADMIN/MANAGER) botga to'g'ridan-to'g'ri
+//      savol yozib Jarvis (tool-use AI yordamchi)dan javob olishi
+//      mumkin — oddiy AGENT faqat bildirishnoma oladi, yozolmaydi.
+//
+// IZOLYATSIYA: bitta tenantning boti FAQAT o'zining tenantId'siga
+// tegishli foydalanuvchilar bilan ishlaydi (`JarvisBotLink.tenantId`
+// + `botId` — @@unique([botId, chatId])). Runtime'da har bir bot
+// instansi yaratilgan paytdayoq FAQAT bitta tenantId bilan yopiladi
+// (closure) — boshqa tenant ma'lumoti shu bot orqali HECH QACHON
+// chiqib ketolmaydi, aralashib qolmaydi.
+model JarvisBot {
+  id       String @id @default(cuid())
+  tenantId String @unique
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  botToken    String
+  botUsername String?
+  isActive    Boolean @default(true)
+
+  // Sozlamalar (admin CRM sozlamalaridan boshqaradi)
+  notifyAdminOnAnalysis Boolean @default(true) // har bir qo'ng'iroq tahlilidan keyin adminga yuborish
+  dailyDigestEnabled    Boolean @default(true) // kunlik AI brifingni botga yuborish
+  dailyDigestHour       Int     @default(9)    // Asia/Tashkent bo'yicha soat (0-23)
+  // Oxirgi kunlik digest yuborilgan sana (YYYY-MM-DD, Tashkent) —
+  // bir kunda BIR MARTA yuborilishini kafolatlaydi (xarajat nazorati).
+  lastDigestDate String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  links JarvisBotLink[]
+
+  @@map("jarvis_bots")
+}
+
+model JarvisBotLink {
+  id       String    @id @default(cuid())
+  tenantId String
+  botId    String
+  bot      JarvisBot @relation(fields: [botId], references: [id], onDelete: Cascade)
+  userId   String    @unique
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  chatId String // Telegramdagi shaxsiy chat ID (foydalanuvchi /start qilganda yoziladi)
+  role   String // ulash vaqtidagi rol (TENANT_ADMIN/MANAGER/AGENT) — marshrutlash uchun
+
+  // ADMIN botga yozgan savollarni Jarvis AI yordamchisi (ai-assistant
+  // moduli) orqali javoblaydi — shu maydon suhbat davomiyligini
+  // (kontekstni) Telegram orqali ham saqlab turadi.
+  aiConversationId String?
+
+  isActive Boolean  @default(true)
+  linkedAt DateTime @default(now())
+
+  @@unique([botId, chatId])
+  @@index([tenantId])
+  @@map("jarvis_bot_links")
 }
 
 // ═══════════════════════════════════════════════════════════════

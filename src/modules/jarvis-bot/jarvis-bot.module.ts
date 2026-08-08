@@ -1,0 +1,645 @@
+import {
+  Module, Injectable, Controller, Get, Post, Patch, Delete, Body, Param,
+  UseGuards, Logger, BadRequestException, NotFoundException,
+  OnModuleInit, OnModuleDestroy, Optional, Inject,
+} from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { Cron } from '@nestjs/schedule';
+import { OnEvent } from '@nestjs/event-emitter';
+import TelegramBot from 'node-telegram-bot-api';
+import type Redis from 'ioredis';
+import { PrismaService } from '../../prisma/prisma.service';
+import { PrismaModule } from '../../prisma/prisma.module';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { RolesGuard } from '../../common/guards/roles.guard';
+import { CurrentUser, Roles } from '../../common/decorators';
+import { REDIS_CLIENT } from '../../common/cache/cache.constants';
+import { RedisClientModule } from '../../common/cache/redis-client.module';
+import { CronLockService } from '../../common/utils/cron-lock.service';
+import { AiAssistantModule, AiAssistantService } from '../ai-assistant/ai-assistant.module';
+import { BriefingModule, BriefingService } from '../briefing/briefing.module';
+// v42: Jarvis'ga OVOZLI XABAR yuborilsa — qo'ng'iroq yozuvlarini matnga
+// o'giradigan XUDDI SHU Whisper xizmatidan foydalanamiz (yangi kod
+// yozilmadi, mavjud infratuzilma qayta ishlatildi).
+import { TranscriptionModule, TranscriptionService } from '../transcription/transcription.module';
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * v41: JARVIS BOT — har bir tenant uchun BITTA ICHKI Telegram bot
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * G'OYA: `telegram.module.ts`dagi botlar — MIJOZLAR bilan gaplashadi.
+ * Bu modul BUTUNLAY BOSHQA narsa: faqat CRM XODIMLARI uchun ICHKI bot.
+ *
+ *   1) Har bir qo'ng'iroq AI tahlili tugagach — ADMINGA (va
+ *      MANAGERlarga) darhol yuboriladi.
+ *   2) Har kuni ertalab (sozlanadigan soat, standart 09:00 Tashkent)
+ *      har bir AGENTGA shaxsiy AI brifing, ADMINGA esa jamoaviy
+ *      brifing yuboriladi — bu `BriefingService`dan (kuniga BIR
+ *      MARTA generatsiya qilinib keshlangan) o'qiladi, ya'ni bot
+ *      ORQALI yuborish o'ZI qo'shimcha AI xarajat QILMAYDI.
+ *   3) Botga FAQAT ADMIN (TENANT_ADMIN yoki MANAGER) to'g'ridan-to'g'ri
+ *      savol yozib Jarvis (tool-use AI yordamchi)dan javob olishi
+ *      mumkin. Oddiy AGENT botdan faqat bildirishnoma oladi — biror
+ *      narsa yozsa, bot buni ochiq tushuntiradi va javob bermaydi
+ *      (demak AGENT'lar hech qachon qo'shimcha AI xarajat qildirmaydi).
+ *
+ * IZOLYATSIYA (MUHIM): bitta tenantning boti FAQAT o'zining
+ * tenantId'siga tegishli foydalanuvchilar bilan ishlaydi:
+ *   - Har bir bot instansi `startBot(tenantId, botId, token)` orqali
+ *     yaratiladi va shu tenantId uni yopib turadi (JS closure) — bot
+ *     hech qachon "boshqa tenantId" bilan biror amal bajarolmaydi,
+ *     chunki bunday parametr umuman mavjud emas.
+ *   - Ulanish (`JarvisBotLink`) `@@unique([botId, chatId])` bilan
+ *     himoyalangan — bitta chat faqat BITTA botga (demak BITTA
+ *     tenantga) bog'lanishi mumkin.
+ *   - Ulash faqat CRM ichida (login qilingan holda) generatsiya
+ *     qilingan bir martalik kod orqali sodir bo'ladi — token yoki
+ *     chatId qo'lda kiritilmaydi, shuning uchun boshqa firma
+ *     xodimi tasodifan yoki ataylab boshqa botga ulanolmaydi.
+ *
+ * XARAJATNI NAZORAT QILISH:
+ *   - Kunlik brifing — allaqachon kuniga bir marta keshlangan
+ *     ma'lumotdan o'qiladi (qo'shimcha AI so'rov yo'q).
+ *   - Qo'ng'iroq tahlili push'i — AI so'rov QILMAYDI, faqat
+ *     `analyzeCall` allaqachon hisoblagan natijani matn qilib
+ *     yuboradi.
+ *   - Faqat ADMIN botga savol yozganda AI so'rov ketadi, va u ham
+ *     `ai-assistant.module.ts`dagi KUNLIK KVOTA bilan cheklangan
+ *     (standart: kuniga 50 so'rov, veb-chat bilan UMUMIY hisoblanadi
+ *     — demak bot orqali "cheksiz" so'rov yuborib bo'lmaydi).
+ */
+
+const CODE_TTL_SEC = 600; // 10 daqiqa
+const memoryCodes = new Map<string, { userId: string; role: string; expiresAt: number }>();
+
+type TelegramMsg = {
+  chat: { id: number | string };
+  text?: string;
+  from?: { id: number | string; first_name?: string };
+};
+
+type TelegramVoiceMsg = {
+  chat: { id: number | string };
+  voice?: { file_id: string; file_size?: number; duration?: number };
+};
+
+@Injectable()
+export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger('JarvisBot');
+  // tenantId → aktiv TelegramBot instansi (har biri FAQAT o'z tenantId'sini biladi)
+  private bots = new Map<string, TelegramBot>();
+  // tenantId → JarvisBot.id (tezkor qidiruv uchun)
+  private botIds = new Map<string, string>();
+
+  constructor(
+    private prisma: PrismaService,
+    private aiAssistant: AiAssistantService,
+    private briefing: BriefingService,
+    private cronLock: CronLockService,
+    private transcription: TranscriptionService,
+    @Optional() @Inject(REDIS_CLIENT) private readonly redis: Redis | null = null,
+  ) {}
+
+  async onModuleInit() {
+    try {
+      const bots = await this.prisma.jarvisBot.findMany({ where: { isActive: true } });
+      for (const b of bots) {
+        await this.startBot(b.tenantId, b.id, b.botToken).catch((e) =>
+          this.logger.error(`Jarvis bot start xato [tenant ${b.tenantId}]: ${e.message}`),
+        );
+      }
+      this.logger.log(`${bots.length} ta Jarvis bot ishga tushirildi`);
+    } catch (e: any) {
+      this.logger.error(`Init xato: ${e.message}`);
+    }
+  }
+
+  async onModuleDestroy() {
+    for (const [tenantId, bot] of this.bots.entries()) {
+      try {
+        await bot.stopPolling();
+        this.logger.log(`Jarvis bot to'xtatildi: ${tenantId}`);
+      } catch {}
+    }
+    this.bots.clear();
+  }
+
+  // ─── BOT HAYOT SIKLI ────────────────────────────────────────────
+
+  private async startBot(tenantId: string, botId: string, token: string) {
+    const existing = this.bots.get(tenantId);
+    if (existing) {
+      try { await existing.stopPolling(); } catch {}
+      this.bots.delete(tenantId);
+    }
+    try {
+      const tempBot = new TelegramBot(token, { polling: false });
+      await tempBot.deleteWebhook({ drop_pending_updates: true });
+    } catch {}
+
+    const bot = new TelegramBot(token, { polling: true });
+
+    // MUHIM: bu yopiq funksiya (closure) ICHIDA `tenantId` va `botId`
+    // O'ZGARMAS — shuning uchun shu bot hech qachon boshqa tenant
+    // uchun amal bajarolmaydi.
+    bot.on('message', (msg: TelegramMsg) =>
+      this.handleIncoming(tenantId, botId, bot, msg).catch((e) =>
+        this.logger.error(`handleIncoming xato [${tenantId}]: ${e.message}`),
+      ),
+    );
+    // v42: OVOZLI XABAR — matn bilan BIR QATORDA qo'llab-quvvatlanadi.
+    // Telegram voice notlar alohida 'voice' hodisasi bilan keladi
+    // ('message' hodisasida ham keladi, lekin u yerda `msg.text` bo'sh
+    // bo'lgani uchun `handleIncoming` uni jim o'tkazib yuboradi).
+    bot.on('voice', (msg: TelegramVoiceMsg) =>
+      this.handleVoice(tenantId, botId, bot, msg).catch((e) =>
+        this.logger.error(`handleVoice xato [${tenantId}]: ${e.message}`),
+      ),
+    );
+
+    let lastErrorTime = 0;
+    bot.on('polling_error', (e: any) => {
+      const msg = e?.message || String(e);
+      const now = Date.now();
+      if (now - lastErrorTime < 60000) return;
+      lastErrorTime = now;
+      if (msg.includes('409') || msg.includes('Conflict')) {
+        this.logger.warn(`Jarvis bot ${tenantId}: 409 Conflict — 15s dan keyin restart`);
+        setTimeout(() => { this.startBot(tenantId, botId, token).catch(() => {}); }, 15000);
+      } else if (msg.includes('ENOTFOUND') || msg.includes('ECONNREFUSED') || msg.includes('ETIMEDOUT')) {
+        setTimeout(() => { this.startBot(tenantId, botId, token).catch(() => {}); }, 60000);
+      } else {
+        this.logger.error(`Jarvis bot ${tenantId}: ${msg}`);
+      }
+    });
+
+    this.bots.set(tenantId, bot);
+    this.botIds.set(tenantId, botId);
+  }
+
+  private async stopBot(tenantId: string) {
+    const bot = this.bots.get(tenantId);
+    if (bot) {
+      try { await bot.stopPolling(); } catch {}
+      this.bots.delete(tenantId);
+    }
+    this.botIds.delete(tenantId);
+  }
+
+  // ─── ULASH KODI (CRM ichida generatsiya qilinadi) ──────────────
+
+  private codeKey(tenantId: string, code: string) {
+    return `jarvis-link:${tenantId}:${code}`;
+  }
+
+  private genCode(): string {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // chalkash belgilarsiz (0/O, 1/I yo'q)
+    let out = '';
+    for (let i = 0; i < 6; i++) out += chars[Math.floor(Math.random() * chars.length)];
+    return out;
+  }
+
+  /** CRM ichida (login qilingan holda) chaqiriladi — bir martalik ulanish kodi beradi */
+  async createLinkCode(tenantId: string, userId: string, role: string) {
+    const bot = await this.prisma.jarvisBot.findUnique({ where: { tenantId } });
+    if (!bot || !bot.isActive) {
+      throw new BadRequestException("Bu kompaniyada Jarvis bot hali ulanmagan. Avval administrator botni ulasin.");
+    }
+    const code = this.genCode();
+    const value = JSON.stringify({ userId, role });
+
+    if (this.redis) {
+      try {
+        await this.redis.set(this.codeKey(tenantId, code), value, 'EX', CODE_TTL_SEC);
+      } catch {
+        memoryCodes.set(this.codeKey(tenantId, code), { userId, role, expiresAt: Date.now() + CODE_TTL_SEC * 1000 });
+      }
+    } else {
+      memoryCodes.set(this.codeKey(tenantId, code), { userId, role, expiresAt: Date.now() + CODE_TTL_SEC * 1000 });
+    }
+
+    return {
+      code,
+      botUsername: bot.botUsername,
+      deepLink: bot.botUsername ? `https://t.me/${bot.botUsername}?start=${code}` : null,
+      expiresInSec: CODE_TTL_SEC,
+    };
+  }
+
+  private async consumeLinkCode(tenantId: string, code: string): Promise<{ userId: string; role: string } | null> {
+    const key = this.codeKey(tenantId, code.toUpperCase().trim());
+    if (this.redis) {
+      try {
+        const raw = await this.redis.get(key);
+        if (!raw) return null;
+        await this.redis.del(key).catch(() => {});
+        return JSON.parse(raw);
+      } catch {
+        // fallthrough — xotira zaxirasiga
+      }
+    }
+    const entry = memoryCodes.get(key);
+    if (!entry || entry.expiresAt < Date.now()) return null;
+    memoryCodes.delete(key);
+    return { userId: entry.userId, role: entry.role };
+  }
+
+  // ─── KIRUVCHI XABARLARNI QAYTA ISHLASH ─────────────────────────
+
+  private async handleIncoming(tenantId: string, botId: string, bot: TelegramBot, msg: TelegramMsg) {
+    const chatId = String(msg.chat.id);
+    const text = String(msg.text || '').trim();
+    if (!text) return;
+
+    if (text.startsWith('/start')) {
+      const parts = text.split(/\s+/);
+      const code = parts[1];
+
+      if (!code) {
+        const existing = await this.prisma.jarvisBotLink.findUnique({ where: { botId_chatId: { botId, chatId } } as any }).catch(() => null);
+        if (existing) {
+          await bot.sendMessage(chatId, "👋 Salom! Siz allaqachon ulangansiz.");
+        } else {
+          await bot.sendMessage(chatId, "👋 Salom! Bu — Jarvis, CRM'ning ichki AI yordamchisi.\n\nUlanish uchun CRM'da: Sozlamalar → Jarvis Bot bo'limidan \"Ulash\" tugmasini bosing (yoki kod oling).");
+        }
+        return;
+      }
+
+      const payload = await this.consumeLinkCode(tenantId, code);
+      if (!payload) {
+        await bot.sendMessage(chatId, "❌ Kod noto'g'ri yoki muddati o'tgan. CRM'dan yangi kod oling.");
+        return;
+      }
+      const user = await this.prisma.user.findFirst({ where: { id: payload.userId, tenantId, status: 'ACTIVE' as any } });
+      if (!user) {
+        await bot.sendMessage(chatId, "❌ Foydalanuvchi topilmadi.");
+        return;
+      }
+
+      await this.prisma.jarvisBotLink.upsert({
+        where: { userId: user.id },
+        create: { tenantId, botId, userId: user.id, chatId, role: user.role },
+        update: { botId, chatId, role: user.role, isActive: true },
+      });
+
+      const isAdmin = ['TENANT_ADMIN', 'MANAGER'].includes(user.role);
+      await bot.sendMessage(
+        chatId,
+        isAdmin
+          ? `✅ Ulandingiz, ${user.name}!\n\nEndi har bir qo'ng'iroq tahlili va kunlik jamoaviy brifing shu yerga keladi. Savolingiz bo'lsa — shunchaki yozing, Jarvis javob beradi.`
+          : `✅ Ulandingiz, ${user.name}!\n\nEndi har kuni ertalab shaxsiy AI brifingingiz shu yerga keladi. (Savol yozish faqat administratorga ochiq.)`,
+      );
+      return;
+    }
+
+    const link = await this.prisma.jarvisBotLink.findUnique({ where: { botId_chatId: { botId, chatId } } as any }).catch(() => null);
+    if (!link || !link.isActive) {
+      await bot.sendMessage(chatId, "Siz hali ulanmagansiz. CRM'da Sozlamalar → Jarvis Bot bo'limidan ulanish kodini oling.");
+      return;
+    }
+
+    if (!['TENANT_ADMIN', 'MANAGER'].includes(link.role)) {
+      await bot.sendMessage(chatId, "Bu bot orqali faqat bildirishnomalar (qo'ng'iroq tahlili, kunlik brifing) yuboriladi. Savol-javob faqat administratorga ochiq.");
+      return;
+    }
+
+    // Faqat ADMIN/MANAGER — Jarvis AI yordamchisiga yo'naltiramiz
+    await this.runJarvisTurn(bot, chatId, tenantId, link, text);
+  }
+
+  /**
+   * v42: ADMIN/MANAGER Jarvis'ga OVOZLI XABAR yuborsa — avval mavjud
+   * Whisper pipeline (`TranscriptionService`, `calls.module.ts`dagi
+   * qo'ng'iroq yozuvlarini matnga o'giruvchi XIZMAT BILAN BIR XIL)
+   * orqali matnga o'giramiz, so'ng xuddi yozma xabar kabi Jarvis AI
+   * yordamchisiga yo'naltiramiz — shuning uchun ovozli buyruq
+   * ("Ahmadning bosqichini Muzokara qil" kabi) ham TO'LIQ ishlaydi,
+   * chunki tool-use agent ikkalasida ham BIR XIL kod yo'lidan o'tadi.
+   * Qo'shimcha AI (Claude) so'rovi qo'shilmaydi — faqat STT (Whisper)
+   * so'rovi qo'shiladi, u ham faqat ADMIN/MANAGER uchun ishlaydi.
+   */
+  private async handleVoice(tenantId: string, botId: string, bot: TelegramBot, msg: TelegramVoiceMsg) {
+    const chatId = String(msg.chat.id);
+    const voice = msg.voice;
+    if (!voice?.file_id) return;
+
+    const link = await this.prisma.jarvisBotLink.findUnique({ where: { botId_chatId: { botId, chatId } } as any }).catch(() => null);
+    if (!link || !link.isActive) {
+      await bot.sendMessage(chatId, "Siz hali ulanmagansiz. CRM'da Sozlamalar → Jarvis Bot bo'limidan ulanish kodini oling.");
+      return;
+    }
+    if (!['TENANT_ADMIN', 'MANAGER'].includes(link.role)) {
+      await bot.sendMessage(chatId, "Bu bot orqali faqat bildirishnomalar yuboriladi. Ovozli buyruq berish faqat administratorga ochiq.");
+      return;
+    }
+    if (!this.transcription.isConfigured()) {
+      await bot.sendMessage(chatId, "⚠️ Ovozli xabarlarni matnga o'girish sozlanmagan (GROQ_API_KEY/OPENAI_API_KEY yo'q). Iltimos, matn bilan yozing.");
+      return;
+    }
+    // 25MB Whisper limitidan xavfsiz chegara (Telegram voice notlar odatda juda kichik)
+    if (voice.file_size && voice.file_size > 24 * 1024 * 1024) {
+      await bot.sendMessage(chatId, "⚠️ Ovozli xabar juda katta (limit 25MB).");
+      return;
+    }
+
+    try {
+      await bot.sendChatAction(chatId, 'typing').catch(() => {});
+      const fileUrl = await bot.getFileLink(voice.file_id);
+      const stt = await this.transcription.transcribeFromUrl(fileUrl);
+      if (!stt.text) {
+        await bot.sendMessage(chatId, `⚠️ Ovozli xabarni tushunolmadim${stt.error ? `: ${stt.error}` : '.'} Iltimos, qayta urinib ko'ring yoki matn bilan yozing.`);
+        return;
+      }
+      await bot.sendMessage(chatId, `🎙 Eshitdim: "${stt.text.slice(0, 300)}"`);
+      await this.runJarvisTurn(bot, chatId, tenantId, link, stt.text);
+    } catch (e: any) {
+      this.logger.warn(`Ovozli xabar xato [${tenantId}]: ${e.message}`);
+      await bot.sendMessage(chatId, "⚠️ Ovozli xabarni qayta ishlab bo'lmadi. Matn bilan yozib ko'ring.");
+    }
+  }
+
+  /** Matn (yoki ovozdan aylantirilgan matn)ni Jarvis AI yordamchisiga yuboradi va javobni botga qaytaradi. */
+  private async runJarvisTurn(
+    bot: TelegramBot,
+    chatId: string,
+    tenantId: string,
+    link: { id: string; userId: string; role: string; aiConversationId?: string | null },
+    text: string,
+  ) {
+    try {
+      await bot.sendChatAction(chatId, 'typing').catch(() => {});
+      const result = await this.aiAssistant.chat(
+        { tenantId, userId: link.userId, role: link.role },
+        link.aiConversationId || undefined,
+        text,
+        'telegram',
+      );
+      if (result.conversationId !== link.aiConversationId) {
+        await this.prisma.jarvisBotLink.update({
+          where: { id: link.id },
+          data: { aiConversationId: result.conversationId },
+        }).catch(() => {});
+      }
+      await bot.sendMessage(chatId, (result.reply || "Javob tayyorlay olmadim.").slice(0, 4000));
+    } catch (e: any) {
+      const msg = e?.response?.message || e?.message || "Jarvis hozir javob bera olmadi.";
+      await bot.sendMessage(chatId, `⚠️ ${msg}`);
+    }
+  }
+
+  // ─── ADMIN CRM'DAN BOTNI BOSHQARISH ────────────────────────────
+
+  async connect(tenantId: string, token: string) {
+    if (!token?.trim()) throw new BadRequestException('Bot token kerak');
+    token = token.trim();
+
+    const tempBot = new TelegramBot(token, { polling: false });
+    const info = await tempBot.getMe().catch(() => {
+      throw new BadRequestException("Token noto'g'ri — Telegram bu tokenni tanimadi");
+    });
+
+    // Global tekshiruv: bu token boshqa tenantda ALLAQACHON ishlatilmayaptimi
+    // (izolyatsiyani buzmasin — bitta bot faqat bitta firmaga tegishli bo'lsin)
+    const dup = await this.prisma.jarvisBot.findFirst({ where: { botToken: token, NOT: { tenantId } } });
+    if (dup) throw new BadRequestException('Bu bot allaqachon boshqa kompaniyada ulangan');
+
+    const bot = await this.prisma.jarvisBot.upsert({
+      where: { tenantId },
+      create: { tenantId, botToken: token, botUsername: info.username, isActive: true },
+      update: { botToken: token, botUsername: info.username, isActive: true },
+    });
+
+    await this.startBot(tenantId, bot.id, token);
+    return { connected: true, botUsername: bot.botUsername };
+  }
+
+  async disconnect(tenantId: string) {
+    const bot = await this.prisma.jarvisBot.findUnique({ where: { tenantId } });
+    if (!bot) throw new NotFoundException('Jarvis bot topilmadi');
+    await this.stopBot(tenantId);
+    await this.prisma.jarvisBot.update({ where: { tenantId }, data: { isActive: false } });
+    return { connected: false };
+  }
+
+  async updateSettings(tenantId: string, data: { notifyAdminOnAnalysis?: boolean; dailyDigestEnabled?: boolean; dailyDigestHour?: number }) {
+    const bot = await this.prisma.jarvisBot.findUnique({ where: { tenantId } });
+    if (!bot) throw new NotFoundException('Jarvis bot topilmadi');
+    const patch: any = {};
+    if (typeof data.notifyAdminOnAnalysis === 'boolean') patch.notifyAdminOnAnalysis = data.notifyAdminOnAnalysis;
+    if (typeof data.dailyDigestEnabled === 'boolean') patch.dailyDigestEnabled = data.dailyDigestEnabled;
+    if (typeof data.dailyDigestHour === 'number' && data.dailyDigestHour >= 0 && data.dailyDigestHour <= 23) {
+      patch.dailyDigestHour = data.dailyDigestHour;
+    }
+    return this.prisma.jarvisBot.update({ where: { tenantId }, data: patch });
+  }
+
+  async getStatus(tenantId: string, userId: string) {
+    const bot = await this.prisma.jarvisBot.findUnique({
+      where: { tenantId },
+      include: { links: { select: { userId: true, role: true, isActive: true, linkedAt: true, user: { select: { name: true } } } } },
+    });
+    const myLink = bot?.links.find((l) => l.userId === userId) || null;
+    return {
+      connected: !!bot?.isActive,
+      botUsername: bot?.botUsername || null,
+      notifyAdminOnAnalysis: bot?.notifyAdminOnAnalysis ?? true,
+      dailyDigestEnabled: bot?.dailyDigestEnabled ?? true,
+      dailyDigestHour: bot?.dailyDigestHour ?? 9,
+      links: bot?.links.map((l) => ({ userId: l.userId, name: l.user?.name, role: l.role, isActive: l.isActive, linkedAt: l.linkedAt })) || [],
+      myLinked: !!myLink?.isActive,
+    };
+  }
+
+  async unlink(tenantId: string, targetUserId: string) {
+    const link = await this.prisma.jarvisBotLink.findFirst({ where: { tenantId, userId: targetUserId } });
+    if (!link) throw new NotFoundException('Ulanish topilmadi');
+    await this.prisma.jarvisBotLink.delete({ where: { id: link.id } });
+    return { success: true };
+  }
+
+  // ─── QO'NG'IROQ TAHLILI → ADMINGA PUSH (AI so'rov QILMAYDI) ────
+
+  /**
+   * `calls.module.ts`dagi `analyzeCall` muvaffaqiyatli tugagach
+   * `call.analyzed` hodisasini chiqaradi — biz shu yerda tinglaymiz.
+   * TO'G'RIDAN-TO'G'RI IMPORT emas, hodisa orqali — bu CallsModule
+   * bilan JarvisBotModule (u BriefingModule'ni ishlatadi, u esa
+   * `calls.module.ts`dan OBJECTION_CATEGORIES'ni import qiladi)
+   * o'rtasida aylanma bog'liqlik (circular import) yaratmaydi.
+   */
+  @OnEvent('call.analyzed')
+  async notifyCallAnalyzed(payload: {
+    tenantId: string;
+    id: string;
+    agentId?: string | null;
+    agentName?: string | null;
+    clientName?: string | null;
+    aiSummary?: string | null;
+    aiSentiment?: string | null;
+    aiFeedback?: any;
+  }) {
+    const { tenantId, ...call } = payload;
+    try {
+      const bot = await this.prisma.jarvisBot.findUnique({ where: { tenantId } });
+      if (!bot || !bot.isActive || !bot.notifyAdminOnAnalysis) return;
+      const botInstance = this.bots.get(tenantId);
+      if (!botInstance) return;
+
+      const admins = await this.prisma.jarvisBotLink.findMany({
+        where: { tenantId, botId: bot.id, isActive: true, role: { in: ['TENANT_ADMIN', 'MANAGER'] } },
+      });
+      if (!admins.length) return;
+
+      const sentimentEmoji = call.aiSentiment === 'positive' ? '🟢' : call.aiSentiment === 'negative' ? '🔴' : '🟡';
+      const score = call.aiFeedback?.overallScore != null ? `${call.aiFeedback.overallScore}/10` : '—';
+      const lines = [
+        `📞 Yangi qo'ng'iroq tahlili`,
+        ``,
+        `Agent: ${call.agentName || 'Noma\'lum'}`,
+        `Mijoz: ${call.clientName || 'Noma\'lum'}`,
+        `Kayfiyat: ${sentimentEmoji}  Baho: ${score}`,
+        ``,
+        call.aiSummary ? call.aiSummary.slice(0, 600) : 'Xulosa yo\'q.',
+      ];
+      const text = lines.join('\n');
+
+      for (const link of admins) {
+        await botInstance.sendMessage(link.chatId, text).catch((e) =>
+          this.logger.warn(`Push yuborilmadi [${tenantId} → ${link.chatId}]: ${e.message}`),
+        );
+      }
+    } catch (e: any) {
+      this.logger.warn(`notifyCallAnalyzed xato: ${e.message}`);
+    }
+  }
+
+  // ─── KUNLIK BRIFING → CRON (AI qo'shimcha so'rov QILMAYDI — keshdan o'qiydi) ───
+
+  private todayKeyTashkent(): string {
+    const tashkent = new Date(Date.now() + 5 * 3600 * 1000);
+    return tashkent.toISOString().slice(0, 10);
+  }
+  private currentHourTashkent(): number {
+    const tashkent = new Date(Date.now() + 5 * 3600 * 1000);
+    return tashkent.getUTCHours();
+  }
+
+  /** Har soat boshida ishga tushadi, faqat "vaqti kelgan" botlarga digest yuboradi (kuniga 1 marta) */
+  @Cron('0 * * * *')
+  async hourlyDigestTick() {
+    await this.cronLock.runOnce('jarvis-daily-digest', 15 * 60, async () => {
+      const hour = this.currentHourTashkent();
+      const today = this.todayKeyTashkent();
+      const dueBots = await this.prisma.jarvisBot.findMany({
+        where: { isActive: true, dailyDigestEnabled: true, dailyDigestHour: hour, NOT: { lastDigestDate: today } },
+      });
+      for (const bot of dueBots) {
+        await this.sendDailyDigest(bot.tenantId, bot.id).catch((e) =>
+          this.logger.warn(`Kunlik digest xato [${bot.tenantId}]: ${e.message}`),
+        );
+        await this.prisma.jarvisBot.update({ where: { id: bot.id }, data: { lastDigestDate: today } }).catch(() => {});
+      }
+    });
+  }
+
+  private async sendDailyDigest(tenantId: string, botId: string) {
+    const botInstance = this.bots.get(tenantId);
+    if (!botInstance) return;
+
+    const links = await this.prisma.jarvisBotLink.findMany({ where: { tenantId, botId, isActive: true } });
+    for (const link of links) {
+      try {
+        // v41: keshlangan brifingdan o'qiydi — agar bugun hali generatsiya
+        // qilinmagan bo'lsa shu yerda BIR MARTA generatsiya qilinadi va
+        // keyin dashboard ochilganda ham xuddi shu natija ko'rinadi
+        // (aksincha ham to'g'ri) — ya'ni ikki marta AI xarajat qilinmaydi.
+        const data = await this.briefing.getBriefing(tenantId, link.userId, link.role, false);
+        if ((data as any)?.disabled || (data as any)?.error) continue;
+
+        const isAgent = link.role === 'AGENT';
+        const heading = isAgent ? "🌅 Bugungi shaxsiy ustuvorliklaringiz" : "🌅 Jamoaning bugungi holati";
+        const parts = [heading];
+        if (data.greeting) parts.push(data.greeting);
+        parts.push('');
+        const items = Array.isArray(data.items) ? data.items.slice(0, 6) : [];
+        if (items.length) {
+          items.forEach((it: any, i: number) => {
+            parts.push(`${i + 1}. ${it.title}${it.clientName ? ` — ${it.clientName}` : ''}`);
+            if (it.reason) parts.push(`   ↳ ${it.reason}`);
+          });
+        } else {
+          parts.push("Bugun ustuvor ochiq ish topilmadi 👍");
+        }
+        if (data.weakSpot) {
+          parts.push('', `💡 ${data.weakSpot.title}: ${data.weakSpot.detail}`);
+          if (data.weakSpot.tip) parts.push(`   Tavsiya: ${data.weakSpot.tip}`);
+        }
+
+        await botInstance.sendMessage(link.chatId, parts.join('\n').slice(0, 4000));
+      } catch (e: any) {
+        this.logger.warn(`Digest yuborilmadi [${tenantId} → ${link.userId}]: ${e.message}`);
+      }
+    }
+  }
+}
+
+@ApiTags('Jarvis Bot')
+@ApiBearerAuth()
+@Controller('jarvis-bot')
+@UseGuards(JwtAuthGuard)
+export class JarvisBotController {
+  constructor(private svc: JarvisBotService) {}
+
+  @ApiOperation({ summary: "Jarvis bot holati (ulanganmi, kim ulangan, o'zim ulanganmanmi)" })
+  @Get('status')
+  status(@CurrentUser() u: any) {
+    return this.svc.getStatus(u.tenantId, u.sub);
+  }
+
+  @ApiOperation({ summary: "Jarvis botni ulash (bitta tenantda FAQAT bitta bot)" })
+  @Post('connect')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  connect(@CurrentUser() u: any, @Body() body: { token: string }) {
+    return this.svc.connect(u.tenantId, body?.token);
+  }
+
+  @ApiOperation({ summary: "Jarvis botni uzish" })
+  @Post('disconnect')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  disconnect(@CurrentUser() u: any) {
+    return this.svc.disconnect(u.tenantId);
+  }
+
+  @ApiOperation({ summary: "Bildirishnoma sozlamalarini yangilash" })
+  @Patch('settings')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  updateSettings(@CurrentUser() u: any, @Body() body: any) {
+    return this.svc.updateSettings(u.tenantId, body);
+  }
+
+  @ApiOperation({ summary: "O'zimni Jarvis botga ulash uchun bir martali kod olish" })
+  @Post('link-code')
+  linkCode(@CurrentUser() u: any) {
+    return this.svc.createLinkCode(u.tenantId, u.sub, u.role);
+  }
+
+  @ApiOperation({ summary: "Boshqa foydalanuvchini botdan uzish" })
+  @Delete('links/:userId')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN')
+  unlink(@CurrentUser() u: any, @Param('userId') userId: string) {
+    return this.svc.unlink(u.tenantId, userId);
+  }
+}
+
+@Module({
+  imports: [PrismaModule, RedisClientModule, AiAssistantModule, BriefingModule, TranscriptionModule],
+  controllers: [JarvisBotController],
+  providers: [JarvisBotService],
+  exports: [JarvisBotService],
+})
+export class JarvisBotModule {}

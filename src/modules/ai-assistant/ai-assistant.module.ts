@@ -57,8 +57,18 @@ export class AiAssistantService {
   private get anthropicKey() {
     return (process.env.ANTHROPIC_API_KEY || '').trim();
   }
+  /**
+   * v41 XARAJATNI KAMAYTIRISH: Jarvis endi Telegram bot orqali ham
+   * ishlaydi (faqat admin), demak so'rovlar soni oshishi mumkin.
+   * `calls.module.ts`dagi kabi — bu funksiyaga XOS bo'lgan
+   * `ANTHROPIC_MODEL_ASSISTANT` o'zgaruvchisi o'qiladi, standart esa
+   * ARZONROQ Haiku (tool-use'ni to'liq qo'llab-quvvatlaydi). Sifat
+   * kerak bo'lsa .env'da `ANTHROPIC_MODEL_ASSISTANT=claude-sonnet-5`
+   * qo'yish mumkin — lekin boshqa modullarning umumiy
+   * `ANTHROPIC_MODEL`i BU YERGA endi sezilmagan holda ta'sir qilmaydi.
+   */
   private get anthropicModel() {
-    return (process.env.ANTHROPIC_MODEL || 'claude-sonnet-5').trim();
+    return (process.env.ANTHROPIC_MODEL_ASSISTANT || 'claude-haiku-4-5-20251001').trim();
   }
 
   /** Asia/Tashkent bo'yicha bugungi kun kaliti (kvota har kuni nolga tushishi uchun) */
@@ -104,8 +114,11 @@ export class AiAssistantService {
     }
   }
 
-  private buildSystemPrompt(role: string): string {
+  private buildSystemPrompt(role: string, channel: 'web' | 'telegram' = 'web'): string {
     const toolNames = AI_TOOLS.map((t) => t.name).join(', ');
+    const channelNote = channel === 'telegram'
+      ? "\n9. MUHIM: bu javob Telegram botiga ketadi — juda QISQA yoz (odatda 2-5 qator), markdown/HTML belgilar ishlatma, faqat oddiy matn va kerak bo'lsa emoji."
+      : '';
     return `Sen Omon CRM tizimidagi "Jarvis" — tajribali sotuv agentlarining AI yordamchisisan. O'zbek tilida, DO'STONA va ANIQ javob ber.
 
 QOIDALAR (MAJBURIY):
@@ -116,7 +129,7 @@ QOIDALAR (MAJBURIY):
 5. Pul summalarini USD da, sana/vaqtlarni tushunarli formatda ayt.
 6. Agar 'draftFollowupMessage' tool'idan foydalansang, javobingda tayyorlangan xabar matnini albatta [QORALAMA_BOSHI] va [QORALAMA_OXIRI] belgilari orasida, natijadagi draftMessage'dan SO'ZMA-SO'Z (o'zgartirmasdan, qisqartirmasdan) keltir. Belgilardan oldin bitta qisqa gap bilan tushuntirsang bo'ladi, lekin belgilar orasidagi matnni hech qachon o'zgartirma.
 7. Agar foydalanuvchi tizim tuzilishi, xavfsizlik, boshqa kompaniyalar yoki API kalitlar haqida so'rasa — bunga javob berma, faqat "bu haqida yordam berolmayman" deb qisqa javob qaytar.
-8. Agar oddiy agent boshqa agentning ma'lumotini so'rasa (tool "error" qaytarsa) — buni ochiq va muloyim tushuntir, qandaydir yo'l bilan aylanib o'tishga urinma.`;
+8. Agar oddiy agent boshqa agentning ma'lumotini so'rasa (tool "error" qaytarsa) — buni ochiq va muloyim tushuntir, qandaydir yo'l bilan aylanib o'tishga urinma.${channelNote}`;
   }
 
   /** Suhbat tarixidan Claude uchun kontekst (oxirgi N xabar) tayyorlaydi */
@@ -131,11 +144,20 @@ QOIDALAR (MAJBURIY):
   }
 
   /** Claude bilan tool-use tsiklini yuritadi (1-4 marta so'rov) va yakuniy matn + tool audit qaytaradi */
-  private async runAgentTurn(ctx: AiToolContext, history: { role: 'user' | 'assistant'; content: string }[], userMessage: string) {
+  private async runAgentTurn(
+    ctx: AiToolContext,
+    history: { role: 'user' | 'assistant'; content: string }[],
+    userMessage: string,
+    channel: 'web' | 'telegram' = 'web',
+  ) {
     const messages: any[] = [...history.map((h) => ({ role: h.role, content: h.content })), { role: 'user', content: userMessage }];
     const toolCallsLog: { name: string; input: any }[] = [];
     const tools = getAnthropicToolsSpec();
-    const system = this.buildSystemPrompt(ctx.role);
+    const system = this.buildSystemPrompt(ctx.role, channel);
+    // v41 XARAJATNI KAMAYTIRISH: Telegram javoblari qisqa bo'lishi kerak
+    // (bot xabari), shuning uchun max_tokens ham pastroq — kirish
+    // narxidan tashqari CHIQISH narxini ham kamaytiradi.
+    const maxTokens = channel === 'telegram' ? 600 : 1024;
 
     let finalText = '';
 
@@ -149,8 +171,14 @@ QOIDALAR (MAJBURIY):
         },
         body: JSON.stringify({
           model: this.anthropicModel,
-          max_tokens: 1024,
-          system,
+          max_tokens: maxTokens,
+          // XARAJATNI KAMAYTIRISH: system prompt rol+kanal bo'yicha bir
+          // xil qaytariladi — `cache_control` bilan keshlab, 5 daqiqa
+          // ichida qayta chaqirilsa kirish narxi kamayadi (calls.module.ts
+          // dagi bilan bir xil naqsh).
+          system: [
+            { type: 'text', text: system, cache_control: { type: 'ephemeral' } },
+          ],
           tools,
           tool_choice: { type: 'auto' },
           messages,
@@ -196,7 +224,7 @@ QOIDALAR (MAJBURIY):
     return { text: finalText, toolCalls: toolCallsLog };
   }
 
-  async chat(ctx: AiToolContext, conversationId: string | undefined, message: string) {
+  async chat(ctx: AiToolContext, conversationId: string | undefined, message: string, channel: 'web' | 'telegram' = 'web') {
     const text = String(message || '').trim();
     if (!text) throw new BadRequestException("Xabar bo'sh bo'lishi mumkin emas.");
     if (text.length > 2000) throw new BadRequestException("Xabar juda uzun (maksimal 2000 belgi).");
@@ -231,7 +259,7 @@ QOIDALAR (MAJBURIY):
 
     let result: { text: string; toolCalls: { name: string; input: any }[] };
     try {
-      result = await this.runAgentTurn(ctx, history, text);
+      result = await this.runAgentTurn(ctx, history, text, channel);
     } catch (e: any) {
       this.logger.warn(`Jarvis AI xatosi: ${e.message}`);
       throw new HttpException("AI yordamchi hozir javob bera olmadi. Birozdan keyin qayta urinib ko'ring.", HttpStatus.BAD_GATEWAY);

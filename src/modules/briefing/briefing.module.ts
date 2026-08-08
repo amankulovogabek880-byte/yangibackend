@@ -52,8 +52,15 @@ export class BriefingService {
   private get anthropicKey() {
     return (process.env.ANTHROPIC_API_KEY || '').trim();
   }
+  /**
+   * v41 XARAJATNI KAMAYTIRISH: brifing kuniga bitta marta keshlanadi,
+   * lekin baribir bu funksiyaga XOS `ANTHROPIC_MODEL_BRIEFING`
+   * o'zgaruvchisi orqali ARZONROQ Haiku standart qilindi (calls.module.ts
+   * va ai-assistant.module.ts dagi bilan bir xil naqsh) — umumiy
+   * `ANTHROPIC_MODEL` endi bu yerga sezilmagan holda ta'sir qilmaydi.
+   */
   private get anthropicModel() {
-    return (process.env.ANTHROPIC_MODEL || 'claude-sonnet-5').trim();
+    return (process.env.ANTHROPIC_MODEL_BRIEFING || 'claude-haiku-4-5-20251001').trim();
   }
 
   /** Asia/Tashkent bo'yicha bugungi kun kaliti (UTC+5, DST yo'q) */
@@ -299,7 +306,11 @@ FAQAT JSON qaytar:
         body: JSON.stringify({
           model: this.anthropicModel,
           max_tokens: 1200,
-          system,
+          // XARAJATNI KAMAYTIRISH: system prompt agent/jamoa turi bo'yicha
+          // deyarli bir xil qaytadi — keshlab kirish narxini kamaytiramiz.
+          system: [
+            { type: 'text', text: system, cache_control: { type: 'ephemeral' } },
+          ],
           messages: [{ role: 'user', content: prompt }],
         }),
       });

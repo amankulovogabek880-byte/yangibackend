@@ -25,6 +25,7 @@ import { CallDirection, CallStatus } from '../../prisma-types';;
 import { FollowUpsModule, FollowUpsService } from '../followups/followups.module';
 import { TranscriptionModule, TranscriptionService } from '../transcription/transcription.module';
 import { CALL_SCORING_RUBRIC } from './call-scoring-rubric';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 
 // E'tiroz turlari — statistikani izchil yig'ish uchun yopiq ro'yxat
 // (Claude javobni shu kategoriyalardan birortasiga moslashtiradi)
@@ -65,6 +66,12 @@ export class CallsService {
     private providerFactory: PhoneProviderFactory,
     private followUps: FollowUpsService,
     private transcription: TranscriptionService,
+    // v41: Jarvis Bot push'ini TO'G'RIDAN-TO'G'RI import qilish o'rniga
+    // hodisa (event) orqali yuboramiz — `bookings.module.ts`/
+    // `automations.module.ts`dagi bilan bir xil naqsh, va CallsModule
+    // bilan JarvisBotModule o'rtasida aylanma bog'liqlik (circular
+    // import) yaratmaydi.
+    private eventEmitter: EventEmitter2,
   ) {}
 
   // ═══════════════════════════════════════════════════════════════
@@ -400,6 +407,23 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       if (call.agentId) {
         this.realtime.emitToUser(call.agentId, 'call:analyzed', { callId, summary: updated.aiSummary });
       }
+
+      // v41: Jarvis Bot — tahlil natijasini ADMINGA (agar ulangan bo'lsa)
+      // Telegram orqali darhol yuboradi. Hodisa (event) sifatida
+      // yuboriladi — bu YANGI AI so'rov QILMAYDI (faqat yuqorida
+      // allaqachon hisoblangan natijani matn qilib yuboradi), va agar
+      // Jarvis bot ulanmagan/tinglovchisi bo'lmasa ham qo'ng'iroq
+      // tahlilining o'zi buzilmaydi.
+      this.eventEmitter.emit('call.analyzed', {
+        tenantId,
+        id: callId,
+        agentId: call.agentId,
+        agentName: call.agent?.name,
+        clientName: call.client?.fullName,
+        aiSummary: updated.aiSummary,
+        aiSentiment: updated.aiSentiment,
+        aiFeedback: updated.aiFeedback,
+      });
 
       return updated;
     } catch (e: any) {
