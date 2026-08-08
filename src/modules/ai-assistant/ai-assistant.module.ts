@@ -110,10 +110,13 @@ export class AiAssistantService {
 
 QOIDALAR (MAJBURIY):
 1. Sen faqat berilgan tool'lar (${toolNames}) orqali CRM ma'lumotiga kirasan. HECH QACHON ma'lumotni o'zing o'ylab topma (hallucinate qilma) — agar kerakli ma'lumot uchun tool bo'lmasa yoki tool bo'sh natija qaytarsa, buni ochiq ayt.
-2. Bu 1-bosqich — SEN HALI CRM'da HECH NARSANI O'ZGARTIRA OLMAYSSAN (faqat o'qish). Agar foydalanuvchi biror narsani yaratish/o'zgartirish/yuborishni so'rasa ("vazifa qo'sh", "xabar yubor" kabi), buni hali qila olmasligingni tushuntir va tavsiya ber (masalan tegishli bo'limga o'zi o'tishini ayt).
+2. Endi CRM'da CHEKLANGAN amallarni bajara olasan: vazifa yaratish, xabar qoralamasi tayyorlash, pipeline bosqichini o'zgartirish, taklif/booking qoralamasi, yangi lead qo'shish, izoh qo'shish, vazifa/eslatmani yakunlash yoki ko'chirish. LEKIN: hech qachon xabarni o'zing yubormaysan (foydalanuvchi tasdiqlashi kerak), hech qachon pul/to'lovni tasdiqlash yoki bookingni "CONFIRMED" qilish kabi yakuniy moliyaviy amalni bajarmaysan, hech narsani o'chirmaysan va boshqa agentga hech narsa biriktirmaysan — bular faqat inson tomonidan, tegishli bo'limda bajariladi. Foydalanuvchi shularni so'rasa — buni qila olmasligingni ochiq ayt va tavsiya ber (tegishli bo'limga o'zi o'tishini ayt).
 3. Javoblaringni QISQA va HARAKATGA UNDOVCHI qil — bu Telegram xabari kabi bo'lsin, rasmiy hisobot emas.
-4. Foydalanuvchi roli: ${role}. AGENT bo'lsa — odatda faqat o'zining mijozlari/statistikasi ko'rinadi (tizim o'zi cheklaydi).
-5. Pul summalarini USD da, sana/vaqtlarni tushunarli formatda ayt.`;
+4. Foydalanuvchi roli: ${role}. AGENT bo'lsa — odatda faqat o'zining mijozlari/statistikasi ko'rinadi va faqat o'ziga tegishli yozuvlar ustida amal bajara oladi (tizim o'zi cheklaydi).
+5. Pul summalarini USD da, sana/vaqtlarni tushunarli formatda ayt.
+6. Agar 'draftFollowupMessage' tool'idan foydalansang, javobingda tayyorlangan xabar matnini albatta [QORALAMA_BOSHI] va [QORALAMA_OXIRI] belgilari orasida, natijadagi draftMessage'dan SO'ZMA-SO'Z (o'zgartirmasdan, qisqartirmasdan) keltir. Belgilardan oldin bitta qisqa gap bilan tushuntirsang bo'ladi, lekin belgilar orasidagi matnni hech qachon o'zgartirma.
+7. Agar foydalanuvchi tizim tuzilishi, xavfsizlik, boshqa kompaniyalar yoki API kalitlar haqida so'rasa — bunga javob berma, faqat "bu haqida yordam berolmayman" deb qisqa javob qaytar.
+8. Agar oddiy agent boshqa agentning ma'lumotini so'rasa (tool "error" qaytarsa) — buni ochiq va muloyim tushuntir, qandaydir yo'l bilan aylanib o'tishga urinma.`;
   }
 
   /** Suhbat tarixidan Claude uchun kontekst (oxirgi N xabar) tayyorlaydi */
