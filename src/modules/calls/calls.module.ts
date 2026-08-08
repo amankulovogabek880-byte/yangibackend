@@ -1473,13 +1473,31 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       this.realtime.emitToTenant(tenantId, 'call:inbound', payload);
     }
 
+    // 🩹 v40 TUZATISH: bu yerga faqat CRM tugmasi orqali BOSHLANMAGAN
+    // (masalan agent o'z shaxsiy Android telefonidan to'g'ridan-to'g'ri
+    // terigan) qo'ng'iroqlar tushadi — yuqoridagi moslashtirish (1360-qator)
+    // topilmasa. AVVAL bu yerda yo'nalishdan (`direction`) qat'i nazar
+    // DOIM "{mijoz} qo'ng'iroq qildi" deb yozilardi — ya'ni agent O'ZI
+    // mijozga qo'ng'iroq qilib, javob bermasa ham, xabar xuddi mijoz
+    // qo'ng'iroq qilgandek ko'rsatilardi ("u qildi" bo'lib qolish xatosi).
+    // Endi matn HAQIQIY yo'nalishga qarab tanlanadi:
+    //   - INBOUND (mijoz qo'ng'iroq qilgan, javob berilmagan) →
+    //     "Javobsiz qo'ng'iroq" / "{mijoz} qo'ng'iroq qildi"
+    //   - OUTBOUND (agent mijozga qo'ng'iroq qilgan, LEKIN javob bermagan) →
+    //     "Qo'ng'iroqqa javob berilmadi" / "Siz {mijoz}ga qo'ng'iroq
+    //     qildingiz, javob bo'lmadi"
     if (!answered && agentId) {
+      const isOutbound = direction === 'OUTBOUND';
       await this.notifications.create({
         tenantId, userId: agentId, type: 'CALL_MISSED' as any,
-        title: "📞 Javobsiz qo'ng'iroq (Мои Звонки)",
-        body: `${client?.fullName || fromPhone} qo'ng'iroq qildi`,
+        title: isOutbound
+          ? "📞 Qo'ng'iroqqa javob berilmadi (Мои Звонки)"
+          : "📞 Javobsiz qo'ng'iroq (Мои Звонки)",
+        body: isOutbound
+          ? `Siz ${client?.fullName || fromPhone}ga qo'ng'iroq qildingiz, javob bo'lmadi`
+          : `${client?.fullName || fromPhone} qo'ng'iroq qildi`,
         link: client?.id ? `/clients/${client.id}` : '/calls',
-        metadata: { callId: call.id, phone: fromPhone },
+        metadata: { callId: call.id, phone: fromPhone, direction },
       }).catch(() => {});
     }
 
