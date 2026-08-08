@@ -222,6 +222,7 @@ export class ClientsService {
         take,
         include: {
           assignedAgent: { select: { id: true, name: true, avatarUrl: true } },
+          customStage: { select: { id: true, name: true, color: true } },
           _count: { select: { bookings: true } },
         },
         orderBy,
@@ -254,6 +255,7 @@ export class ClientsService {
         orderBy: { pipelineStageAt: 'desc' },
         include: {
           assignedAgent: { select: { id: true, name: true } },
+          customStage: { select: { id: true, name: true, color: true } },
           _count: { select: { bookings: true } },
         },
       }),
