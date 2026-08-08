@@ -1,6 +1,6 @@
 import { PrismaService } from '../../prisma/prisma.service';
 import { hasPermission } from '../../common/permissions/permissions.constants';
-import { phoneVariants, normalizePhone, generateRef } from '../../common/utils/helpers';
+import { phoneVariants, normalizePhone, generateRef, convertToUSD } from '../../common/utils/helpers';
 
 /**
  * ═══════════════════════════════════════════════════════════════
@@ -647,50 +647,110 @@ const draftFollowupMessage: AiToolDefinition = {
 // ─────────────────────────────────────────────────────────────
 // 10) updatePipelineStage
 // ─────────────────────────────────────────────────────────────
+// ESLATMA (audit topilmasi): loyihada pipeline bosqichini o'zgartirishning
+// KANONIK joyi `src/modules/pipeline/pipeline.module.ts`dagi
+// `PipelineService.moveStage()` ekan — u yerda: (a) `ClientTimeline`ga
+// `type: 'stage_change'` yozuvi qo'shiladi (StageHistory'ga EMAS — butun
+// loyihada hech qayerda `stageHistory.create()` chaqirilmaydi, faqat
+// `getHistory()` o'qiydi, ya'ni bu jadval amalda bo'sh qoladi), (b) maxsus
+// (tenant o'zi qo'shgan) bosqichlar `CUSTOM_<customStageId>` shaklida
+// keladi va `customStageId` ustuniga yoziladi, `pipelineStage` esa
+// o'zgarmay qoladi. Quyidagi tool shu ikkala holatni ham hisobga oladi —
+// ClientTimeline yozadi (asosiy, UI shuni o'qiydi) VA StageHistory'ga ham
+// yozadi (zarar qilmaydi, aksincha hozircha bo'sh turgan jadvalga real
+// ma'lumot qo'shadi).
 const updatePipelineStage: AiToolDefinition = {
   name: 'updatePipelineStage',
   description:
-    "Mijozning pipeline (sotuv voronkasi) bosqichini o'zgartiradi. Yakunlangan (COMPLETED) yoki yo'qotilgan (LOST) mijozni qayta ochib bo'lmaydi.",
+    "Mijozning pipeline (sotuv voronkasi) bosqichini o'zgartiradi — standart bosqichlar (masalan CONTACTED, NEGOTIATION) yoki tenant o'zi qo'shgan maxsus bosqich nomi bilan. Yakunlangan (COMPLETED) yoki yo'qotilgan (LOST) mijozni qayta ochib bo'lmaydi.",
   input_schema: {
     type: 'object',
     properties: {
       clientId: { type: 'string', description: 'Mijoz ID' },
-      newStage: { type: 'string', enum: PIPELINE_STAGES, description: "Yangi bosqich" },
+      newStage: {
+        type: 'string',
+        description:
+          `Yangi bosqich. Standart qiymatlar: ${PIPELINE_STAGES.join(', ')}. ` +
+          "Agar tenant o'zi qo'shgan maxsus bosqichga o'tkazish kerak bo'lsa, uning aniq NOMINI yozing (masalan 'Shartnoma imzolandi') — tool o'zi mos maxsus bosqichni tenant ichidan qidiradi.",
+      },
     },
     required: ['clientId', 'newStage'],
   },
   execute: async (prisma, ctx, params) => {
-    const newStage = String(params?.newStage || '').toUpperCase();
-    if (!PIPELINE_STAGES.includes(newStage)) {
-      return { error: `Noto'g'ri bosqich. Ruxsat etilganlar: ${PIPELINE_STAGES.join(', ')}` };
-    }
+    const rawStage = String(params?.newStage || '').trim();
+    if (!rawStage) return { error: "Yangi bosqich ko'rsatilmagan" };
 
     const owned = await requireOwnedClient(prisma, ctx, params?.clientId);
     if ('error' in owned) return owned;
     const client = owned.client;
 
     const oldStage = client.pipelineStage;
-    if ((oldStage === 'COMPLETED' || oldStage === 'LOST') && newStage !== oldStage) {
-      return { error: "Yakunlangan/yo'qotilgan mijozni qayta ochib bo'lmaydi, buni admin qilishi kerak" };
-    }
-    if (oldStage === newStage) {
-      return { success: true, clientName: client.fullName, oldStage, newStage, note: 'Mijoz allaqachon shu bosqichda edi' };
+
+    // 1) Avval standart ENUM bosqich sifatida tekshiramiz
+    const upperStage = rawStage.toUpperCase();
+    let updateData: any = { pipelineStageAt: new Date() };
+    let newStageLabel: string;
+    let isCustom = false;
+
+    if (PIPELINE_STAGES.includes(upperStage)) {
+      // Yakunlangan/yo'qotilganni qayta ochish — faqat HAQIQIY o'zgarishda bloklaymiz
+      // (masalan yana COMPLETED deb so'ralsa, bu no-op, xato emas)
+      if ((oldStage === 'COMPLETED' || oldStage === 'LOST') && upperStage !== oldStage) {
+        return { error: "Yakunlangan/yo'qotilgan mijozni qayta ochib bo'lmaydi, buni admin qilishi kerak" };
+      }
+      updateData.pipelineStage = upperStage as any;
+      updateData.customStageId = null;
+      newStageLabel = upperStage;
+    } else {
+      if (oldStage === 'COMPLETED' || oldStage === 'LOST') {
+        return { error: "Yakunlangan/yo'qotilgan mijozni qayta ochib bo'lmaydi, buni admin qilishi kerak" };
+      }
+      // 2) Bo'lmasa — tenantning maxsus (custom) bosqichlaridan nomi bo'yicha qidiramiz
+      const customStage = await prisma.customStage.findFirst({
+        where: { tenantId: ctx.tenantId, name: { equals: rawStage, mode: 'insensitive' } },
+      });
+      if (!customStage) {
+        return {
+          error: `Bunday bosqich topilmadi. Standart bosqichlar: ${PIPELINE_STAGES.join(', ')}. Agar bu maxsus bosqich bo'lsa, uning nomini aniqroq yozib ko'ring.`,
+        };
+      }
+      updateData.customStageId = customStage.id;
+      newStageLabel = customStage.name;
+      isCustom = true;
     }
 
-    await prisma.client.update({
-      where: { id: client.id },
-      data: { pipelineStage: newStage as any, pipelineStageAt: new Date() },
-    });
+    if (!isCustom && oldStage === upperStage) {
+      return { success: true, clientName: client.fullName, oldStage, newStage: upperStage, note: 'Mijoz allaqachon shu bosqichda edi' };
+    }
 
-    await prisma.stageHistory.create({
+    await prisma.client.update({ where: { id: client.id }, data: updateData });
+
+    // Asosiy audit: ClientTimeline — mijoz sahifasidagi tarix shu yerdan o'qiladi
+    await prisma.clientTimeline.create({
       data: {
         clientId: client.id,
         userId: ctx.userId,
-        fromStage: oldStage as any,
-        toStage: newStage as any,
-        note: 'Jarvis (AI yordamchi) orqali o\'zgartirildi',
-      },
+        type: 'stage_change',
+        title: `Bosqich: ${oldStage} → ${newStageLabel} (Jarvis)`,
+        description: 'AI yordamchi orqali o\'zgartirildi',
+        metadata: { from: oldStage, to: newStageLabel, via: 'ai-assistant' },
+      } as any,
     }).catch(() => {});
+
+    // Qo'shimcha: StageHistory (dedikatsiyalangan "Bosqich tarixi" ekrani buni o'qiydi)
+    // MUHIM: StageHistory.toStage ustuni MAJBURIY (PipelineStage enum, null bo'lolmaydi) —
+    // shu sababli faqat standart ENUM bosqichga o'tishda yoziladi, custom bosqich uchun EMAS.
+    if (!isCustom) {
+      await prisma.stageHistory.create({
+        data: {
+          clientId: client.id,
+          userId: ctx.userId,
+          fromStage: (PIPELINE_STAGES.includes(oldStage) ? oldStage : null) as any,
+          toStage: updateData.pipelineStage as any,
+          note: 'Jarvis (AI yordamchi) orqali o\'zgartirildi',
+        },
+      }).catch(() => {});
+    }
 
     await prisma.auditLog.create({
       data: {
@@ -699,12 +759,12 @@ const updatePipelineStage: AiToolDefinition = {
         action: 'STAGE_CHANGE' as any,
         entity: 'client',
         entityId: client.id,
-        changes: { pipelineStage: { from: oldStage, to: newStage } },
+        changes: { pipelineStage: { from: oldStage, to: newStageLabel } },
         metadata: { via: 'ai-assistant' },
       },
     }).catch(() => {});
 
-    return { success: true, clientName: client.fullName, oldStage, newStage };
+    return { success: true, clientName: client.fullName, oldStage, newStage: newStageLabel };
   },
 };
 
@@ -714,12 +774,13 @@ const updatePipelineStage: AiToolDefinition = {
 // ESLATMA: Loyihada alohida "Offer" Prisma modeli YO'Q — takliflar
 // Client.preferences.offers JSON massivida saqlanadi (qarang:
 // src/modules/offers/offers.module.ts). Shu sababli bu yerda ham xuddi
-// shu joyga, xuddi shu minimal shaklda ('DRAFT' status bilan) yoziladi —
-// mavjud "Takliflar" ekrani buni to'g'ridan-to'g'ri ko'rsata oladi.
-// Valyuta konvertatsiyasi (CBU.uz) BU YERDA QILINMAYDI — agar valyuta
-// USD bo'lmasa, taklif "USD emas" ekanini ochiq belgilab qo'yadi va
-// narxni original valyutada saqlaydi (foydalanuvchi keyin "Takliflar"
-// ekranida to'g'rilashi mumkin).
+// shu joyga, xuddi shu shaklda ('DRAFT' status bilan) yoziladi — mavjud
+// "Takliflar" ekrani buni to'g'ridan-to'g'ri ko'rsata oladi.
+// ESLATMA (audit topilmasi): `offers.module.ts`dagi haqiqiy `buildOfferFields()`
+// TASDIQLADI — actualPrice/markup/clientPrice/pricePerPerson HAR DOIM USD'da
+// saqlanishi SHART (aks holda KPI/komissiya hisob-kitoblari buziladi). Avvalgi
+// versiyada bu yerda konvertatsiya QILINMAGAN edi — endi xuddi shu
+// `convertToUSD()` funksiyasidan (CBU.uz rasmiy kursi) foydalanib tuzatildi.
 const createOfferDraft: AiToolDefinition = {
   name: 'createOfferDraft',
   description:
@@ -731,7 +792,7 @@ const createOfferDraft: AiToolDefinition = {
       tourId: { type: 'string', description: "(Ixtiyoriy) marketplace tur ID — searchMarketplaceTours natijasidan" },
       description: { type: 'string', description: "Taklif tavsifi/tur nomi, masalan 'Antalya, 7 kecha, Rixos'" },
       price: { type: 'number', description: '1 kishi uchun narx' },
-      currency: { type: 'string', enum: ['USD', 'EUR', 'UZS', 'RUB'], description: "Valyuta (standart USD)" },
+      currency: { type: 'string', enum: ['USD', 'EUR', 'UZS', 'RUB'], description: "Narx qaysi valyutada kiritilyapti (standart USD) — tool buni avtomatik USD'ga o'giradi (CBU.uz rasmiy kursi)" },
     },
     required: ['clientId', 'description', 'price'],
   },
@@ -743,8 +804,22 @@ const createOfferDraft: AiToolDefinition = {
     const description = String(params?.description || '').trim();
     if (!description) return { error: "Taklif tavsifi bo'sh bo'lishi mumkin emas" };
 
-    const price = Number(params?.price);
-    if (!Number.isFinite(price) || price <= 0) return { error: "Narx noto'g'ri (0 dan katta bo'lishi kerak)" };
+    const rawPrice = Number(params?.price);
+    if (!Number.isFinite(rawPrice) || rawPrice <= 0) return { error: "Narx noto'g'ri (0 dan katta bo'lishi kerak)" };
+
+    const enteredCurrency = ['USD', 'EUR', 'UZS', 'RUB'].includes(params?.currency) ? params.currency : 'USD';
+
+    let price = rawPrice;
+    let fx: { rate: number; source: string } | null = null;
+    if (enteredCurrency !== 'USD') {
+      try {
+        const converted = await convertToUSD(rawPrice, enteredCurrency);
+        price = converted.usd;
+        fx = { rate: converted.rate, source: converted.source };
+      } catch {
+        return { error: "Valyuta kursini olishda xatolik yuz berdi (CBU.uz). Iltimos narxni USD'da kiriting yoki keyinroq urinib ko'ring." };
+      }
+    }
 
     let destination: string | null = null;
     if (params?.tourId) {
@@ -753,13 +828,12 @@ const createOfferDraft: AiToolDefinition = {
       });
       if (!tour) return { error: "Ko'rsatilgan tur (tourId) topilmadi" };
       destination = tour.destination;
-      // Narx tur narxidan 3 barobardan ko'p oshib ketsa — mantiqsiz, rad etamiz
+      // Narx (USD'ga o'girilgandan keyin) tur narxidan 3 barobardan ko'p oshib ketsa — mantiqsiz, rad etamiz
       if (tour.price && price > tour.price * 3) {
-        return { error: `Narx ($${price}) tanlangan tur narxidan ($${tour.price}) mantiqsiz baland. Iltimos tekshiring.` };
+        return { error: `Narx ($${price.toFixed(2)}) tanlangan tur narxidan ($${tour.price}) mantiqsiz baland. Iltimos tekshiring.` };
       }
     }
 
-    const currency = ['USD', 'EUR', 'UZS', 'RUB'].includes(params?.currency) ? params.currency : 'USD';
     const prefs: any = (client as any).preferences || {};
     if (!prefs.offers) prefs.offers = [];
 
@@ -772,14 +846,15 @@ const createOfferDraft: AiToolDefinition = {
       adults: 1,
       children: 0,
       actualPrice: 0,
-      markup: currency === 'USD' ? price : 0,
-      clientPrice: currency === 'USD' ? price : 0,
-      pricePerPerson: currency === 'USD' ? price : 0,
-      currency: currency === 'USD' ? 'USD' : currency,
-      // v41: agar USD bo'lmasa, konvertatsiya qilinmagan — ochiq belgilaymiz
-      needsCurrencyConversion: currency !== 'USD',
-      originalCurrency: currency !== 'USD' ? currency : undefined,
-      originalAmount: currency !== 'USD' ? price : undefined,
+      markup: price,
+      clientPrice: price,
+      pricePerPerson: price,
+      currency: 'USD',
+      originalCurrency: enteredCurrency !== 'USD' ? enteredCurrency : undefined,
+      originalMarkup: enteredCurrency !== 'USD' ? rawPrice : undefined,
+      exchangeRate: fx ? fx.rate : undefined,
+      exchangeRateSource: fx ? fx.source : undefined,
+      exchangeRateAt: fx ? new Date().toISOString() : undefined,
       marketplaceTourId: params?.tourId || undefined,
       status: 'DRAFT',
       createdVia: 'ai-assistant',
@@ -795,7 +870,7 @@ const createOfferDraft: AiToolDefinition = {
         userId: ctx.userId,
         type: 'offer_created',
         title: 'Taklif qoralamasi yaratildi (Jarvis): ' + description,
-        description: currency === 'USD' ? `$${price}` : `${price} ${currency}`,
+        description: `$${price.toFixed(2)}`,
         metadata: { offerId: offer.id, tourName: description },
       } as any,
     }).catch(() => {});
@@ -803,7 +878,7 @@ const createOfferDraft: AiToolDefinition = {
     return {
       success: true,
       offerId: offer.id,
-      summary: `${description} — ${currency === 'USD' ? '$' + price : price + ' ' + currency} (DRAFT, hali yuborilmagan)`,
+      summary: `${description} — $${price.toFixed(2)} (DRAFT, hali yuborilmagan)`,
     };
   },
 };
@@ -823,7 +898,7 @@ const createBookingDraft: AiToolDefinition = {
       destination: { type: 'string', description: 'Manzil' },
       departureDate: { type: 'string', description: "Jo'nash sanasi, ISO formatda" },
       totalPrice: { type: 'number', description: "Umumiy narx" },
-      currency: { type: 'string', enum: ['USD', 'EUR', 'UZS', 'RUB'], description: "Valyuta (standart USD)" },
+      currency: { type: 'string', enum: ['USD', 'EUR', 'UZS', 'RUB'], description: "Narx qaysi valyutada kiritilyapti (standart USD) — tool buni avtomatik USD'ga o'giradi (CBU.uz rasmiy kursi), chunki Booking.totalPrice bazada har doim USD saqlanishi shart" },
       marketplaceTourId: { type: 'string', description: "(Ixtiyoriy) marketplace tur ID" },
     },
     required: ['clientId', 'tourName', 'destination', 'departureDate', 'totalPrice'],
@@ -837,13 +912,31 @@ const createBookingDraft: AiToolDefinition = {
     const destination = String(params?.destination || '').trim();
     if (!tourName || !destination) return { error: "Tur nomi va manzil bo'sh bo'lishi mumkin emas" };
 
-    const totalPrice = Number(params?.totalPrice);
-    if (!Number.isFinite(totalPrice) || totalPrice <= 0) return { error: "Narx noto'g'ri (0 dan katta bo'lishi kerak)" };
+    const rawTotalPrice = Number(params?.totalPrice);
+    if (!Number.isFinite(rawTotalPrice) || rawTotalPrice <= 0) return { error: "Narx noto'g'ri (0 dan katta bo'lishi kerak)" };
 
     const departureDate = new Date(params?.departureDate);
     if (isNaN(departureDate.getTime())) return { error: "Jo'nash sanasi noto'g'ri formatda" };
 
-    const currency = ['USD', 'EUR', 'UZS', 'RUB'].includes(params?.currency) ? params.currency : 'USD';
+    const enteredCurrency = ['USD', 'EUR', 'UZS', 'RUB'].includes(params?.currency) ? params.currency : 'USD';
+
+    // MUHIM (audit topilmasi): Booking.totalPrice bazada HAR DOIM USD'da
+    // saqlanishi shart (schema izohi) — aks holda hisobot/KPI/komissiya
+    // hisob-kitoblari boshqa bookinglar bilan aralashib noto'g'ri chiqadi.
+    // Shuning uchun boshqa valyutada kiritilsa, CBU.uz kursi bilan USD'ga
+    // o'giramiz (xuddi offers.module.ts qilgani kabi), asl qiymatni esa
+    // originalCurrency/originalAmount/exchangeRate maydonlarida saqlaymiz.
+    let totalPrice = rawTotalPrice;
+    let fx: { rate: number; source: string } | null = null;
+    if (enteredCurrency !== 'USD') {
+      try {
+        const converted = await convertToUSD(rawTotalPrice, enteredCurrency);
+        totalPrice = converted.usd;
+        fx = { rate: converted.rate, source: converted.source };
+      } catch {
+        return { error: "Valyuta kursini olishda xatolik yuz berdi (CBU.uz). Iltimos narxni USD'da kiriting yoki keyinroq urinib ko'ring." };
+      }
+    }
 
     let warning: string | undefined;
     if (params?.marketplaceTourId) {
@@ -855,7 +948,7 @@ const createBookingDraft: AiToolDefinition = {
       if (tour.destination && tour.destination.toLowerCase() !== destination.toLowerCase()) {
         mismatches.push(`manzil (tur: ${tour.destination})`);
       }
-      if (tour.price && currency === 'USD' && Math.abs(tour.price - totalPrice) > tour.price * 0.5) {
+      if (tour.price && Math.abs(tour.price - totalPrice) > tour.price * 0.5) {
         mismatches.push(`narx (tur bazaviy narxi: $${tour.price})`);
       }
       if (mismatches.length) warning = `Diqqat: kiritilgan ma'lumot tur ma'lumotidan farq qiladi — ${mismatches.join(', ')}.`;
@@ -877,7 +970,11 @@ const createBookingDraft: AiToolDefinition = {
         destination,
         departureDate,
         totalPrice,
-        currency: currency as any,
+        currency: 'USD' as any,
+        originalCurrency: fx ? (enteredCurrency as any) : undefined,
+        originalAmount: fx ? rawTotalPrice : undefined,
+        exchangeRate: fx ? fx.rate : undefined,
+        exchangeRateAt: fx ? new Date() : undefined,
         paidAmount: 0,
         status: 'DRAFT' as any,
         marketplaceTourId: params?.marketplaceTourId || undefined,
@@ -1028,9 +1125,15 @@ const markTaskDone: AiToolDefinition = {
     const task = await prisma.task.findFirst({ where: { id: taskId, tenantId: ctx.tenantId } });
     if (!task) return { error: 'Bu vazifa topilmadi' };
 
-    const isPrivileged = ctx.role === 'TENANT_ADMIN' || ctx.role === 'MANAGER';
-    if (task.assigneeId !== ctx.userId && !isPrivileged) {
-      return { error: 'Bu vazifa sizga biriktirilmagan.' };
+    // ESLATMA (audit topilmasi): `src/modules/tasks/tasks.module.ts`dagi haqiqiy
+    // `update()` metodi bilan bir xil qoidaga moslashtirildi: FAQAT 'AGENT' roli
+    // cheklanadi (boshqa barcha rollar — MANAGER/TENANT_ADMIN/ACCOUNTANT — butun
+    // ilova bo'ylab yozuvchi amallarda cheklanmaydi, bu yerda ham shunday), va
+    // AGENT o'zi TOPSHIRILGAN (assignee) YOKI O'ZI YARATGAN (creator) vazifani
+    // yakunlay oladi — faqat assignee emas.
+    const isRestricted = ctx.role === 'AGENT' && task.assigneeId !== ctx.userId && task.creatorId !== ctx.userId;
+    if (isRestricted) {
+      return { error: 'Bu vazifa sizga tegishli emas.' };
     }
     if (task.status === 'DONE') {
       return { success: true, title: task.title, note: 'Vazifa allaqachon yakunlangan edi' };
@@ -1067,7 +1170,13 @@ const rescheduleFollowup: AiToolDefinition = {
 
     const followUp = await prisma.followUp.findFirst({ where: { id: followUpId, tenantId: ctx.tenantId } });
     if (!followUp) return { error: 'Bu eslatma topilmadi' };
-    if (followUp.agentId !== ctx.userId) return { error: 'Bu eslatma sizga tegishli emas.' };
+    // ESLATMA (audit topilmasi): `src/modules/followups/followups.module.ts`dagi
+    // `complete()`/`delete()` bilan bir xil qoida — FAQAT 'AGENT' roli o'ziga
+    // tegishli (agentId === ctx.userId) eslatma bilan cheklanadi, boshqa
+    // rollar (MANAGER/TENANT_ADMIN/ACCOUNTANT) istalgan eslatmani ko'chira oladi.
+    if (ctx.role === 'AGENT' && followUp.agentId !== ctx.userId) {
+      return { error: 'Bu eslatma sizga tegishli emas.' };
+    }
 
     await prisma.followUp.update({
       where: { id: followUp.id },
