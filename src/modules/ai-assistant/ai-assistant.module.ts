@@ -1,9 +1,10 @@
 import {
   Module, Injectable, Controller, Get, Post, Delete,
-  Param, Body, UseGuards, NotFoundException, BadRequestException,
+  Param, Body, UseGuards, UseInterceptors, UploadedFile, NotFoundException, BadRequestException,
   HttpException, HttpStatus, Logger, Optional, Inject,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { ApiTags, ApiOperation, ApiBearerAuth, ApiConsumes } from '@nestjs/swagger';
 import type Redis from 'ioredis';
 import { PrismaService } from '../../prisma/prisma.service';
 import { PrismaModule } from '../../prisma/prisma.module';
@@ -12,6 +13,10 @@ import { CurrentUser } from '../../common/decorators';
 import { REDIS_CLIENT } from '../../common/cache/cache.constants';
 import { RedisClientModule } from '../../common/cache/redis-client.module';
 import { AI_TOOLS, getAnthropicToolsSpec, executeAiTool, AiToolContext } from './ai-assistant.tools';
+// v43: VEB Jarvis vidjetidagi mikrofon tugmasi — ovozli xabarni matnga
+// o'girish uchun XUDDI SHU Whisper xizmatidan (qo'ng'iroq yozuvlari va
+// Telegram Jarvis bot bilan BIR XIL) foydalanamiz.
+import { TranscriptionModule, TranscriptionService } from '../transcription/transcription.module';
 
 /**
  * ═══════════════════════════════════════════════════════════════
@@ -324,12 +329,44 @@ QOIDALAR (MAJBURIY):
 @Controller('ai-assistant')
 @UseGuards(JwtAuthGuard)
 export class AiAssistantController {
-  constructor(private svc: AiAssistantService) {}
+  constructor(private svc: AiAssistantService, private transcription: TranscriptionService) {}
 
   @ApiOperation({ summary: "Jarvis bilan suhbat — yangi xabar yuborish (kerak bo'lsa yangi suhbat avtomatik yaratiladi)" })
   @Post('chat')
   chat(@CurrentUser() u: any, @Body() body: { conversationId?: string; message: string }) {
     return this.svc.chat({ tenantId: u.tenantId, userId: u.sub, role: u.role }, body?.conversationId, body?.message);
+  }
+
+  /**
+   * v43: VEB CHATDAGI MIKROFON TUGMASI — brauzer ovozli xabarni
+   * yozib (MediaRecorder), shu yerga yuboradi. Avval Whisper orqali
+   * matnga o'giramiz, so'ng XUDDI YOZMA XABAR KABI (`svc.chat`) Jarvis
+   * tool-use agenti orqali yuboramiz — shuning uchun ovozli BUYRUQ ham
+   * ("Aziz akaning bosqichini Muzokara qil" kabi) TO'LIQ ishlaydi.
+   * Javobda transkripsiya matni ham qaytariladi — vidjet buni foydalanuvchi
+   * xabari sifatida ko'rsatishi uchun (u nima deganini ko'rsin).
+   */
+  @ApiOperation({ summary: "Jarvis bilan OVOZLI suhbat — audio yuboriladi, matnga o'girilib, tool-use agentga yuboriladi" })
+  @ApiConsumes('multipart/form-data')
+  @Post('voice-chat')
+  @UseInterceptors(FileInterceptor('audio', { limits: { fileSize: 24 * 1024 * 1024 } }))
+  async voiceChat(
+    @CurrentUser() u: any,
+    @UploadedFile() file: Express.Multer.File,
+    @Body('conversationId') conversationId?: string,
+  ) {
+    if (!file?.buffer?.length) {
+      throw new BadRequestException("Audio fayl kelmadi");
+    }
+    if (!this.transcription.isConfigured()) {
+      throw new BadRequestException("Ovozli xabarlarni matnga o'girish sozlanmagan (GROQ_API_KEY/OPENAI_API_KEY yo'q). Matn bilan yozing.");
+    }
+    const stt = await this.transcription.transcribeBuffer(file.buffer);
+    if (!stt.text) {
+      throw new BadRequestException(stt.error || "Ovozli xabarni tushunib bo'lmadi. Qayta urinib ko'ring.");
+    }
+    const result = await this.svc.chat({ tenantId: u.tenantId, userId: u.sub, role: u.role }, conversationId, stt.text);
+    return { ...result, transcript: stt.text };
   }
 
   @ApiOperation({ summary: "O'zining suhbatlar ro'yxati" })
@@ -352,7 +389,7 @@ export class AiAssistantController {
 }
 
 @Module({
-  imports: [PrismaModule, RedisClientModule],
+  imports: [PrismaModule, RedisClientModule, TranscriptionModule],
   controllers: [AiAssistantController],
   providers: [AiAssistantService],
   exports: [AiAssistantService],

@@ -2,42 +2,6 @@ import { Module, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { normalizeAudioForWhisper } from '../../common/utils/voice-convert';
 
-/**
- * ═══════════════════════════════════════════════════════════════
- * AVTOMATIK TRANSKRIPSIYA (Speech-to-Text) — v16, v37 (Groq qo'shildi)
- * ═══════════════════════════════════════════════════════════════
- * MUAMMO: Anthropic (Claude) API audio faylni to'g'ridan-to'g'ri
- * qabul qilmaydi — faqat matn/rasm/PDF. Shuning uchun "AI qo'ng'iroqni
- * eshitib tahlil qilishi" uchun oldin ovozni MATNGA aylantirish kerak,
- * keyingina Claude shu matnni tahlil qiladi (calls.module.ts'dagi
- * `analyzeCall`).
- *
- * v37: IKKITA provayder qo'llab-quvvatlanadi — GROQ (Whisper Large v3
- * Turbo, ~9x ARZONROQ, OpenAI bilan bir xil API formatida) va OpenAI
- * (asl Whisper). Qaysi biri "asosiy" (birinchi urinib ko'riladigan)
- * ekanini PLATFORM_OWNER `/owner` panelidan, kodga tegmasdan,
- * ISH VAQTIDA o'zgartira oladi (PlatformSetting jadvali orqali,
- * key = "sttProvider", qiymati "groq" yoki "openai").
- *
- * ZAXIRA (fallback): tanlangan asosiy provayder ishlamay qolsa
- * (masalan kalit sozlanmagan yoki server xatosi bersa), ikkinchisi
- * AVTOMATIK sinab ko'riladi — agar uning ham kaliti bo'lsa. Shu
- * tufayli ikkalasining kalitini ham .env'da saqlash tavsiya etiladi:
- * ular bir-birini "sug'urtalaydi".
- *
- * SOZLASH: .env fayliga qo'shing:
- *   GROQ_API_KEY=gsk_...      (https://console.groq.com — bepul boshlanadi)
- *   OPENAI_API_KEY=sk-...     (mavjud, ANTHROPIC_API_KEY'dan ALOHIDA kalit)
- * Ikkalasi ham bo'lmasa, avtomatik transkripsiya jim o'chirilgan
- * holda qoladi va eski usul — agent qo'lda matn kiritadi — ishlashda
- * davom etadi, hech narsa buzilmaydi.
- *
- * ESLATMA: har bir kompaniya uchun AI umuman yoqiq/o'chiqligi
- * (`tenant.settings.aiEnabled`) — bu FAYLDA emas, `calls.module.ts`
- * (`isAiEnabledForTenant`) darajasida tekshiriladi. Bu servis faqat
- * "QAYSI provayder" savoliga javob beradi, "yoqilganmi" degan
- * savolga emas.
- */
 
 type SttProvider = 'groq' | 'openai';
 type TranscribeResult = { text: string | null; error?: string; transient?: boolean };
@@ -59,11 +23,7 @@ export class TranscriptionService {
     return !!this.groqKey || !!this.openaiKey;
   }
 
-  /**
-   * PLATFORM_OWNER `/owner` panelidan belgilagan "asosiy" provayderni
-   * o'qiydi. Hech narsa belgilanmagan bo'lsa (birinchi marta) — GROQ
-   * standart (arzonroq bo'lgani uchun).
-   */
+ 
   private async getPreferredProvider(): Promise<SttProvider> {
     try {
       const row = await this.prisma.platformSetting.findUnique({ where: { key: 'sttProvider' } });
@@ -91,18 +51,7 @@ export class TranscriptionService {
     return this.getSttProviderSetting();
   }
 
-  /**
-   * Berilgan audio URL'ni yuklab olib, Whisper orqali matnga o'giradi.
-   * v18: avval faqat `string | null` qaytarardi — xato bo'lsa sabab
-   * FAQAT server logida qolardi, admin panelida "AI kutmoqda" abadiy
-   * osilib qolardi va HECH KIM sababini ko'ra olmasdi. Endi sabab ham
-   * qaytariladi — chaqiruvchi (`calls.module.ts`) buni `Call.aiError`ga
-   * yozadi, shunda admin/agent buni to'g'ridan-to'g'ri UI'da ko'radi.
-   *
-   * v37: avval audio bir marta yuklab olinadi/tozalanadi, so'ng
-   * TANLANGAN provayderga yuboriladi; u ishlamasa (yoki kaliti bo'lmasa)
-   * — IKKINCHI provayderga (agar kaliti bo'lsa) qayta urinib ko'riladi.
-   */
+
   async transcribeFromUrl(recordingUrl: string): Promise<TranscribeResult> {
     if (!this.isConfigured()) {
       return { text: null, error: "GROQ_API_KEY yoki OPENAI_API_KEY sozlanmagan (audio matnga o'girish uchun kerak, bu ANTHROPIC_API_KEY'dan ALOHIDA kalit)." };
@@ -132,20 +81,40 @@ export class TranscriptionService {
         return { text: null, error: "Audio fayl bo'sh yoki buzilgan (juda kichik hajm)", transient: true };
       }
 
-      // 2) v19: Whisper'ga yuborishdan OLDIN ffmpeg orqali "tozalab" qayta
-      // kodlaymiz — PBX'dan kelgan audio ko'pincha nostandart/streaming
+      return this.transcribeBuffer(Buffer.from(arrayBuf));
+    } catch (e: any) {
+      const msg = `Transkripsiya xatosi: ${e?.message}`;
+      this.logger.warn(msg);
+      return { text: null, error: msg, transient: true };
+    }
+  }
+
+  
+  async transcribeBuffer(rawBuffer: Buffer): Promise<TranscribeResult> {
+    if (!this.isConfigured()) {
+      return { text: null, error: "GROQ_API_KEY yoki OPENAI_API_KEY sozlanmagan (audio matnga o'girish uchun kerak, bu ANTHROPIC_API_KEY'dan ALOHIDA kalit)." };
+    }
+    if (!rawBuffer || rawBuffer.byteLength < 500) {
+      return { text: null, error: "Audio fayl bo'sh yoki buzilgan (juda kichik hajm)", transient: true };
+    }
+    if (rawBuffer.byteLength > 24 * 1024 * 1024) {
+      return { text: null, error: `Audio juda katta (${Math.round(rawBuffer.byteLength / 1024 / 1024)}MB, limit 25MB)` };
+    }
+
+    try {
+      // v19: Whisper'ga yuborishdan OLDIN ffmpeg orqali "tozalab" qayta
+      // kodlaymiz — brauzerdan kelgan audio ko'pincha nostandart/streaming
       // sarlavhali bo'ladi va Whisper buni to'g'ridan-to'g'ri qabul qilsa
       // "duration":0 xatosi berishi mumkin (garchi brauzerda ijro etilsa ham).
-      const normalized = await normalizeAudioForWhisper(Buffer.from(arrayBuf));
+      const normalized = await normalizeAudioForWhisper(rawBuffer);
       if ('error' in normalized) {
         const msg = `Audio tozalashda xato: ${normalized.error}`;
         this.logger.warn(msg);
-        // Bo'sh/hali tayyor bo'lmagan yozuv — vaqtinchalik, avtomatik qayta sinaladi
         return { text: null, error: msg, transient: true };
       }
       const audioBuffer = Buffer.from(normalized.buffer);
 
-      // 3) Qaysi provayder "asosiy" ekanini owner panelidan o'qiymiz,
+      // Qaysi provayder "asosiy" ekanini owner panelidan o'qiymiz,
       // so'ng shundan boshlab, kerak bo'lsa ikkinchisiga o'tamiz.
       const preferred = await this.getPreferredProvider();
       const order: SttProvider[] = preferred === 'groq' ? ['groq', 'openai'] : ['openai', 'groq'];
