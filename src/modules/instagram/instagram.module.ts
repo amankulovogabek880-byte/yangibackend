@@ -4,7 +4,7 @@ import { Roles } from '../../common/decorators';
 import { verifyMetaSignature, canSkipSignature } from '../../common/utils/meta-signature';
 import {
   Module, Injectable, Controller,
-  Get, Post, Body, Query, Req, Res,
+  Get, Post, Delete, Body, Query, Req, Res,
   UseGuards, Logger, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { SkipThrottle } from '@nestjs/throttler';
@@ -353,6 +353,57 @@ export class InstagramService {
    *    Meta talabi shunday, aks holda "Invalid OAuth access token" xatosi
    *    qaytadi, chunki bu token Facebook Graph'da tanilmaydi.
    */
+  /**
+   * "Instagram uzish" tugmasi — ulangan akkauntni to'liq uzadi.
+   *
+   * 1) Iloji bo'lsa, Meta'dagi obunani ham bekor qilishga harakat qilamiz
+   *    (subscribed_apps DELETE) — token/pageId eskirgan yoki bekor qilingan
+   *    bo'lsa xato chiqishi mumkin, lekin bu holatda ham lokal tozalashni
+   *    to'xtatmaymiz (foydalanuvchi baribir "uzilgan" ko'rishi kerak).
+   * 2) tenant.instagramPageId ustunini va settings ichidagi barcha
+   *    Instagram bilan bog'liq maydonlarni tozalaymiz — shunda Page ID
+   *    boshqa hisobga qayta ulanishi ham mumkin bo'ladi (unique cheklov
+   *    tufayli avval bo'shatilishi shart edi).
+   */
+  async disconnect(tenantId: string) {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const cur: any = tenant?.settings || {};
+    const accessToken = this.decryptToken(cur.instagramAccessToken);
+    const pageId = cur.instagramPageId;
+    const authMode = cur.instagramAuthMode || 'facebook';
+
+    if (accessToken && pageId) {
+      try {
+        const host = igApiHost(authMode);
+        const url = `https://${host}/${GRAPH_API_VERSION}/${pageId}/subscribed_apps` +
+          `?access_token=${encodeURIComponent(accessToken)}`;
+        await fetch(url, { method: 'DELETE' });
+      } catch (e: any) {
+        this.logger.warn('Instagram disconnect: Meta obunasini bekor qilishda xato (e\'tibor berilmaydi): ' + e.message);
+      }
+    }
+
+    await this.prisma.tenant.update({
+      where: { id: tenantId },
+      data: {
+        instagramPageId: null,
+        settings: {
+          ...cur,
+          instagramAccessToken: null,
+          instagramPageId: null,
+          instagramAuthMode: null,
+          instagramUsername: null,
+        },
+      },
+    });
+
+    this.logger.log(`Instagram uzildi: tenant=${tenantId}`);
+    return this.getConfig(tenantId);
+  }
+
   private async subscribeAppToPage(pageId: string, accessToken: string, authMode?: string) {
     try {
       const host = igApiHost(authMode);
@@ -1427,6 +1478,15 @@ export class InstagramController {
   @Roles('TENANT_ADMIN')
   saveConfig(@CurrentUser() u: any, @Body() body: any) {
     return this.svc.saveConfig(u.tenantId, body);
+  }
+
+  @ApiOperation({ summary: 'Instagram akkauntini uzish' })
+  @ApiBearerAuth('JWT')
+  @Delete('config')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('TENANT_ADMIN')
+  disconnect(@CurrentUser() u: any) {
+    return this.svc.disconnect(u.tenantId);
   }
 
   @ApiOperation({ summary: 'Instagram statistikasi' })
