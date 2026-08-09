@@ -50,6 +50,64 @@ const PIPELINE_STAGE_LABELS: Record<string, string> = {
 };
 const PIPELINE_STAGES = Object.keys(PIPELINE_STAGE_LABELS);
 
+/**
+ * v44: TENANTNING HOZIRGI VORONKASI BILAN SINXRONLASH.
+ *
+ * MUAMMO: avval Jarvis FAQAT yuqoridagi qattiq kodlangan ENUM
+ * nomlaridan (NEW_LEAD, CONTACTED...) foydalanardi. Agar tenant
+ * Sozlamalar → Turlar bozori/Pipeline bo'limidan bosqich nomini
+ * o'zgartirsa/qayta tartiblasa/yangi bosqich qo'shsa — Jarvis buni
+ * UMUMAN bilmasdi va noto'g'ri (eski) bosqichga yozib qo'yishi yoki
+ * "topilmadi" deb xato qaytarishi mumkin edi.
+ *
+ * YECHIM: `pipeline.module.ts`dagi kanonik yozuv joyi (`moveStage`/
+ * `getBoard`)ga TO'LIQ mos ravishda — har doim avval `CustomStage`
+ * jadvalidan (tenantning HOZIRGI, tahrirlangan bosqich ro'yxati)
+ * nom bo'yicha qidiramiz, faqat keyin standart ENUM'ga tushamiz.
+ * `getBoard()` ham xuddi shunday ustuvorlik bilan ishlaydi
+ * (avval `customStageId`, keyin `pipelineStage`) — shuning uchun
+ * Jarvis yozgan natija UI kanban-doskasida ANIQ TO'G'RI ustunda
+ * chiqadi, qanday nomlangan/tartiblangan bo'lishidan qat'iy nazar.
+ */
+async function getCurrentPipelines(prisma: PrismaService, tenantId: string) {
+  return prisma.pipeline.findMany({
+    where: { tenantId },
+    include: { stages: { orderBy: { order: 'asc' } } },
+    orderBy: { createdAt: 'asc' },
+  });
+}
+
+/** Har bir Jarvis xabarida (system prompt ichida) ko'rsatiladigan — tenantning JORIY voronkasi matni. */
+export async function formatCurrentPipelinesForPrompt(prisma: PrismaService, tenantId: string): Promise<string> {
+  try {
+    const pipelines: any[] = await getCurrentPipelines(prisma, tenantId);
+    if (!pipelines.length) return '';
+    const parts = pipelines.map((p) => {
+      const stageList = (p.stages || [])
+        .map((s: any, i: number) => `${i + 1}. "${s.name}"${s.isClosing ? ' — yakunlovchi' : ''}${s.isLost ? ' — yo\'qotilgan' : ''}`)
+        .join('\n');
+      return `• Voronka "${p.name}"${p.isDefault ? ' (asosiy)' : ''}:\n${stageList || '  (bosqichlar hali qo\'shilmagan)'}`;
+    });
+    return parts.join('\n\n');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Berilgan matn (rawStage)ni tenantning HOZIRGI maxsus bosqichi bilan
+ * moslaydi (aniq nom, katta-kichik harfga sezgirsiz). Topilmasa — `null`.
+ * MUHIM: bu funksiya har doim ENUM tekshiruvidan OLDIN chaqiriladi —
+ * chunki tenant o'z voronkasini standart nomlar bilan bir xil qilib
+ * qayta nomlagan bo'lishi ham mumkin (masalan yana "CONTACTED"), va
+ * bu holda ham HOZIRGI customStage yozuvi ustuvor bo'lishi kerak.
+ */
+async function resolveCustomStage(prisma: PrismaService, tenantId: string, rawStage: string) {
+  return prisma.customStage.findFirst({
+    where: { tenantId, name: { equals: rawStage, mode: 'insensitive' } },
+  });
+}
+
 /** AGENT roli uchun "faqat o'zining mijozlari" cheklovini qo'shadi (agar ruxsati bo'lmasa) */
 function agentScope(ctx: AiToolContext, field = 'assignedAgentId'): Record<string, any> {
   if (ctx.role === 'AGENT' && !hasPermission({ role: ctx.role }, 'view_all_clients')) {
@@ -181,40 +239,72 @@ const getClientInfo: AiToolDefinition = {
 const listPipelineByStage: AiToolDefinition = {
   name: 'listPipelineByStage',
   description:
-    "Pipeline (sotuv voronkasi)ning muayyan bosqichida turgan mijozlar ro'yxatini qaytaradi. Masalan 'NEGOTIATION' bosqichidagi barcha mijozlar.",
+    "Pipeline (sotuv voronkasi)ning muayyan bosqichida turgan mijozlar ro'yxatini qaytaradi. `stage` parametriga tenantning HOZIRGI voronkasidagi ANIQ bosqich nomini yozing (system prompt'da ko'rsatilgan ro'yxatdan) — standart bosqich nomlari (masalan 'NEGOTIATION') ham ishlaydi, agar tenant hali bosqichlarni o'zgartirmagan bo'lsa.",
   input_schema: {
     type: 'object',
     properties: {
       stage: {
         type: 'string',
-        enum: PIPELINE_STAGES,
-        description: 'Pipeline bosqichi (ENUM): ' + PIPELINE_STAGES.join(', '),
+        description: "Bosqich nomi — tenantning JORIY voronkasidagi aniq nom (masalan \"Muzokara\"), yoki standart ENUM: " + PIPELINE_STAGES.join(', '),
       },
       limit: { type: 'number', description: "Qaytariladigan mijozlar soni (standart 15, maksimal 30)" },
     },
     required: ['stage'],
   },
   execute: async (prisma, ctx, params) => {
-    const stage = String(params?.stage || '').toUpperCase();
-    if (!PIPELINE_STAGES.includes(stage)) {
-      return { error: `Noto'g'ri bosqich. Ruxsat etilganlar: ${PIPELINE_STAGES.join(', ')}` };
-    }
+    const rawStage = String(params?.stage || '').trim();
+    if (!rawStage) return { error: "Bosqich ko'rsatilmagan" };
     const limit = Math.min(30, Math.max(1, Number(params?.limit) || 15));
 
-    const clients = await prisma.client.findMany({
-      where: { tenantId: ctx.tenantId, pipelineStage: stage as any, ...agentScope(ctx) },
-      select: {
-        id: true, fullName: true, phone: true, tier: true, source: true,
-        pipelineStageAt: true, totalRevenue: true,
-        assignedAgent: { select: { name: true } },
-      },
-      orderBy: { pipelineStageAt: 'desc' },
-      take: limit,
-    });
+    // v44: AVVAL tenantning HOZIRGI (tahrirlangan) maxsus bosqichi bilan
+    // moslashtiramiz — bu getBoard() bilan BIR XIL ustuvorlik tartibi.
+    const customStage = await resolveCustomStage(prisma, ctx.tenantId, rawStage);
+
+    let clients: any[];
+    let stageLabel: string;
+    let stageKey: string;
+
+    if (customStage) {
+      stageKey = `CUSTOM_${customStage.id}`;
+      stageLabel = customStage.name;
+      clients = await prisma.client.findMany({
+        where: { tenantId: ctx.tenantId, customStageId: customStage.id, ...agentScope(ctx) },
+        select: {
+          id: true, fullName: true, phone: true, tier: true, source: true,
+          pipelineStageAt: true, totalRevenue: true,
+          assignedAgent: { select: { name: true } },
+        },
+        orderBy: { pipelineStageAt: 'desc' },
+        take: limit,
+      });
+    } else {
+      const upperStage = rawStage.toUpperCase();
+      if (!PIPELINE_STAGES.includes(upperStage)) {
+        const current = await formatCurrentPipelinesForPrompt(prisma, ctx.tenantId);
+        return {
+          error: `Bunday bosqich topilmadi ("${rawStage}"). Tenantning joriy voronkasi:\n${current || '(voronka topilmadi)'}`,
+        };
+      }
+      stageKey = upperStage;
+      stageLabel = PIPELINE_STAGE_LABELS[upperStage];
+      clients = await prisma.client.findMany({
+        // customStageId bo'lgan mijozlar ALLAQACHON boshqa (maxsus) bosqichda
+        // hisoblanadi — ular bu yerda ikki marta chiqib ketmasligi kerak
+        // (getBoard()dagi bir xil mantiq).
+        where: { tenantId: ctx.tenantId, pipelineStage: upperStage as any, customStageId: null, ...agentScope(ctx) },
+        select: {
+          id: true, fullName: true, phone: true, tier: true, source: true,
+          pipelineStageAt: true, totalRevenue: true,
+          assignedAgent: { select: { name: true } },
+        },
+        orderBy: { pipelineStageAt: 'desc' },
+        take: limit,
+      });
+    }
 
     return {
-      stage,
-      stageLabel: PIPELINE_STAGE_LABELS[stage],
+      stage: stageKey,
+      stageLabel,
       count: clients.length,
       clients: clients.map((c) => ({
         id: c.id, fullName: c.fullName, phone: c.phone, tier: c.tier, source: c.source,
@@ -662,7 +752,7 @@ const draftFollowupMessage: AiToolDefinition = {
 const updatePipelineStage: AiToolDefinition = {
   name: 'updatePipelineStage',
   description:
-    "Mijozning pipeline (sotuv voronkasi) bosqichini o'zgartiradi — standart bosqichlar (masalan CONTACTED, NEGOTIATION) yoki tenant o'zi qo'shgan maxsus bosqich nomi bilan. Yakunlangan (COMPLETED) yoki yo'qotilgan (LOST) mijozni qayta ochib bo'lmaydi.",
+    "Mijozning pipeline (sotuv voronkasi) bosqichini o'zgartiradi. `newStage`ga tenantning HOZIRGI voronkasidagi ANIQ bosqich nomini yozing (system prompt'da ko'rsatilgan ro'yxatdan) — bu doim standart ENUM nomlaridan USTUVOR. Agar tenant hali bosqichlarni o'zgartirmagan bo'lsa, standart nomlar ham ishlaydi. Yakunlangan (COMPLETED) yoki yo'qotilgan (LOST) mijozni qayta ochib bo'lmaydi.",
   input_schema: {
     type: 'object',
     properties: {
@@ -685,42 +775,50 @@ const updatePipelineStage: AiToolDefinition = {
     const client = owned.client;
 
     const oldStage = client.pipelineStage;
+    const wasClosed = oldStage === 'COMPLETED' || oldStage === 'LOST';
 
-    // 1) Avval standart ENUM bosqich sifatida tekshiramiz
-    const upperStage = rawStage.toUpperCase();
     let updateData: any = { pipelineStageAt: new Date() };
     let newStageLabel: string;
     let isCustom = false;
 
-    if (PIPELINE_STAGES.includes(upperStage)) {
-      // Yakunlangan/yo'qotilganni qayta ochish — faqat HAQIQIY o'zgarishda bloklaymiz
-      // (masalan yana COMPLETED deb so'ralsa, bu no-op, xato emas)
-      if ((oldStage === 'COMPLETED' || oldStage === 'LOST') && upperStage !== oldStage) {
+    // v44: AVVAL tenantning HOZIRGI (tahrirlangan) maxsus bosqichi bilan
+    // moslashtiramiz — `getBoard()` UI kanban-doskasida AYNAN shu
+    // ustuvorlik bilan ishlaydi (customStageId > enum). Shu tufayli
+    // agar tenant o'z voronkasini o'zgartirgan/qayta nomlagan bo'lsa
+    // ham, Jarvis to'g'ri (hozirgi) ustunga yozadi.
+    const customStage = await resolveCustomStage(prisma, ctx.tenantId, rawStage);
+    const upperStage = rawStage.toUpperCase();
+
+    if (customStage) {
+      if (wasClosed && !(customStage.isClosing || customStage.isLost)) {
+        return { error: "Yakunlangan/yo'qotilgan mijozni qayta ochib bo'lmaydi, buni admin qilishi kerak" };
+      }
+      updateData.customStageId = customStage.id;
+      newStageLabel = customStage.name;
+      isCustom = true;
+      // Legacy enum maydonini ham iloji boricha moslashtiramiz (eski
+      // hisobot/vidjetlar buzilmasin) — faqat nom aynan standart enum
+      // nomi bilan bir xil bo'lsa (masalan tenant hali qayta nomlamagan).
+      if (PIPELINE_STAGES.includes(upperStage)) updateData.pipelineStage = upperStage as any;
+    } else if (PIPELINE_STAGES.includes(upperStage)) {
+      if (wasClosed && upperStage !== oldStage) {
         return { error: "Yakunlangan/yo'qotilgan mijozni qayta ochib bo'lmaydi, buni admin qilishi kerak" };
       }
       updateData.pipelineStage = upperStage as any;
       updateData.customStageId = null;
       newStageLabel = upperStage;
     } else {
-      if (oldStage === 'COMPLETED' || oldStage === 'LOST') {
-        return { error: "Yakunlangan/yo'qotilgan mijozni qayta ochib bo'lmaydi, buni admin qilishi kerak" };
-      }
-      // 2) Bo'lmasa — tenantning maxsus (custom) bosqichlaridan nomi bo'yicha qidiramiz
-      const customStage = await prisma.customStage.findFirst({
-        where: { tenantId: ctx.tenantId, name: { equals: rawStage, mode: 'insensitive' } },
-      });
-      if (!customStage) {
-        return {
-          error: `Bunday bosqich topilmadi. Standart bosqichlar: ${PIPELINE_STAGES.join(', ')}. Agar bu maxsus bosqich bo'lsa, uning nomini aniqroq yozib ko'ring.`,
-        };
-      }
-      updateData.customStageId = customStage.id;
-      newStageLabel = customStage.name;
-      isCustom = true;
+      const current = await formatCurrentPipelinesForPrompt(prisma, ctx.tenantId);
+      return {
+        error: `Bunday bosqich topilmadi ("${rawStage}"). Tenantning joriy voronkasi:\n${current || '(voronka topilmadi)'}`,
+      };
     }
 
     if (!isCustom && oldStage === upperStage) {
       return { success: true, clientName: client.fullName, oldStage, newStage: upperStage, note: 'Mijoz allaqachon shu bosqichda edi' };
+    }
+    if (isCustom && client.customStageId === customStage!.id) {
+      return { success: true, clientName: client.fullName, oldStage: newStageLabel, newStage: newStageLabel, note: 'Mijoz allaqachon shu bosqichda edi' };
     }
 
     await prisma.client.update({ where: { id: client.id }, data: updateData });

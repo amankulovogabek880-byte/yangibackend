@@ -12,7 +12,7 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators';
 import { REDIS_CLIENT } from '../../common/cache/cache.constants';
 import { RedisClientModule } from '../../common/cache/redis-client.module';
-import { AI_TOOLS, getAnthropicToolsSpec, executeAiTool, AiToolContext } from './ai-assistant.tools';
+import { AI_TOOLS, getAnthropicToolsSpec, executeAiTool, AiToolContext, formatCurrentPipelinesForPrompt } from './ai-assistant.tools';
 // v43: VEB Jarvis vidjetidagi mikrofon tugmasi — ovozli xabarni matnga
 // o'girish uchun XUDDI SHU Whisper xizmatidan (qo'ng'iroq yozuvlari va
 // Telegram Jarvis bot bilan BIR XIL) foydalanamiz.
@@ -129,6 +129,7 @@ export class AiAssistantService {
 QOIDALAR (MAJBURIY):
 1. Sen faqat berilgan tool'lar (${toolNames}) orqali CRM ma'lumotiga kirasan. HECH QACHON ma'lumotni o'zing o'ylab topma (hallucinate qilma) — agar kerakli ma'lumot uchun tool bo'lmasa yoki tool bo'sh natija qaytarsa, buni ochiq ayt.
 2. Endi CRM'da CHEKLANGAN amallarni bajara olasan: vazifa yaratish, xabar qoralamasi tayyorlash, pipeline bosqichini o'zgartirish, taklif/booking qoralamasi, yangi lead qo'shish, izoh qo'shish, vazifa/eslatmani yakunlash yoki ko'chirish. LEKIN: hech qachon xabarni o'zing yubormaysan (foydalanuvchi tasdiqlashi kerak), hech qachon pul/to'lovni tasdiqlash yoki bookingni "CONFIRMED" qilish kabi yakuniy moliyaviy amalni bajarmaysan, hech narsani o'chirmaysan va boshqa agentga hech narsa biriktirmaysan — bular faqat inson tomonidan, tegishli bo'limda bajariladi. Foydalanuvchi shularni so'rasa — buni qila olmasligingni ochiq ayt va tavsiya ber (tegishli bo'limga o'zi o'tishini ayt).
+2b. MUHIM (PIPELINE/VORONKA): pastda "TENANTNING HOZIRGI VORONKASI" bo'limida shu kompaniyaning AYNAN HOZIRGI (tahrirlangan/qayta nomlangan bo'lishi mumkin) bosqichlar ro'yxati berilgan — bosqich nomini so'rayotganda yoki o'zgartirayotganda DOIM shu ro'yxatdagi ANIQ nomdan foydalan, standart/eski nomlarni taxmin qilma (masalan tenant "CONTACTED"ni "Bog'lanildi"ga o'zgartirgan bo'lishi mumkin).
 3. Javoblaringni QISQA va HARAKATGA UNDOVCHI qil — bu Telegram xabari kabi bo'lsin, rasmiy hisobot emas.
 4. Foydalanuvchi roli: ${role}. AGENT bo'lsa — odatda faqat o'zining mijozlari/statistikasi ko'rinadi va faqat o'ziga tegishli yozuvlar ustida amal bajara oladi (tizim o'zi cheklaydi).
 5. Pul summalarini USD da, sana/vaqtlarni tushunarli formatda ayt.
@@ -159,6 +160,17 @@ QOIDALAR (MAJBURIY):
     const toolCallsLog: { name: string; input: any }[] = [];
     const tools = getAnthropicToolsSpec();
     const system = this.buildSystemPrompt(ctx.role, channel);
+    // v44: TENANTNING HOZIRGI (tahrirlangan) VORONKASI — har safar
+    // YANGILANIB olinadi (KESHLANMAYDI), shuning uchun tenant Sozlamalar
+    // bo'limidan bosqichlarni o'zgartirsa/qayta nomlasa/qayta tartiblasa,
+    // Jarvis SHU DAQIQADA yangi holatni ko'radi. Bu alohida system blok
+    // sifatida (statik ko'rsatmalar keshidan TASHQARIDA) qo'shiladi —
+    // shunda statik qism uchun `cache_control` afzalligi yo'qolmaydi,
+    // faqat shu qism har doim "yangi" hisoblanadi.
+    const currentPipelines = await formatCurrentPipelinesForPrompt(this.prisma, ctx.tenantId);
+    const pipelineBlock = currentPipelines
+      ? `TENANTNING HOZIRGI VORONKASI (bosqich nomlarini/tartibni SHU YERDAN ol, boshqa manbadan EMAS):\n\n${currentPipelines}`
+      : 'TENANTNING HOZIRGI VORONKASI: hali sozlanmagan — standart bosqich nomlaridan foydalan.';
     // v41 XARAJATNI KAMAYTIRISH: Telegram javoblari qisqa bo'lishi kerak
     // (bot xabari), shuning uchun max_tokens ham pastroq — kirish
     // narxidan tashqari CHIQISH narxini ham kamaytiradi.
@@ -183,6 +195,7 @@ QOIDALAR (MAJBURIY):
           // dagi bilan bir xil naqsh).
           system: [
             { type: 'text', text: system, cache_control: { type: 'ephemeral' } },
+            { type: 'text', text: pipelineBlock },
           ],
           tools,
           tool_choice: { type: 'auto' },
