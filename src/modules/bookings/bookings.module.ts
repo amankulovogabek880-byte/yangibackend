@@ -583,86 +583,136 @@ export class BookingsService {
   }
 
   // ═══════════════════════════════════════════════════════════════
-  // AVTOMATIK ESLATMA: uchish sanasidan 2 kun oldin mijozga Telegram
-  // orqali xabar yuboriladi. To'liq kod orqali — inson yoki AI
-  // aralashuvisiz. Har soatda ishga tushadi, lekin har bir booking
-  // uchun faqat BIR MARTA xabar ketadi (departureReminderSentAt).
+  // AVTOMATIK ESLATMA: uchish sanasidan admin belgilagan necha kun
+  // oldin mijozga Telegram orqali xabar yuboriladi. To'liq kod
+  // orqali — inson yoki AI aralashuvisiz. Har soatda ishga tushadi,
+  // lekin har bir booking uchun faqat BIR MARTA xabar ketadi
+  // (departureReminderSentAt).
+  //
+  // v24: ilgari "2 kun oldin" va xabar matni HARD-CODE qilingan edi.
+  // Endi har bir tenant buni o'zi Settings → "Avtomatik eslatma"
+  // bo'limidan sozlaydi (tenant.settings.departureReminder):
+  //   { enabled: boolean, daysBefore: number, message: string }
+  // `message` ichida {ism}/{manzil}/{sana}/{tur}/{kun} kabi
+  // o'rin-belgilar (placeholder) qoldirilsa, tizim ularni HAR BIR
+  // mijoz uchun avtomatik o'sha mijozning ma'lumotlari bilan
+  // almashtiradi — masalan "{ism}" mijozning ismini avtomatik oladi.
   // ═══════════════════════════════════════════════════════════════
+  private static readonly DEFAULT_REMINDER_DAYS = 2;
+  private static readonly DEFAULT_REMINDER_MESSAGE =
+    `Assalomu alaykum, {ism}! 🌍\n\n` +
+    `{manzil} yo'nalishidagi safaringizga atigi {kun} kun qoldi — {sana} kuni uchasiz. ✈️\n\n` +
+    `✅ Pasport/hujjatlaringizni tekshirib qo'ying\n` +
+    `✅ Chipta va mehmonxona bronlari tayyor\n` +
+    `✅ Yo'l uchun buyumlaringizni yig'ishni boshlang\n\n` +
+    `Hammasi tayyormi? Savol yoki yordam kerak bo'lsa, shu yerga yozavering — doim yordamga tayyormiz!`;
+
+  private renderReminderText(
+    template: string | undefined,
+    b: { client: { fullName: string }; destination: string; tourName: string; departureDate: Date | null },
+    daysBefore: number,
+  ): string {
+    const dateStr = b.departureDate
+      ? new Date(b.departureDate).toLocaleDateString('uz-UZ', { day: 'numeric', month: 'long', year: 'numeric' })
+      : '';
+    const tpl = (template && template.trim()) ? template : BookingsService.DEFAULT_REMINDER_MESSAGE;
+    return tpl
+      .replace(/\{ism\}/g, b.client?.fullName || '')
+      .replace(/\{manzil\}/g, b.destination || '')
+      .replace(/\{tur\}/g, b.tourName || '')
+      .replace(/\{sana\}/g, dateStr)
+      .replace(/\{kun\}/g, String(daysBefore));
+  }
+
   @Cron(CronExpression.EVERY_HOUR)
   async sendDepartureReminders() {
-    // "2 kun oldin" — departureDate aynan bugundan 2 kun keyingi
-    // kalendar kuniga to'g'ri keladigan (soatidan qat'i nazar) bookinglar.
-    const now = new Date();
-    const target = new Date(now);
-    target.setHours(0, 0, 0, 0);
-    target.setDate(target.getDate() + 2);
-    const targetEnd = new Date(target);
-    targetEnd.setHours(23, 59, 59, 999);
-
-    const bookings = await this.prisma.booking.findMany({
-      where: {
-        status: { in: ['CONFIRMED', 'IN_PROGRESS'] },
-        departureDate: { gte: target, lte: targetEnd },
-        departureReminderSentAt: null,
-      },
-      include: {
-        client: { select: { id: true, fullName: true } },
-      },
-      take: 200,
+    // Har bir tenant o'z sozlamasiga ega bo'lishi mumkin (kun soni
+    // ham, matn ham har xil bo'lishi mumkin) — shuning uchun avval
+    // tenantlarni, keyin HAR BIRI uchun o'z oynasi bo'yicha
+    // bookinglarni alohida tekshiramiz.
+    const tenants = await this.prisma.tenant.findMany({
+      select: { id: true, settings: true },
     });
 
-    for (const b of bookings) {
-      if (!b.client) continue;
+    for (const tenant of tenants) {
+      const cfg = ((tenant.settings as any) || {}).departureReminder || {};
+      // Sozlanmagan bo'lsa ham (yangi tenant) — standart holatda YOQILGAN
+      // va standart 2 kun/standart matn bilan ishlayveradi (avvalgi xatti-harakat saqlanadi).
+      if (cfg.enabled === false) continue;
 
-      try {
-        // Mijozning eng so'nggi Telegram suhbatini topamiz
-        const conv = await this.prisma.conversation.findFirst({
-          where: { tenantId: b.tenantId, clientId: b.client.id, channel: 'TELEGRAM' },
-          orderBy: { lastMessageAt: 'desc' },
-        });
+      const daysBeforeRaw = Number(cfg.daysBefore);
+      const daysBefore = Number.isFinite(daysBeforeRaw) && daysBeforeRaw >= 0
+        ? daysBeforeRaw
+        : BookingsService.DEFAULT_REMINDER_DAYS;
 
-        const dateStr = b.departureDate
-          ? new Date(b.departureDate).toLocaleDateString('uz-UZ', { day: 'numeric', month: 'long', year: 'numeric' })
-          : '';
+      // "N kun oldin" — departureDate aynan bugundan N kun keyingi
+      // kalendar kuniga to'g'ri keladigan (soatidan qat'i nazar) bookinglar.
+      const now = new Date();
+      const target = new Date(now);
+      target.setHours(0, 0, 0, 0);
+      target.setDate(target.getDate() + daysBefore);
+      const targetEnd = new Date(target);
+      targetEnd.setHours(23, 59, 59, 999);
 
-        const text =
-          `Assalomu alaykum, ${b.client.fullName}! 🌍\n\n` +
-          `${b.destination} yo'nalishidagi safaringizga atigi 2 kun qoldi — ${dateStr} kuni uchasiz. ✈️\n\n` +
-          `✅ Pasport/hujjatlaringizni tekshirib qo'ying\n` +
-          `✅ Chipta va mehmonxona bronlari tayyor\n` +
-          `✅ Yo'l uchun buyumlaringizni yig'ishni boshlang\n\n` +
-          `Hammasi tayyormi? Savol yoki yordam kerak bo'lsa, shu yerga yozavering — doim yordamga tayyormiz!`;
+      const bookings = await this.prisma.booking.findMany({
+        where: {
+          tenantId: tenant.id,
+          status: { in: ['CONFIRMED', 'IN_PROGRESS'] },
+          departureDate: { gte: target, lte: targetEnd },
+          departureReminderSentAt: null,
+        },
+        include: {
+          client: { select: { id: true, fullName: true } },
+        },
+        take: 200,
+      });
 
-        let delivered = false;
-        if (conv) {
-          await this.telegram.sendSystemMessage(b.tenantId, conv.id, text);
-          delivered = true;
+      for (const b of bookings) {
+        if (!b.client) continue;
+
+        try {
+          // Mijozning eng so'nggi Telegram suhbatini topamiz
+          const conv = await this.prisma.conversation.findFirst({
+            where: { tenantId: b.tenantId, clientId: b.client.id, channel: 'TELEGRAM' },
+            orderBy: { lastMessageAt: 'desc' },
+          });
+
+          const dateStr = b.departureDate
+            ? new Date(b.departureDate).toLocaleDateString('uz-UZ', { day: 'numeric', month: 'long', year: 'numeric' })
+            : '';
+          const text = this.renderReminderText(cfg.message, b as any, daysBefore);
+
+          let delivered = false;
+          if (conv) {
+            await this.telegram.sendSystemMessage(b.tenantId, conv.id, text);
+            delivered = true;
+          }
+
+          // Conv topilmasa ham belgilaymiz — aks holda har soatda qayta
+          // urinib, agentga bir xil ogohlantirishni takror-takror yuboraveradi.
+          await this.prisma.booking.update({
+            where: { id: b.id },
+            data: { departureReminderSentAt: new Date() },
+          });
+
+          if (b.agentId) {
+            this.notifications.create({
+              tenantId: b.tenantId,
+              userId: b.agentId,
+              type: 'SYSTEM',
+              title: delivered ? '✈️ Uchish eslatmasi yuborildi' : '⚠️ Uchish eslatmasi yuborilmadi',
+              body: delivered
+                ? `${b.client.fullName} — ${b.destination} (${dateStr})`
+                : `${b.client.fullName} uchun ulangan Telegram suhbati topilmadi, eslatma yuborilmadi.`,
+              link: `/bookings/${b.id}`,
+              metadata: { bookingId: b.id },
+            }).catch(() => {});
+          }
+        } catch (e: any) {
+          // Vaqtinchalik xato (masalan bot/session ishlamayapti) — belgilanmaydi,
+          // keyingi soatlik urinishda qayta harakat qilinadi.
+          this.logger.warn(`Uchish eslatmasi xato (booking=${b.id}): ${e?.message || e}`);
         }
-
-        // Conv topilmasa ham belgilaymiz — aks holda har soatda qayta
-        // urinib, agentga bir xil ogohlantirishni takror-takror yuboraveradi.
-        await this.prisma.booking.update({
-          where: { id: b.id },
-          data: { departureReminderSentAt: new Date() },
-        });
-
-        if (b.agentId) {
-          this.notifications.create({
-            tenantId: b.tenantId,
-            userId: b.agentId,
-            type: 'SYSTEM',
-            title: delivered ? '✈️ Uchish eslatmasi yuborildi' : '⚠️ Uchish eslatmasi yuborilmadi',
-            body: delivered
-              ? `${b.client.fullName} — ${b.destination} (${dateStr})`
-              : `${b.client.fullName} uchun ulangan Telegram suhbati topilmadi, eslatma yuborilmadi.`,
-            link: `/bookings/${b.id}`,
-            metadata: { bookingId: b.id },
-          }).catch(() => {});
-        }
-      } catch (e: any) {
-        // Vaqtinchalik xato (masalan bot/session ishlamayapti) — belgilanmaydi,
-        // keyingi soatlik urinishda qayta harakat qilinadi.
-        this.logger.warn(`Uchish eslatmasi xato (booking=${b.id}): ${e?.message || e}`);
       }
     }
   }
