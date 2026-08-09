@@ -150,9 +150,15 @@ export function validateEnv(): void {
     }
   }
 
-  if (!igSecret && !(singleApp && fbSecret)) {
+  // TUZATILDI (v13.1): webhook imzo tekshiruvi endi INSTAGRAM_LOGIN_APP_SECRET'ga
+  // ham fallback qiladi (instagram.module.ts → getInstagramAppSecret), shuning
+  // uchun bu ogohlantirish ham SHU holatni "sozlangan" deb hisoblashi kerak —
+  // aks holda admin to'g'ri sozlagan bo'lsa ham noto'g'ri ogohlantirish ko'rardi.
+  const igLoginSecretSet = !!process.env.INSTAGRAM_LOGIN_APP_SECRET;
+  if (!igSecret && !(singleApp && fbSecret) && !igLoginSecretSet) {
     warnings.push(
-      "INSTAGRAM_APP_SECRET sozlanmagan — Instagram webhook'lari RAD ETILADI. DM'lar CRM'ga tushmaydi.",
+      "INSTAGRAM_APP_SECRET (yoki INSTAGRAM_LOGIN_APP_SECRET) sozlanmagan — " +
+        "Instagram webhook'lari RAD ETILADI. DM'lar CRM'ga tushmaydi.",
     );
   }
 

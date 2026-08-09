@@ -38,7 +38,23 @@ import { swallow } from '../../common/utils/swallow';
 function getInstagramAppSecret(): string | undefined {
   const ig = process.env.INSTAGRAM_APP_SECRET;
   if (ig) return ig;
-  if (process.env.META_SINGLE_APP === 'true') return process.env.FACEBOOK_APP_SECRET;
+  if (process.env.META_SINGLE_APP === 'true' && process.env.FACEBOOK_APP_SECRET) {
+    return process.env.FACEBOOK_APP_SECRET;
+  }
+  // TUZATILDI (v13.1): admin "Instagram orqali ulash" (Instagram Login for
+  // Business) tugmasi orqali ulangan bo'lsa, ilgari faqat
+  // INSTAGRAM_LOGIN_APP_ID/SECRET sozlanardi (OAuth uchun) va
+  // INSTAGRAM_APP_SECRET (webhook imzosi uchun) ALOHIDA env sifatida
+  // sozlanmagan qolardi. Natijada OAuth ulanish MUVAFFAQIYATLI o'tardi
+  // (token olinardi), lekin real DM kelganda webhook imzosi tekshiruvi
+  // "APP_SECRET sozlanmagan" deb HAR DOIM 403 qaytarardi — Meta buni qayta
+  // urinib, oxiri to'xtatib qo'yardi, va admin "Instagram ulangan" deb
+  // ko'rsa ham DM'lar Chat bo'limiga hech qachon tushmasdi.
+  //
+  // Amalda "Instagram API with Instagram Login" bitta Meta App bo'lgani
+  // uchun, webhook'ni ham AYNAN shu App imzolaydi — shuning uchun
+  // INSTAGRAM_LOGIN_APP_SECRET'ga ham fallback qilamiz.
+  if (process.env.INSTAGRAM_LOGIN_APP_SECRET) return process.env.INSTAGRAM_LOGIN_APP_SECRET;
   return undefined;
 }
 
