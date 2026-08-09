@@ -64,6 +64,32 @@ const HANDOVER_KEYWORDS = [
  */
 const REPLY_WINDOW_HOURS = 24;
 
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * AI REJIM (erkin suhbat) — Claude orqali mijoz savollariga javob
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * G'OYA: eski rejim (ASK_NAME → ASK_DESTINATION → ...) faqat qattiq
+ * belgilangan savollarni beradi. AI rejimida esa mijoz istalgan
+ * savolni yozishi mumkin ("Antalyaga necha kunlik tur bor?",
+ * "Narxi qancha?") — Claude Sozlamalar'da kiritilgan "Bilim bazasi"
+ * (firma haqida ma'lumot, turlar, narxlar) asosida javob beradi.
+ * Agar javob bera olmasa yoki mijoz operator so'rasa — jonli
+ * operator raqamini beradi va suhbat "ig:human" rejimiga o'tadi
+ * (xuddi eski rejimdagi kabi).
+ *
+ * XARAJATNI NAZORAT QILISH: calls/ai-marketing modullaridagi kabi
+ * shu funksiyaga XOS ANTHROPIC_MODEL_INSTAGRAM o'zgaruvchisi
+ * o'qiladi (standart — arzon Haiku). Har bir tenant uchun kunlik
+ * so'rov limiti bor (standart 300; INSTAGRAM_AI_DAILY_LIMIT bilan
+ * sozlanadi) — API xarajati nazoratdan chiqib ketmasligi uchun.
+ */
+const AI_CONTEXT_MESSAGE_LIMIT = 12; // Claude'ga yuboriladigan oxirgi xabarlar soni
+const AI_DAILY_QUOTA = parseInt(process.env.INSTAGRAM_AI_DAILY_LIMIT || '300', 10);
+
+/** Kunlik AI kvota hisoblagichi (jarayon xotirasida — botSessionsCache uslubida) */
+const aiQuotaCache = new Map<string, { count: number; day: string }>();
+
 type BotStep = 'ASK_NAME' | 'ASK_DESTINATION' | 'ASK_PHONE' | 'ASK_DATE' | 'DONE';
 
 interface BotSession {
@@ -118,6 +144,10 @@ export class InstagramService {
       assignToAgentId: s.instagramAssignAgentId || null,
       isEnabled: !!s.instagramAccessToken,
       botSteps: s.instagramBotSteps || [],
+      // ── AI rejim ──
+      aiEnabled: !!s.instagramAiEnabled,
+      operatorPhone: s.instagramOperatorPhone || '',
+      knowledgeBase: s.instagramKnowledgeBase || '',
     };
   }
 
@@ -156,6 +186,10 @@ export class InstagramService {
       assignToAgentId: s.instagramAssignAgentId || null,
       isEnabled: !!s.instagramAccessToken,
       botSteps: s.instagramBotSteps || defaultSteps,
+      // ── AI rejim ──
+      aiEnabled: !!s.instagramAiEnabled,
+      operatorPhone: s.instagramOperatorPhone || '',
+      knowledgeBase: s.instagramKnowledgeBase || '',
     };
   }
 
@@ -184,6 +218,9 @@ export class InstagramService {
     botName?: string;
     greetingMessage?: string;
     assignToAgentId?: string;
+    aiEnabled?: boolean;
+    operatorPhone?: string;
+    knowledgeBase?: string;
   }) {
     const tenant = await this.prisma.tenant.findUnique({
       where: { id: tenantId },
@@ -228,6 +265,10 @@ export class InstagramService {
           instagramFarewell: (data as any).farewell ?? cur.instagramFarewell,
           instagramBotSteps: (data as any).botSteps ?? cur.instagramBotSteps,
           instagramAssignAgentId: data.assignToAgentId ?? cur.instagramAssignAgentId,
+          // ── AI rejim ──
+          instagramAiEnabled: data.aiEnabled ?? cur.instagramAiEnabled ?? false,
+          instagramOperatorPhone: data.operatorPhone ?? cur.instagramOperatorPhone ?? '',
+          instagramKnowledgeBase: data.knowledgeBase ?? cur.instagramKnowledgeBase ?? '',
         },
       },
     });
@@ -386,6 +427,16 @@ export class InstagramService {
       return;
     }
 
+    // ── AI rejim: erkin suhbat (skript emas) ──
+    // Sozlamalar → Instagram → "AI bilan javob berish" yoqilgan bo'lsa,
+    // pastdagi qattiq ASK_NAME/ASK_DESTINATION skripti ISHLAMAYDI —
+    // buning o'rniga Claude mijoz bilan erkin suhbatlashadi va kerak
+    // bo'lsa operator raqamini beradi.
+    if (config.aiEnabled) {
+      await this.handleAiMessage(tenantId, conv, config, senderId, text);
+      return;
+    }
+
     const key = senderId + ':' + tenantId;
     let session = botSessionsCache.get(key);
     if (!session) {
@@ -459,6 +510,177 @@ export class InstagramService {
     if (session.step === 'DONE') {
       await this.switchToHuman(conv);
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // AI REJIM: Claude bilan erkin suhbat
+  // ═══════════════════════════════════════════════════════════
+
+  private get anthropicKey() {
+    return (process.env.ANTHROPIC_API_KEY || '').trim();
+  }
+
+  /** ai-marketing/calls modullaridagi kabi — shu funksiyaga XOS model o'zgaruvchisi. */
+  private get anthropicModel() {
+    return (process.env.ANTHROPIC_MODEL_INSTAGRAM || 'claude-haiku-4-5-20251001').trim();
+  }
+
+  /** Kunlik AI kvotasini tekshiradi va sarflaydi. Limitdan oshsa false qaytaradi. */
+  private consumeAiQuota(tenantId: string): boolean {
+    const today = new Date().toISOString().slice(0, 10);
+    const cur = aiQuotaCache.get(tenantId);
+    if (!cur || cur.day !== today) {
+      aiQuotaCache.set(tenantId, { count: 1, day: today });
+      return true;
+    }
+    if (cur.count >= AI_DAILY_QUOTA) return false;
+    cur.count += 1;
+    return true;
+  }
+
+  /**
+   * Mijozga jonli operatorga o'tkazilgani haqida xabar yozadi (operator
+   * raqami bilan, agar Sozlamalarda kiritilgan bo'lsa) va suhbatni
+   * "ig:human" rejimiga o'tkazadi.
+   */
+  private async handoffToOperator(tenantId: string, conv: any, config: any, senderId: string, aiReplyText?: string) {
+    const phoneLine = config.operatorPhone
+      ? `\n\nMenejerimiz raqami: ${config.operatorPhone} — bevosita bog'lanishingiz mumkin, yoki shu yerda kuting, tez orada javob beramiz.`
+      : '\n\nMenejerimiz tez orada siz bilan bog\'lanadi.';
+    const text = (aiReplyText ? aiReplyText.trim() : 'Kechirasiz, bu savolga aniq javob bera olmayapman.') + phoneLine;
+
+    await this.sendRaw(config.accessToken!, senderId, text);
+    await this.saveOutbound(conv, text, null);
+    await this.switchToHuman(conv);
+    await this.deleteSession(tenantId, senderId);
+
+    if (conv.assignedAgentId) {
+      await this.notifications.create({
+        tenantId,
+        userId: conv.assignedAgentId,
+        type: 'LEAD_NEW',
+        title: '🤖 Instagram AI: operatorga topshirildi',
+        body: conv.firstName || 'Instagram foydalanuvchi',
+        link: `/inbox?conv=${conv.id}`,
+        metadata: { conversationId: conv.id },
+      }).catch(swallow('bildirishnoma'));
+    }
+  }
+
+  /**
+   * AI rejimida kelgan mijoz xabariga Claude orqali javob yozadi.
+   *
+   * - Bilim bazasi (config.knowledgeBase) — firma/turlar/narxlar haqida
+   *   admin Sozlamalarda kiritgan matn. Claude FAQAT shu matndagi
+   *   faktlarga tayanadi, narx/sana to'qib chiqarmaydi.
+   * - Claude javobni QAT'IY JSON ko'rinishida qaytaradi:
+   *   {"reply": "mijozga yuboriladigan matn", "handoff": true|false}
+   *   `handoff: true` — Claude aniq javob bera olmadi YOKI mijoz
+   *   jonli odam so'radi (bu holat asosan yuqoridagi HANDOVER_KEYWORDS
+   *   orqali ushlanadi, lekin Claude ham mustaqil aniqlashi mumkin).
+   */
+  private async handleAiMessage(tenantId: string, conv: any, config: any, senderId: string, text: string) {
+    if (!config.accessToken) return;
+
+    if (!this.anthropicKey) {
+      this.logger.warn('Instagram AI: ANTHROPIC_API_KEY sozlanmagan — operatorga topshirilmoqda');
+      await this.handoffToOperator(tenantId, conv, config, senderId);
+      return;
+    }
+
+    if (!this.consumeAiQuota(tenantId)) {
+      this.logger.warn(`Instagram AI: tenant ${tenantId} kunlik kvota (${AI_DAILY_QUOTA}) tugadi`);
+      await this.handoffToOperator(tenantId, conv, config, senderId,
+        'Hozircha AI yordamchimiz band — kechirasiz.');
+      return;
+    }
+
+    // Suhbat tarixi — oxirgi bir nechta xabar (Claude'ga kontekst uchun)
+    const history = await this.prisma.message.findMany({
+      where: { conversationId: conv.id },
+      orderBy: { createdAt: 'desc' },
+      take: AI_CONTEXT_MESSAGE_LIMIT,
+      select: { direction: true, text: true },
+    });
+    const messages = history
+      .reverse()
+      .filter((m) => (m.text || '').trim())
+      .map((m) => ({
+        role: m.direction === 'OUTBOUND' ? 'assistant' : 'user',
+        content: m.text as string,
+      }));
+    // Oxirgi xabar aynan shu kiruvchi xabar bo'lishi kerak (saveInbound
+    // handleAiMessage'dan OLDIN chaqiriladi, shu sabab tarixda allaqachon bor)
+    if (messages.length === 0 || messages[messages.length - 1].content !== text) {
+      messages.push({ role: 'user', content: text });
+    }
+
+    const tenant = await this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { name: true } });
+    const kb = (config.knowledgeBase || '').trim();
+
+    const system = `Sen "${tenant?.name || 'Sayohat agentligi'}" turizm agentligining Instagram Direct orqali mijozlarga javob beruvchi yordamchisisan.
+
+QOIDALAR:
+1. Faqat pastdagi "BILIM BAZASI" bo'limidagi faktlardan foydalan — narx, sana, tur yo'nalishi yoki xizmatlarni hech qachon o'zingdan to'qib chiqarma.
+2. Agar savolga aniq javob berish uchun bilim bazasida yetarli ma'lumot bo'lmasa, yoki mijoz aniq operator/menejer bilan gaplashishni so'rasa — "handoff": true qaytar va reply'da mijozga hozircha nima bilishing (agar bo'lsa) qisqa yoz.
+3. Javoblaring QISQA (2-4 gap), samimiy, o'zbek tilida (agar mijoz rus tilida yozsa — rus tilida javob ber).
+4. Hech qachon narxni, sanani yoki mavjudlikni "taxminan" deb o'ylab topma — bilmasang shundayligini yoz va handoff qil.
+5. Salomlashish, xayrlashish kabi oddiy xabarlarga o'zing tabiiy javob ber (handoff kerak emas).
+
+BILIM BAZASI (agentlik haqida, turlar, narxlar, shartlar):
+${kb || '(Admin hali bilim bazasini to\'ldirmagan — faqat umumiy, ehtiyotkor javob ber va aniq savollarda handoff qil.)'}
+
+Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech narsa yozma (izoh, markdown belgisi ham kerak emas):
+{"reply": "...", "handoff": false}`;
+
+    let raw = '';
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': this.anthropicKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: this.anthropicModel,
+          max_tokens: 500,
+          system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+          messages,
+        }),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`Anthropic API xato (HTTP ${res.status}): ${errText.slice(0, 200)}`);
+      }
+
+      const j: any = await res.json();
+      const textBlock = (j?.content || []).find((c: any) => c.type === 'text');
+      raw = textBlock?.text || '';
+    } catch (e: any) {
+      this.logger.error('Instagram AI xato: ' + e.message);
+      await this.handoffToOperator(tenantId, conv, config, senderId);
+      return;
+    }
+
+    let parsed: { reply?: string; handoff?: boolean } = {};
+    try {
+      const match = raw.match(/\{[\s\S]*\}/);
+      parsed = match ? JSON.parse(match[0]) : { reply: raw };
+    } catch {
+      parsed = { reply: raw };
+    }
+
+    const replyText = (parsed.reply || '').trim();
+    if (parsed.handoff) {
+      await this.handoffToOperator(tenantId, conv, config, senderId, replyText);
+      return;
+    }
+
+    if (!replyText) return;
+    await this.sendRaw(config.accessToken, senderId, replyText);
+    await this.saveOutbound(conv, replyText, null);
   }
 
   // ═══════════════════════════════════════════════════════════
