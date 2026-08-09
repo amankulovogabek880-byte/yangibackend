@@ -995,6 +995,67 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  // ─── Tizim tomonidan avtomatik yuboriladigan xabarlar ───────────────────
+  // (masalan: booking uchish sanasidan 2 kun oldin eslatma). Hech qanday
+  // agent aralashuvisiz ishlaydi — shuning uchun agentId talab qilinmaydi
+  // va xabar hech kimga "biriktirilmaydi" (agentId=null, tizim xabari).
+  // Faqat MAVJUD suhbatga (conversationId) yoziladi — yangi suhbat
+  // yaratilmaydi, chunki mijoz avval yozgan/yozilgan bo'lishi shart.
+  async sendSystemMessage(tenantId: string, conversationId: string, text: string) {
+    if (!text?.trim()) throw new BadRequestException('Xabar matni kerak');
+
+    const conv = await this.prisma.conversation.findFirst({
+      where: { id: conversationId, tenantId },
+    });
+    if (!conv) throw new NotFoundException('Suhbat topilmadi');
+
+    const account = await this.getSharedAccount(tenantId);
+    if (!account) {
+      throw new BadRequestException('Kompaniya Telegram accounti ulanmagan');
+    }
+
+    let client = activeSessions.get(account.id);
+    if (!client || !(await client.isUserAuthorized().catch(() => false))) {
+      client = (await this.restoreSession(account)) || undefined;
+      if (!client) throw new BadRequestException('Session yaroqsiz');
+    }
+
+    const peer = await client.getInputEntity(conv.externalChatId);
+    const sent = await client.sendMessage(peer, { message: text });
+
+    const updatedConv = await this.prisma.conversation.update({
+      where: { id: conv.id },
+      data: {
+        lastMessageAt: new Date(),
+        lastMessageText: text.slice(0, 200),
+        accountId: account.id,
+      },
+    });
+
+    const savedMsg = await this.prisma.message.create({
+      data: {
+        conversationId: conv.id,
+        agentId: null,
+        direction: 'OUTBOUND',
+        messageType: 'TEXT',
+        text,
+        externalMsgId: String((sent as any).id || Date.now()),
+        isDelivered: true,
+      },
+    });
+
+    try {
+      this.realtime.emitToConversation(conv.id, 'message:new', savedMsg);
+      this.realtime.emitConversationEvent(tenantId, updatedConv.assignedAgentId, 'conversation:updated', {
+        conversationId: conv.id,
+        lastMessageText: text.slice(0, 200),
+        lastMessageAt: new Date(),
+      });
+    } catch {}
+
+    return { ok: true, conversationId: conv.id, message: savedMsg };
+  }
+
   // ─── v11 FIX (davomi): Media/fayl yuborish (shaxsiy akkaunt orqali) ──────
   // Shablonga biriktirilgan rasm/fayl endi faqat caption-matn sifatida emas,
   // HAQIQIY fayl sifatida (MTProto orqali) yuboriladi — xuddi bot orqali

@@ -731,6 +731,76 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Tizim tomonidan avtomatik yuboriladigan xabarlar uchun (masalan:
+   * booking uchish sanasidan 2 kun oldin yuboriladigan eslatma). Hech qanday
+   * agent/AI aralashuvisiz, faqat kod orqali ishlaydi — shuning uchun
+   * agentId/agentRole talab qilmaydi va "tayinlangan agent"ga tegishli
+   * ruxsat tekshiruvlarini o'tkazib yubormaydi (chunki bu tekshiruv
+   * odam-agent xabar yozganda kerak, tizim xabarida emas).
+   * Suhbat turiga qarab (bot yoki shaxsiy/MTProto akkaunt) mos yo'l bilan
+   * yuboradi va xabarni suhbat tarixiga (Message) yozadi.
+   */
+  async sendSystemMessage(tenantId: string, conversationId: string, text: string) {
+    if (!text?.trim()) throw new BadRequestException("Xabar bo'sh");
+    const conv = await this.prisma.conversation.findFirst({
+      where: { id: conversationId, tenantId },
+      include: { account: true },
+    });
+    if (!conv) throw new NotFoundException('Suhbat topilmadi');
+    if (conv.channel !== 'TELEGRAM') {
+      throw new BadRequestException('Avtomatik eslatma faqat Telegram suhbatlariga yuboriladi');
+    }
+
+    // Shaxsiy (MTProto) akkaunt orqali ulangan suhbat — UserTelegramService orqali
+    if ((conv as any).account?.isPersonal) {
+      return this.userTelegram.sendSystemMessage(tenantId, conversationId, text);
+    }
+
+    if (!conv.accountId) {
+      throw new BadRequestException("Suhbat hech qanday Telegram akkauntga bog'lanmagan");
+    }
+    const bot = await this.getOrStartBot(conv.accountId, tenantId);
+
+    const msg = await this.prisma.message.create({
+      data: {
+        conversationId, agentId: null,
+        direction: 'OUTBOUND', messageType: 'TEXT',
+        text, isInternal: false, isRead: false,
+      },
+    });
+
+    try {
+      const sent = await bot.sendMessage(conv.externalChatId, text);
+      await this.prisma.message.update({
+        where: { id: msg.id },
+        data: { externalMsgId: String(sent.message_id), isDelivered: true },
+      });
+    } catch (e: any) {
+      await this.prisma.message.update({
+        where: { id: msg.id },
+        data: { isFailed: true, errorMessage: e.message },
+      });
+      throw new BadRequestException(`Yuborilmadi: ${e.message}`);
+    }
+
+    await this.prisma.conversation.update({
+      where: { id: conversationId },
+      data: { lastMessageAt: new Date(), lastMessageText: text.slice(0, 200), lastMessageType: 'TEXT' },
+    });
+
+    try {
+      this.realtime.emitToConversation(conversationId, 'message:new', msg);
+      this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId, 'conversation:updated', {
+        conversationId,
+        lastMessageText: text.slice(0, 200),
+        lastMessageAt: new Date(),
+      });
+    } catch {}
+
+    return msg;
+  }
+
+  /**
    * v6: Rasm/fayl yuborish
    * Agentlar mehmonxona rasmlarini va boshqa fayllarni klientga yuboradi.
    */

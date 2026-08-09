@@ -879,6 +879,12 @@ model Booking {
   cancelReason String?
   internalNotes String?      // Faqat agent ko'radi
 
+  // ── AVTOMATIK ESLATMALAR ──
+  // Uchish sanasidan (departureDate) 2 kun oldin mijozga Telegram orqali
+  // avtomatik xabar (kod orqali, agent/AI aralashuvisiz) yuborilgach
+  // belgilanadi — qayta-qayta yubormaslik uchun.
+  departureReminderSentAt DateTime?
+
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

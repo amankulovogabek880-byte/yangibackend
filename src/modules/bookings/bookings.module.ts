@@ -1,4 +1,5 @@
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import {
   Module, Injectable, Controller, Get, Post, Put, Delete, Param, Body, Query,
   UseGuards, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
@@ -11,6 +12,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { AuditService } from '../audit/audit.module';
 import { CacheService } from '../../common/cache/cache.service';
+import { TelegramModule, TelegramService } from '../telegram/telegram.module';
 import { Prisma } from '@prisma/client';
 import { BookingStatus, TourType, Currency } from '../../prisma-types';;
 
@@ -29,6 +31,7 @@ export class BookingsService {
     private realtime: RealtimeGateway,
     private audit: AuditService,
     private cache: CacheService,
+    private telegram: TelegramService,
   ) {}
 
   private where(tenantId: string, userId: string, role: string, extra: any = {}): any {
@@ -578,6 +581,91 @@ export class BookingsService {
 
     return { ok: true };
   }
+
+  // ═══════════════════════════════════════════════════════════════
+  // AVTOMATIK ESLATMA: uchish sanasidan 2 kun oldin mijozga Telegram
+  // orqali xabar yuboriladi. To'liq kod orqali — inson yoki AI
+  // aralashuvisiz. Har soatda ishga tushadi, lekin har bir booking
+  // uchun faqat BIR MARTA xabar ketadi (departureReminderSentAt).
+  // ═══════════════════════════════════════════════════════════════
+  @Cron(CronExpression.EVERY_HOUR)
+  async sendDepartureReminders() {
+    // "2 kun oldin" — departureDate aynan bugundan 2 kun keyingi
+    // kalendar kuniga to'g'ri keladigan (soatidan qat'i nazar) bookinglar.
+    const now = new Date();
+    const target = new Date(now);
+    target.setHours(0, 0, 0, 0);
+    target.setDate(target.getDate() + 2);
+    const targetEnd = new Date(target);
+    targetEnd.setHours(23, 59, 59, 999);
+
+    const bookings = await this.prisma.booking.findMany({
+      where: {
+        status: { in: ['CONFIRMED', 'IN_PROGRESS'] },
+        departureDate: { gte: target, lte: targetEnd },
+        departureReminderSentAt: null,
+      },
+      include: {
+        client: { select: { id: true, fullName: true } },
+      },
+      take: 200,
+    });
+
+    for (const b of bookings) {
+      if (!b.client) continue;
+
+      try {
+        // Mijozning eng so'nggi Telegram suhbatini topamiz
+        const conv = await this.prisma.conversation.findFirst({
+          where: { tenantId: b.tenantId, clientId: b.client.id, channel: 'TELEGRAM' },
+          orderBy: { lastMessageAt: 'desc' },
+        });
+
+        const dateStr = b.departureDate
+          ? new Date(b.departureDate).toLocaleDateString('uz-UZ', { day: 'numeric', month: 'long', year: 'numeric' })
+          : '';
+
+        const text =
+          `Assalomu alaykum, ${b.client.fullName}! 🌍\n\n` +
+          `${b.destination} yo'nalishidagi safaringizga atigi 2 kun qoldi — ${dateStr} kuni uchasiz. ✈️\n\n` +
+          `✅ Pasport/hujjatlaringizni tekshirib qo'ying\n` +
+          `✅ Chipta va mehmonxona bronlari tayyor\n` +
+          `✅ Yo'l uchun buyumlaringizni yig'ishni boshlang\n\n` +
+          `Hammasi tayyormi? Savol yoki yordam kerak bo'lsa, shu yerga yozavering — doim yordamga tayyormiz!`;
+
+        let delivered = false;
+        if (conv) {
+          await this.telegram.sendSystemMessage(b.tenantId, conv.id, text);
+          delivered = true;
+        }
+
+        // Conv topilmasa ham belgilaymiz — aks holda har soatda qayta
+        // urinib, agentga bir xil ogohlantirishni takror-takror yuboraveradi.
+        await this.prisma.booking.update({
+          where: { id: b.id },
+          data: { departureReminderSentAt: new Date() },
+        });
+
+        if (b.agentId) {
+          this.notifications.create({
+            tenantId: b.tenantId,
+            userId: b.agentId,
+            type: 'SYSTEM',
+            title: delivered ? '✈️ Uchish eslatmasi yuborildi' : '⚠️ Uchish eslatmasi yuborilmadi',
+            body: delivered
+              ? `${b.client.fullName} — ${b.destination} (${dateStr})`
+              : `${b.client.fullName} uchun ulangan Telegram suhbati topilmadi, eslatma yuborilmadi.`,
+            link: `/bookings/${b.id}`,
+            metadata: { bookingId: b.id },
+          }).catch(() => {});
+        }
+      } catch (e: any) {
+        // Vaqtinchalik xato (masalan bot/session ishlamayapti) — belgilanmaydi,
+        // keyingi soatlik urinishda qayta harakat qilinadi.
+        this.logger.warn(`Uchish eslatmasi xato (booking=${b.id}): ${e?.message || e}`);
+      }
+    }
+  }
 }
 
 @Controller('bookings')
@@ -619,7 +707,7 @@ export class BookingsController {
 }
 
 @Module({
-  imports: [],
+  imports: [TelegramModule],
   controllers: [BookingsController],
   providers: [BookingsService],
   exports: [BookingsService],
