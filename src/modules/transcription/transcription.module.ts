@@ -34,6 +34,24 @@ export class TranscriptionService {
     return 'groq';
   }
 
+  /**
+   * v22: Whisper'ga yuboriladigan til kodi — endi qattiq kodlanmagan,
+   * `platformSetting` (kalit: 'sttLanguage') orqali sozlanadi, standart
+   * 'uz' (o'zbek). Agar kelajakda boshqa til (masalan aralash rus nutqi
+   * ko'p bo'lgan filial uchun 'ru') kerak bo'lsa, buni owner panelidan
+   * kodni o'zgartirmasdan sozlash mumkin bo'ladi.
+   */
+  private async getSttLanguage(): Promise<string> {
+    try {
+      const row = await this.prisma.platformSetting.findUnique({ where: { key: 'sttLanguage' } });
+      const v = String(row?.value || '').trim().toLowerCase();
+      if (v && /^[a-z]{2}$/.test(v)) return v;
+    } catch (e: any) {
+      this.logger.warn(`sttLanguage sozlamasi o'qilmadi (standart: uz): ${e.message}`);
+    }
+    return 'uz';
+  }
+
   async getSttProviderSetting(): Promise<{ preferred: SttProvider; groqConfigured: boolean; openaiConfigured: boolean }> {
     return {
       preferred: await this.getPreferredProvider(),
@@ -119,11 +137,13 @@ export class TranscriptionService {
       const preferred = await this.getPreferredProvider();
       const order: SttProvider[] = preferred === 'groq' ? ['groq', 'openai'] : ['openai', 'groq'];
 
+      const language = await this.getSttLanguage();
+
       let lastResult: TranscribeResult | null = null;
       for (const provider of order) {
         const key = provider === 'groq' ? this.groqKey : this.openaiKey;
         if (!key) continue; // bu provayderning kaliti yo'q — o'tkazib yuboramiz
-        const result = await this.callProvider(provider, key, audioBuffer);
+        const result = await this.callProvider(provider, key, audioBuffer, language);
         if (result.text != null || !result.transient) {
           // Muvaffaqiyatli YOKI "qat'iy" xato (qayta urinish foydasiz) —
           // ikkinchi provayderga o'tishning hojati yo'q.
@@ -148,7 +168,7 @@ export class TranscriptionService {
    * shuning uchun bu funksiya ikkalasiga ham xizmat qiladi, faqat URL
    * va model nomi farq qiladi.
    */
-  private async callProvider(provider: SttProvider, apiKey: string, audioBuffer: Buffer): Promise<TranscribeResult> {
+  private async callProvider(provider: SttProvider, apiKey: string, audioBuffer: Buffer, language: string): Promise<TranscribeResult> {
     const endpoint = provider === 'groq'
       ? 'https://api.groq.com/openai/v1/audio/transcriptions'
       : 'https://api.openai.com/v1/audio/transcriptions';
@@ -156,17 +176,26 @@ export class TranscriptionService {
     // ~9x arzon va aslida sifat jihatdan ham teng/yaxshiroq (Large v3).
     const model = provider === 'groq' ? 'whisper-large-v3-turbo' : 'whisper-1';
 
-    // v21: auto-detect (language yubormaslik) ba'zan noto'g'ri tilni
-    // "topib" (masalan Rumincha) chalkash matn qaytarardi. Whisper
-    // o'zbek tilini qo'llab-quvvatlamagani uchun eng yaqin va yaxshi
-    // qo'llab-quvvatlanadigan til — rus tiliga majburlaymiz (O'zbekistonda
-    // aralash o'zbek-rus nutq ko'p uchraydi, Whisper buni rus sifatida
-    // ancha to'g'ri tanib oladi — auto-detect'ga qaraganda barqarorroq).
+    // v22 TUZATISH: eski kod tilni MAJBURIY 'ru' (rus) qilib yuborardi —
+    // izohda "Whisper o'zbek tilini qo'llab-quvvatlamaydi" deyilgan edi,
+    // lekin bu NOTO'G'RI: Whisper large-v3 (demak Groq'ning
+    // whisper-large-v3-turbo'si ham, OpenAI whisper-1 ham) rasman 'uz'
+    // (o'zbek) tilini qo'llab-quvvatlaydi. Tilni 'ru'ga majburlash
+    // natijasida o'zbekcha ovozli xabar RUS FONETIKASI bilan
+    // transkripsiya qilinardi — natija chalkash/noto'g'ri matn bo'lardi,
+    // Jarvis esa shu buzuq matnni o'qib to'g'ri javob berolmasdi va/yoki
+    // o'zi ham chalkash/rus tilida javob qaytarardi.
+    //
+    // YECHIM: tilni 'uz'ga o'zgartiramiz. Agar kelajakda aralash
+    // o'zbek-rus nutq muammo qilsa, buni PLATFORM SOZLAMASI
+    // (`platformSetting` — xuddi sttProvider kabi) orqali
+    // sozlanadigan qilish mumkin, lekin standart holat endi TO'G'RI
+    // tilga (o'zbek) mos.
     const form = new FormData();
     const blob = new Blob([new Uint8Array(audioBuffer)], { type: 'audio/mpeg' });
     form.append('file', blob, 'recording.mp3');
     form.append('model', model);
-    form.append('language', 'ru');
+    form.append('language', language);
     form.append('response_format', 'json');
 
     try {

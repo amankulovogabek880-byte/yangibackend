@@ -592,7 +592,7 @@ const getBookingStatus: AiToolDefinition = {
 const searchMarketplaceTours: AiToolDefinition = {
   name: 'searchMarketplaceTours',
   description:
-    "Kompaniyaning tur bozoridagi (marketplace) mavjud tur takliflarini qidiradi — manzil, davlat, narx oralig'i, sana bo'yicha filtrlash mumkin.",
+    "Kompaniyaning tur bozoridagi (marketplace) mavjud tur takliflarini qidiradi — manzil, davlat, narx oralig'i, sana bo'yicha filtrlash mumkin. MUHIM: bu FAQAT ichki DB kataloqini (oldindan qo'shilgan turlar) qidiradi — jonli operator API (Ratehawk va h.k.) bilan bog'liq EMAS. Agar natija bo'sh (count: 0) qaytsa, bu 'bunday tur mavjud emas' degani EMAS — kataloq hali to'ldirilmagan yoki operator ulanmagan bo'lishi mumkin. Bunday holda qidiruvni qayta-qayta takrorlab foydalanuvchini kutdirma — agar foydalanuvchi tur tafsilotlarini (yo'nalish, mehmonxona, narx, sana) allaqachon o'zi aytgan bo'lsa, to'g'ridan-to'g'ri 'createOfferDraft' tool'ini o'sha ma'lumotlar bilan (tourId'siz) chaqirib taklif qoralamasini yarat.",
   input_schema: {
     type: 'object',
     properties: {
@@ -634,6 +634,13 @@ const searchMarketplaceTours: AiToolDefinition = {
         seatsAvailable: t.seatsAvailable,
         operator: (t as any).operator?.name,
       })),
+      // v45: natija bo'sh bo'lganda modelga aniq yo'l-yo'riq — "tur yo'q"
+      // deb to'xtab qolmasin, foydalanuvchi bergan ma'lumot bilan
+      // createOfferDraft'ga o'tsin (pastdagi system prompt bilan mos).
+      guidance:
+        tours.length === 0
+          ? "Ichki kataloqda mos tur topilmadi (kataloq bo'sh yoki bu yo'nalish hali qo'shilmagan bo'lishi mumkin — bu 'tur mavjud emas' degani emas). Agar foydalanuvchi tur tafsilotlarini (yo'nalish/mehmonxona/narx/sana) allaqachon aytgan bo'lsa, buni qayta so'ramasdan 'createOfferDraft' tool'i bilan taklif qoralamasini yarat."
+          : undefined,
     };
   },
 };
@@ -882,7 +889,7 @@ const updatePipelineStage: AiToolDefinition = {
 const createOfferDraft: AiToolDefinition = {
   name: 'createOfferDraft',
   description:
-    "Mijoz uchun taklif (offer) QORALAMASINI yaratadi — DRAFT holatida, hali yuborilmagan. Mavjud 'Takliflar' bo'limida ko'rinadi va u yerdan tahrirlab/yuborib bo'ladi.",
+    "Mijoz uchun taklif (offer) QORALAMASINI yaratadi — DRAFT holatida, hali yuborilmagan. Mavjud 'Takliflar' bo'limida ko'rinadi va u yerdan tahrirlab/yuborib bo'ladi. MUHIM: 'tourId' IXTIYORIY — marketplace kataloqida mos tur topilmasa yoki 'searchMarketplaceTours' bo'sh natija qaytarsa ham, foydalanuvchi aytgan tavsif (masalan 'Antalya, Rixos mehmonxonasi, 7 kecha') va narx bilan bu tool'ni tourId'siz chaqirib taklifni baribir yaratish mumkin va KERAK — bu holat xato emas, oddiy ish jarayoni.",
   input_schema: {
     type: 'object',
     properties: {
