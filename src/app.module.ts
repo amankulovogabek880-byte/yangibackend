@@ -46,7 +46,6 @@ import { FollowUpsModule } from './modules/followups/followups.module';
 import { TasksModule } from './modules/tasks/tasks.module';
 import { LeadsModule } from './modules/leads/leads.module';
 import { CallsModule } from './modules/calls/calls.module';
-import { BriefingModule } from './modules/briefing/briefing.module';
 import { KpiModule } from './modules/kpi/kpi.module';
 import { DocumentsModule } from './modules/documents/documents.module';
 import { SearchModule } from './modules/search/search.module';
@@ -132,7 +131,6 @@ import { JarvisBotModule } from './modules/jarvis-bot/jarvis-bot.module';
     TasksModule,
     LeadsModule,
     CallsModule,
-    BriefingModule,
     KpiModule,
     DocumentsModule,
     SearchModule,

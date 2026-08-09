@@ -567,22 +567,18 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
     return tashkent.getUTCHours();
   }
 
-  /** Har soat boshida ishga tushadi, faqat "vaqti kelgan" botlarga digest yuboradi (kuniga 1 marta) */
+  /**
+   * v43: KUNLIK AI BRIFING O'CHIRILDI — token sarfini kamaytirish uchun
+   * bu avtomatik kunlik digest (ertalabki shaxsiy/jamoaviy xabar)
+   * butunlay to'xtatildi. Jarvisning QOLGAN barcha funksiyalari
+   * (qo'ng'iroq tahlili tugagach darhol xabar, admin savol-javob)
+   * o'zgarishsiz ishlab turadi — faqat shu avtomatik AI so'rovi
+   * (soatiga bir marta tekshirilib, "vaqti kelgan" botlarga
+   * yuborilardi) o'chirildi.
+   */
   @Cron('0 * * * *')
   async hourlyDigestTick() {
-    await this.cronLock.runOnce('jarvis-daily-digest', 15 * 60, async () => {
-      const hour = this.currentHourTashkent();
-      const today = this.todayKeyTashkent();
-      const dueBots = await this.prisma.jarvisBot.findMany({
-        where: { isActive: true, dailyDigestEnabled: true, dailyDigestHour: hour, NOT: { lastDigestDate: today } },
-      });
-      for (const bot of dueBots) {
-        await this.sendDailyDigest(bot.tenantId, bot.id).catch((e) =>
-          this.logger.warn(`Kunlik digest xato [${bot.tenantId}]: ${e.message}`),
-        );
-        await this.prisma.jarvisBot.update({ where: { id: bot.id }, data: { lastDigestDate: today } }).catch(() => {});
-      }
-    });
+    return;
   }
 
   private async sendDailyDigest(tenantId: string, botId: string) {

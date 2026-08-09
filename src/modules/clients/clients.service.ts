@@ -333,6 +333,7 @@ export class ClientsService {
     if (phone) {
       const dup = await this.prisma.client.findFirst({
         where: { tenantId, phone },
+        include: { assignedAgent: { select: { name: true } } },
       });
       if (dup) {
         await this.addTimeline(
@@ -342,7 +343,15 @@ export class ClientsService {
           data.note,
           { source: data.source },
         );
-        throw new BadRequestException("Bu telefon raqam allaqachon mavjud");
+        // Qaysi agentning mijozi ekanini ko'rsatamiz — shunda yangi
+        // mijoz yaratmoqchi bo'lgan xodim bu raqam kimning bazasida
+        // borligini darhol biladi (agentga tayinlanmagan bo'lsa —
+        // shunchaki mijoz nomi bilan xabar beriladi).
+        const ownerName = dup.assignedAgent?.name;
+        const message = ownerName
+          ? `Bu telefon raqam allaqachon mavjud — "${dup.fullName}" nomi bilan ${ownerName} agentning mijozlar ro'yxatida bor`
+          : `Bu telefon raqam allaqachon mavjud — "${dup.fullName}" nomi bilan mijozlar ro'yxatida bor`;
+        throw new BadRequestException(message);
       }
     }
 
