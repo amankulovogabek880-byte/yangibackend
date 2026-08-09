@@ -241,12 +241,13 @@ export class CallsService {
 ${CALL_SCORING_RUBRIC}
 
 Qattiq qoidalar:
-1. Xulosa (summary) 2-3 gapdan oshmasin: mijoz nima haqida so'radi, qanday e'tiroz/shubha bildirdi, keyingi qadam nima bo'lishi kerak.
+0. callType — transkriptni o'qib, yuqoridagi "BU HAQIQIY SUHBATMI" bo'limiga qarab ANIQLA: "real_conversation" | "ivr_or_voicemail" | "no_answer_or_hangup" | "short_offtopic". Bu maydonni HAR DOIM to'ldiring — bu keyingi barcha ballarni qanday berishingizga asos bo'ladi.
+1. Xulosa (summary) 2-3 gapdan oshmasin: mijoz nima haqida so'radi (yoki IVR/off-topic bo'lsa — suhbat/qo'ng'iroq AYNAN nima haqida bo'lgani, nima uchun real agent bilan gaplashilmagani), qanday e'tiroz/shubha bildirdi, keyingi qadam nima bo'lishi kerak. callType "ivr_or_voicemail" yoki "short_offtopic" bo'lsa ham summary'ni bo'sh yoki umumiy qoldirmang — transkriptdagi haqiqiy tafsilotlarni (masalan qaysi menyu tugmasi, qaysi mavzu) ayting.
 2. E'tirozlarni FAQAT quyidagi kategoriyalardan tanlab belgila (agar suhbatda e'tiroz bo'lmasa — bo'sh massiv qaytar):
 ${categoriesList}
 3. Har bir e'tiroz uchun mijozning aslidagi gapiga yaqin qisqa "quote" ber (matndan, 15 so'zdan oshmasin).
-4. Keyingi qadam (nextAction) — aniq, bajarish mumkin bo'lgan harakat bo'lsin (masalan "3 kundan keyin narx bo'yicha qayta bog'laning va 5% chegirma taklif qiling"), daysUntilDue — necha kundan keyin bajarilishi kerakligi (1-14 oralig'ida butun son).
-5. Agent feedback — yuqoridagi "AI QAYSI NUQTALAR BO'YICHA BAHOLASHI KERAK" bo'limidagi 6 ta mezonga qarab, agentning gaplashish sifatini xolisona (1-10 ball) baholaysan. Kuchli va yaxshilash kerak bo'lgan tomonlarni QISQA (har biri 1 jumla) ko'rsat. Haqoratli emas, konstruktiv bo'l.
+4. Keyingi qadam (nextAction) — aniq, bajarish mumkin bo'lgan harakat bo'lsin (masalan "3 kundan keyin narx bo'yicha qayta bog'laning va 5% chegirma taklif qiling"), daysUntilDue — necha kundan keyin bajarilishi kerakligi (1-14 oralig'ida butun son). callType "ivr_or_voicemail" yoki "no_answer_or_hangup" bo'lsa, nextAction odatda "qayta qo'ng'iroq qilish" bo'lsin (1-2 kun ichida).
+5. Agent feedback — yuqoridagi "AI QAYSI NUQTALAR BO'YICHA BAHOLASHI KERAK" bo'limidagi 6 ta mezonga qarab, agentning gaplashish sifatini xolisona (1-10 ball) baholaysan. Kuchli va yaxshilash kerak bo'lgan tomonlarni QISQA (har biri 1 jumla) ko'rsat. Haqoratli emas, konstruktiv bo'l. ESLATMA: callType "real_conversation" bo'lmasa (ya'ni agent haqiqatda gaplashmagan bo'lsa), score'ni past (1-3) qo'ying va strengths/improvements'da buning sababini ("agent bu qo'ng'iroqda gaplashmadi, faqat IVR javob berdi" kabi) aniq yozing — ballarni "standart" 7-8 qilib qo'ymang.
 6. Sotuvga yaqinlik (saleReadiness) — mijoz sotib olishga qanchalik yaqinligini 1-10 ballda baholaysan (1 = umuman qiziqmadi, 10 = deyarli rozi bo'ldi/to'lovga tayyor). missedInfo — agent aytishi kerak bo'lib, aytmay qoldirgan MUHIM ma'lumot bo'lsa qisqa yoz (masalan narx, sana, hujjatlar), bo'lmasa bo'sh qoldir. whatWouldClose — mijozni aynan nima ishontirib, sotuvni yakunlagan bo'lardi (1 qisqa, aniq jumla).
 7. bestPhrase — agent ayntan shu suhbatda ishlatgan ENG KUCHLI/samarali gap yoki so'z birikmasi bo'lsa, uni AYNAN o'sha holicha (quote) ko'rsat (masalan mijozni ishontirgan yoki e'tirozni yaxshi yopgan gap). Bunday gap yo'q bo'lsa — bo'sh qoldir, o'ylab topma.
 8. Agar suhbat juda qisqa yoki mazmunsiz bo'lsa (masalan javob bermadi), buni halol yoz — o'ylab topma.
@@ -257,6 +258,7 @@ ${categoriesList}
 
 Javobni FAQAT quyidagi JSON formatida qaytar — hech qanday izoh, sarlavha yoki markdown belgisi qo'shma:
 {
+  "callType": "real_conversation" | "ivr_or_voicemail" | "no_answer_or_hangup" | "short_offtopic",
   "summary": "...",
   "sentiment": "positive" | "neutral" | "negative",
   "objections": [{"category": "price", "label": "Narx qimmat", "quote": "..."}],
@@ -371,6 +373,13 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
       const sentiment = ['positive', 'neutral', 'negative'].includes(parsed.sentiment)
         ? parsed.sentiment : 'neutral';
 
+      // v46: qo'ng'iroq turi — real suhbatmi, IVR/avtomatik javobmi, javobsizmi
+      // yoki mavzudan tashqari gaplashuvmi. Telegram/CRM'da ballarni to'g'ri
+      // izohlash uchun ishlatiladi (masalan IVR qo'ng'irog'ini "yomon ball"
+      // deb emas, "agent gaplashmadi" deb ko'rsatish uchun).
+      const callTypeValues = ['real_conversation', 'ivr_or_voicemail', 'no_answer_or_hangup', 'short_offtopic'];
+      const callType = callTypeValues.includes(parsed.callType) ? parsed.callType : 'real_conversation';
+
       // Keyingi qadamni avtomatik "Eslatmalar" (FollowUp) bo'limiga qo'shamiz
       let followUpId: string | undefined;
       if (nextAction && call.agentId) {
@@ -398,8 +407,8 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
           aiObjections: objections,
           aiNextAction: nextAction ? { ...nextAction, followUpId } : null,
           aiFeedback: (feedback || saleReadiness || bestPhrase || overallScore != null || churnRisk != null || saleProbability != null || mistakes.length)
-            ? { ...(feedback || {}), saleReadiness, bestPhrase, overallScore, churnRisk, saleProbability, mistakes }
-            : null,
+            ? { ...(feedback || {}), saleReadiness, bestPhrase, overallScore, churnRisk, saleProbability, mistakes, callType }
+            : { callType },
           aiAnalyzedAt: new Date(),
         } as any,
       });
@@ -423,6 +432,7 @@ Yuqoridagi qoidalarga rioya qilib tahlilni JSON formatida ber.`;
         aiSummary: updated.aiSummary,
         aiSentiment: updated.aiSentiment,
         aiFeedback: updated.aiFeedback,
+        callType,
       });
 
       return updated;

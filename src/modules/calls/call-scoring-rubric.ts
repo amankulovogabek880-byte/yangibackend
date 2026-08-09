@@ -1,36 +1,24 @@
-// ═══════════════════════════════════════════════════════════════════════
-// AI QO'NG'IROQ BAHOLASH MEZONLARI — BU FAYLNI ISTAGANCHA TAHRIRLANG
-// ═══════════════════════════════════════════════════════════════════════
-//
-// BU YERDA NIMA BOR: quyidagi RUBRIC matni — AI (Claude) har bir
-// qo'ng'iroqni tahlil qilganda "qanday suhbat YAXSHI, qanday suhbat
-// MUKAMMAL (perfect) va agentni AYNAN QANDAY MEZONLAR (points) bo'yicha
-// baholash kerak" degan savolga javob beruvchi QOIDALAR TO'PLAMI.
-//
-// NIMA UCHUN ALOHIDA FAYL: bu qoidalar — sof matn, texnik kod emas.
-// Siz bu yerni istalgancha o'zgartira olasiz (masalan yangi mezon
-// qo'shish, mavjudini kuchaytirish/yumshatish, misollarni o'zingizning
-// tajribangizga moslashtirish) — calls.module.ts faylidagi boshqa
-// qismlarga (JSON formatini o'qish, ballarni saqlash va h.k.) UMUMAN
-// TEGMASDAN. Ya'ni bu — "qonun" qismi, qolgani — "dastur" qismi.
-//
-// QANDAY TAHRIRLASH KERAK:
-//  1. Faqat quyidagi CALL_SCORING_RUBRIC ichidagi MATNNI o'zgartiring.
-//  2. Backtick (`) belgilarini o'chirmang — ular JavaScript matn
-//     boshi/oxirini bildiradi.
-//  3. JSON kalitlari haqida (masalan "feedback", "score", "mistakes")
-//     GAPIRMANG / O'ZGARTIRMANG — ular calls.module.ts faylida ALOHIDA
-//     va qattiq belgilangan, bu yerda ularga tegish shart emas va tavsiya
-//     etilmaydi (aks holda AI javobi noto'g'ri formatda qaytishi mumkin).
-//  4. O'zgartirgandan keyin serverni qayta ishga tushirish (deploy/restart)
-//     kifoya — boshqa hech narsa kerak emas.
-//
-// TIL: matn qanday tilda yozilsa, AI xulosa/fikrlarni o'sha yo'nalishda
-// (lekin baribir o'zbek tilida, calls.module.ts'dagi asosiy qoida bo'yicha)
-// yozadi — shuning uchun bu yerga misollarni ham o'zbekcha yozgan maqsadga
-// muvofiq.
+
 export const CALL_SCORING_RUBRIC = `
-═══ MUKAMMAL (PERFECT) SUHBAT QANDAY BO'LADI ═══
+═══ ENG AVVAL: BU HAQIQIY SUHBATMI, YO'QMI? ═══
+
+Baholashni boshlashdan OLDIN, transkriptni o'qib, quyidagi turlardan AYNAN QAYSI BIRIGA to'g'ri kelishini aniqla. Bu — "callType" maydoni uchun asos, va u KEYINGI hamma ballarga (feedback.score, overallScore va h.k.) TO'G'RIDAN-TO'G'RI ta'sir qiladi:
+
+  • "real_conversation" — agent va mijoz ikkalasi ham gapirgan, haqiqiy dialog bo'lgan (hatto qisqa yoki muvaffaqiyatsiz bo'lsa ham — asosiysi IKKI TOMON ham real gapirgan).
+  • "ivr_or_voicemail" — transkriptda faqat AVTOMATIK tizim ovozi bor (masalan "Barcha operatorlar band, iltimos kuting", "1-tugmani bosing", ovozli pochta signali, robot xabari) — REAL AGENT umuman gapirmagan yoki gapirgan bo'lsa ham 1-2 so'zdan oshmagan.
+  • "no_answer_or_hangup" — qo'ng'iroq ulanmagan, darhol uzilgan, yoki hech kim gapirmagan (bo'sh/deyarli bo'sh transkript).
+  • "short_offtopic" — real odam (agent va/yoki mijoz) gapirgan, LEKIN suhbat sotuv/tur mavzusiga umuman aloqasi yo'q (masalan noto'g'ri raqamga qo'ng'iroq, shaxsiy gaplashuv, sinov qo'ng'irog'i) — bu ham "real_conversation"dan FARQLI, chunki baholab bo'lmaydigan mavzu.
+
+MUHIM QOIDA — "ivr_or_voicemail" va "no_answer_or_hangup" holatlarida:
+  - Agent HALI GAPIRMAGANI uchun uni baholash MUMKIN EMAS. feedback.score, saleReadiness.score, overallScore — barchasini SUN'IY RAVISHDA past (masalan 1-3 oralig'ida, "o'rtacha 5" YOKI qandaydir "standart" raqam EMAS) belgilang va buni feedback.strengths/improvements'da ANIQ tushuntiring (masalan: "Agent bu qo'ng'iroqda umuman gapirmadi — faqat avtomatik IVR javob berdi, shuning uchun ko'nikma baholanmaydi").
+  - churnRisk va saleProbability'ni HAM shu holatga mos (odatda past ishonch bilan, lekin real vaziyatni aks ettirib) belgilang — "standart" 30/40/50 kabi raqamlarni takrorlab qo'ymang, HAR BIR qo'ng'iroq uchun transkriptning o'ziga qarab HAQIQIY, farqlanuvchi baho bering.
+  - summary'da albatta ANIQ yozing: mijoz nima demoqchi bo'lgani/nima uchun qo'ng'iroq qilgani (agar transkriptdan bilinsa — masalan IVR menyusida qaysi tugmani bosgani, qanday savol takrorlangani), va nima uchun real agent bilan gaplasholmagani.
+
+"short_offtopic" holatida ham xuddi shunday — sotuv ko'nikmalari baholanmaydi (past/N/A bo'lsin), LEKIN summary'da suhbat AYNAN NIMA HAQIDA bo'lgani (mavzusi) albatta yozilsin — "off-topic edi" deb qisqa o'tib ketmang, ANIQ nima gaplashilganini ayting.
+
+ENG MUHIM: har bir qo'ng'iroq — ALOHIDA holat. Agar 5 ta ketma-ket IVR qo'ng'iroqni tahlil qilsangiz ham, ularning ballari BIR XIL BO'LISHI SHART EMAS (masalan biттasida IVR faqat 1 marta takrorlangan, boshqasida 3 marta — bu farqni ballarga aks ettiring) — "odatiy" yoki "standart" bitta raqamni har safar qaytarish (masalan doim 8, doim 50%) — bu XATO va yo'l qo'yilmaydi. Transkriptning o'zidagi haqiqiy tafsilotlarga qarab baho bering.
+
+═══ MUKAMMAL (PERFECT) SUHBAT QANDAY BO'LADI (faqat "real_conversation" uchun) ═══
 
 Quyidagi bosqichlar to'liq va sifatli bajarilgan bo'lsa, suhbat "mukammal"ga yaqin deb baholanadi:
 

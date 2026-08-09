@@ -520,6 +520,7 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
     aiSummary?: string | null;
     aiSentiment?: string | null;
     aiFeedback?: any;
+    callType?: string;
   }) {
     const { tenantId, ...call } = payload;
     try {
@@ -533,14 +534,32 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
       });
       if (!admins.length) return;
 
+      // v46: `overallScore` 0-100 shkalada — avval "X/10" deb noto'g'ri
+      // ko'rsatilardi (masalan overallScore=8 bo'lsa "8/10" chiqib, aslida
+      // "8/100" ekanini yashirardi va deyarli har doim past-o'rtacha bir xil
+      // raqam ko'rinib, AI "doim bir xil baho beryapti" degan taassurot
+      // qoldirardi). Endi to'g'ri "/100" bilan ko'rsatiladi.
       const sentimentEmoji = call.aiSentiment === 'positive' ? '🟢' : call.aiSentiment === 'negative' ? '🔴' : '🟡';
-      const score = call.aiFeedback?.overallScore != null ? `${call.aiFeedback.overallScore}/10` : '—';
+      const score = call.aiFeedback?.overallScore != null ? `${call.aiFeedback.overallScore}/100` : '—';
+
+      // callType — agent haqiqatda gaplashmagan qo'ng'iroqlarni (IVR/avtomatik
+      // javob, javobsiz) alohida belgilaymiz, shunda admin ballarni sotuv
+      // ko'nikmasi bilan aralashtirib tushunmaydi.
+      const callType = call.callType || call.aiFeedback?.callType;
+      const callTypeLabel: Record<string, string> = {
+        ivr_or_voicemail: "🤖 Avtomatik javob (IVR) — agent gaplashmadi",
+        no_answer_or_hangup: "📵 Javobsiz / uzilgan qo'ng'iroq",
+        short_offtopic: "💬 Mavzudan tashqari qisqa suhbat",
+      };
+      const typeNote = callType && callTypeLabel[callType] ? callTypeLabel[callType] : null;
+
       const lines = [
         `📞 Yangi qo'ng'iroq tahlili`,
         ``,
         `Agent: ${call.agentName || 'Noma\'lum'}`,
         `Mijoz: ${call.clientName || 'Noma\'lum'}`,
         `Kayfiyat: ${sentimentEmoji}  Baho: ${score}`,
+        ...(typeNote ? [typeNote] : []),
         ``,
         call.aiSummary ? call.aiSummary.slice(0, 600) : 'Xulosa yo\'q.',
       ];
