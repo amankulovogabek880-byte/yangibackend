@@ -35,11 +35,22 @@ export class TranscriptionService {
   }
 
   /**
-   * v22: Whisper'ga yuboriladigan til kodi — endi qattiq kodlanmagan,
-   * `platformSetting` (kalit: 'sttLanguage') orqali sozlanadi, standart
-   * 'uz' (o'zbek). Agar kelajakda boshqa til (masalan aralash rus nutqi
-   * ko'p bo'lgan filial uchun 'ru') kerak bo'lsa, buni owner panelidan
-   * kodni o'zgartirmasdan sozlash mumkin bo'ladi.
+   * v22: Whisper'ga yuboriladigan til kodi — `platformSetting` (kalit:
+   * 'sttLanguage') orqali sozlanadi.
+   *
+   * v46 O'ZGARISH: standart qiymat ENDI BO'SH ('' — AVTO-ANIQLASH), 'uz'
+   * EMAS. SABAB: kompaniyada ba'zi xodimlar o'zbekcha, ba'zilari ruscha
+   * gapiradi (aralash muhit — bu O'zbekistonda odatiy holat). Tilni
+   * qattiq 'uz'ga majburlasak, ruscha gapirganlar UCHUN xuddi avvalgi
+   * 'ru'ga majburlash o'zbekchalar uchun qilgani kabi buzuq natija olardi
+   * — ya'ni muammo shunchaki TESKARISIGA aylanardi, hal bo'lmasdi.
+   * Avto-aniqlash — Whisper'ning o'ziga qaysi til ekanini "topishga"
+   * ishonamiz, buzuq/aloqasiz natijalardan esa yuqoridagi (`callProvider`
+   * ichidagi) ISHONCH TEKSHIRUVI (`avg_logprob`/`no_speech_prob`) himoya
+   * qiladi — past ishonchli natija Jarvis'ga UMUMAN yuborilmaydi.
+   * Agar aniq bitta tilni majburlash kerak bo'lsa (masalan filial faqat
+   * ruscha gaplashadi), buni owner panelidan `sttLanguage=ru` qilib
+   * sozlash mumkin — kodni o'zgartirmasdan.
    */
   private async getSttLanguage(): Promise<string> {
     try {
@@ -47,9 +58,9 @@ export class TranscriptionService {
       const v = String(row?.value || '').trim().toLowerCase();
       if (v && /^[a-z]{2}$/.test(v)) return v;
     } catch (e: any) {
-      this.logger.warn(`sttLanguage sozlamasi o'qilmadi (standart: uz): ${e.message}`);
+      this.logger.warn(`sttLanguage sozlamasi o'qilmadi (standart: avto-aniqlash): ${e.message}`);
     }
-    return 'uz';
+    return ''; // bo'sh = avto-aniqlash
   }
 
   async getSttProviderSetting(): Promise<{ preferred: SttProvider; groqConfigured: boolean; openaiConfigured: boolean }> {
@@ -176,27 +187,38 @@ export class TranscriptionService {
     // ~9x arzon va aslida sifat jihatdan ham teng/yaxshiroq (Large v3).
     const model = provider === 'groq' ? 'whisper-large-v3-turbo' : 'whisper-1';
 
-    // v22 TUZATISH: eski kod tilni MAJBURIY 'ru' (rus) qilib yuborardi —
-    // izohda "Whisper o'zbek tilini qo'llab-quvvatlamaydi" deyilgan edi,
-    // lekin bu NOTO'G'RI: Whisper large-v3 (demak Groq'ning
-    // whisper-large-v3-turbo'si ham, OpenAI whisper-1 ham) rasman 'uz'
-    // (o'zbek) tilini qo'llab-quvvatlaydi. Tilni 'ru'ga majburlash
-    // natijasida o'zbekcha ovozli xabar RUS FONETIKASI bilan
-    // transkripsiya qilinardi — natija chalkash/noto'g'ri matn bo'lardi,
-    // Jarvis esa shu buzuq matnni o'qib to'g'ri javob berolmasdi va/yoki
-    // o'zi ham chalkash/rus tilida javob qaytarardi.
+    // v22: tilni endi sozlanadigan qilib qo'ydik (standart 'uz'/o'zbek —
+    // avvalgi kodda MAJBURIY 'ru'ga majburlangan edi, bu xato edi).
     //
-    // YECHIM: tilni 'uz'ga o'zgartiramiz. Agar kelajakda aralash
-    // o'zbek-rus nutq muammo qilsa, buni PLATFORM SOZLAMASI
-    // (`platformSetting` — xuddi sttProvider kabi) orqali
-    // sozlanadigan qilish mumkin, lekin standart holat endi TO'G'RI
-    // tilga (o'zbek) mos.
+    // v46 QO'SHIMCHA TUZATISH — "HALLYUSINATSIYA" MUAMMOSI: hatto to'g'ri
+    // til bilan ham, Whisper past sifatli/qisqa/shovqinli audio'da BA'ZAN
+    // umuman aloqasi yo'q matn "to'qib chiqaradi" (mashhur muammo — masalan
+    // "Speaking in Armenian...", "Subtitles by...", "Спасибо за просмотр"
+    // kabi audio bilan bog'liq bo'lmagan jumlalar). Bunday "hallyutsinatsiya"
+    // Jarvisga yuborilsa, u buzuq/aloqasiz matnni jiddiy buyruq deb qabul
+    // qilib, mantiqsiz yoki noto'g'ri tilda javob berardi.
+    //
+    // YECHIM (2 qatlam):
+    //  1) `initial_prompt` — Whisper'ga O'ZBEK TILIDA CRM kontekstini
+    //     (mijoz, tur, booking, taklif kabi so'zlar) "namuna" sifatida
+    //     beramiz — bu modelni to'g'ri til/domenga "og'dirishga" yordam
+    //     beradi va nofaol/shovqinli qismlarda hallyutsinatsiyani kamaytiradi.
+    //  2) `response_format: verbose_json` — har bir segment uchun
+    //     `avg_logprob` (ishonch darajasi) va `no_speech_prob` (nutq
+    //     yo'qligi ehtimoli) qaytaradi. Past ishonch/yuqori no_speech —
+    //     natijani ISHONCHSIZ deb belgilaymiz va Jarvis'ga UMUMAN
+    //     yubormaymiz (foydalanuvchidan qayta urinishni so'raymiz) —
+    //     bu tasodifiy "to'qilgan" matnning oqib ketishining oldini oladi.
     const form = new FormData();
     const blob = new Blob([new Uint8Array(audioBuffer)], { type: 'audio/mpeg' });
     form.append('file', blob, 'recording.mp3');
     form.append('model', model);
-    form.append('language', language);
-    form.append('response_format', 'json');
+    if (language) form.append('language', language); // bo'sh bo'lsa — avto-aniqlash (append qilinmaydi)
+    form.append('response_format', 'verbose_json');
+    // Til-neytral CRM lug'at "namunasi" — Whisper'ni domenga (sayohat/CRM)
+    // yo'naltiradi, ammo bironta tilga majburlamaydi (o'zbekcha va ruscha
+    // atamalar aralash berilgan — qaysi til gapirilsa ham foydali).
+    form.append('prompt', "Mijoz, tur, booking, taklif, narx, mehmonxona, Antalya. Клиент, тур, бронь, цена, отель.");
 
     try {
       const res = await fetch(endpoint, {
@@ -220,6 +242,28 @@ export class TranscriptionService {
         // shuning uchun "error" emas, shunchaki bo'sh natija qaytaramiz.
         return { text: null };
       }
+
+      // v46: ISHONCH TEKSHIRUVI — segmentlar past ishonchli/nutqsiz deb
+      // belgilangan bo'lsa, bu ehtimol hallyutsinatsiya — rad etamiz.
+      const segments: any[] = Array.isArray(j?.segments) ? j.segments : [];
+      if (segments.length) {
+        const avgLogprob = segments.reduce((s, seg) => s + (Number(seg.avg_logprob) || 0), 0) / segments.length;
+        const avgNoSpeech = segments.reduce((s, seg) => s + (Number(seg.no_speech_prob) || 0), 0) / segments.length;
+        // Chegaralar Whisper hujjatlarida tavsiya etilgan taxminiy
+        // qiymatlar asosida: avg_logprob < -1 va/yoki no_speech_prob > 0.6
+        // odatda ishonchsiz/bo'sh-shovqinli segmentni bildiradi.
+        if (avgLogprob < -1.0 || avgNoSpeech > 0.6) {
+          this.logger.warn(
+            `${provider}: past ishonchli transkripsiya rad etildi (avgLogprob=${avgLogprob.toFixed(2)}, avgNoSpeech=${avgNoSpeech.toFixed(2)}): "${text.slice(0, 120)}"`,
+          );
+          return {
+            text: null,
+            error: "Ovozli xabar aniq eshitilmadi (shovqin yoki past tovush). Iltimos, jimroq joyda qayta gapirib ko'ring.",
+            transient: true,
+          };
+        }
+      }
+
       return { text };
     } catch (e: any) {
       const msg = `${provider === 'groq' ? 'Groq' : 'OpenAI'} so'rovida tarmoq xatosi: ${e?.message}`;

@@ -74,15 +74,49 @@ const CODE_TTL_SEC = 600; // 10 daqiqa
 const memoryCodes = new Map<string, { userId: string; role: string; expiresAt: number }>();
 
 type TelegramMsg = {
+  message_id?: number | string;
   chat: { id: number | string };
   text?: string;
   from?: { id: number | string; first_name?: string };
 };
 
 type TelegramVoiceMsg = {
+  message_id?: number | string;
   chat: { id: number | string };
   voice?: { file_id: string; file_size?: number; duration?: number };
 };
+
+// v46 TUZATISH: TAKRORLANGAN XABAR MUAMMOSI.
+// SABAB: agar server 2 nusxada ishga tushirilsa (masalan deploy paytida
+// eski jarayon hali to'liq o'chmagan, yoki hosting 2 ta instans/replika
+// bilan ishlaydi) — HAR BIR nusxa BIR XIL bot tokeni bilan `polling: true`
+// rejimida Telegram'dan getUpdates so'rайdi. Bunday holatda Telegram bir
+// xil yangilanishni (update) ikkala jarayonga ham yuborishi mumkin —
+// natijada bitta ovozli xabar UCHUN `handleVoice` IKKI MARTA chaqiriladi
+// (foydalanuvchi "🎙 Eshitdim" xabarini 2 marta ko'radi, ai-assistant
+// so'rovi ham 2 marta ketadi — bekorga xarajat).
+// YECHIM: har bir kiruvchi update'ni (botId+chatId+message_id bo'yicha)
+// QAYTA ISHLASHDAN OLDIN "ko'rilganlar" ro'yxatiga tekshiramiz — agar
+// so'nggi 2 daqiqa ichida xuddi shu message_id allaqachon qayta
+// ishlangan bo'lsa, jim o'tkazib yuboramiz. Bu tub sababni (bir nechta
+// instans) TUZATMAYDI, lekin foydalanuvchiga ta'sirini (takroriy javob,
+// ikki barobar AI xarajati) TO'LIQ yo'q qiladi — va agar tub sabab
+// bitta instans/getUpdates retry bo'lsa ham, bir xil himoya ishlaydi.
+const processedUpdates = new Map<string, number>();
+const DEDUP_TTL_MS = 2 * 60 * 1000;
+function alreadyProcessed(key: string): boolean {
+  const now = Date.now();
+  // vaqti o'tgan yozuvlarni tozalab boramiz (xotira sizmasin)
+  if (processedUpdates.size > 500) {
+    for (const [k, t] of processedUpdates) {
+      if (now - t > DEDUP_TTL_MS) processedUpdates.delete(k);
+    }
+  }
+  const seenAt = processedUpdates.get(key);
+  if (seenAt && now - seenAt < DEDUP_TTL_MS) return true;
+  processedUpdates.set(key, now);
+  return false;
+}
 
 @Injectable()
 export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
@@ -251,6 +285,10 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
     const chatId = String(msg.chat.id);
     const text = String(msg.text || '').trim();
     if (!text) return;
+    if (msg.message_id != null && alreadyProcessed(`${botId}:${chatId}:msg:${msg.message_id}`)) {
+      this.logger.warn(`Takroriy update o'tkazib yuborildi (message_id=${msg.message_id}, tenant=${tenantId})`);
+      return;
+    }
 
     if (text.startsWith('/start')) {
       const parts = text.split(/\s+/);
@@ -323,6 +361,10 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
     const chatId = String(msg.chat.id);
     const voice = msg.voice;
     if (!voice?.file_id) return;
+    if (msg.message_id != null && alreadyProcessed(`${botId}:${chatId}:voice:${msg.message_id}`)) {
+      this.logger.warn(`Takroriy ovozli update o'tkazib yuborildi (message_id=${msg.message_id}, tenant=${tenantId})`);
+      return;
+    }
 
     const link = await this.prisma.jarvisBotLink.findUnique({ where: { botId_chatId: { botId, chatId } } as any }).catch(() => null);
     if (!link || !link.isActive) {
