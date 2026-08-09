@@ -4,9 +4,12 @@ import { Roles } from '../../common/decorators';
 import { verifyMetaSignature, canSkipSignature } from '../../common/utils/meta-signature';
 import {
   Module, Injectable, Controller,
-  Get, Post, Body, Query, Req,
+  Get, Post, Body, Query, Req, Res,
   UseGuards, Logger, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { SkipThrottle } from '@nestjs/throttler';
+import type { Response } from 'express';
+import * as crypto from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser, Public } from '../../common/decorators';
@@ -42,6 +45,50 @@ function getInstagramAppSecret(): string | undefined {
 // Meta Graph API versiyasi — bitta joyda turadi.
 // Eskirsa (masalan v23 -> v25) faqat shu qatorni o'zgartiring.
 const GRAPH_API_VERSION = 'v23.0';
+
+/**
+ * ═══════════════════════════════════════════════════════════════════
+ * INSTAGRAM ORQALI TO'G'RIDAN-TO'G'RI ULANISH ("Instagram Login for
+ * Business" / "Instagram API with Instagram Login").
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Bu — Facebook Page talab qilmaydigan, Meta'ning rasmiy OAuth oqimi.
+ * Admin "Instagram orqali ulash" tugmasini bossa, instagram.com'ning
+ * O'ZIGA (Facebook'ga emas) yo'naltiriladi, u yerda Instagram login/parol
+ * bilan kiradi — login/parol HECH QACHON bizning serverimizga tushmaydi,
+ * faqat Meta bir martalik "code" qaytaradi (standart, xavfsiz OAuth2
+ * Authorization Code oqimi — xuddi "Google orqali kirish" kabi).
+ *
+ * Meta App Dashboard'da: App → Instagram → "API setup with Instagram
+ * login" bo'limida ko'rsatilgan "Instagram app ID" / "Instagram app
+ * secret" AYNAN shular ishlatiladi (Facebook App ID/Secret'dan farqli).
+ * Agar alohida sozlanmagan bo'lsa — quyidagi funksiyalar mavjud
+ * INSTAGRAM_APP_SECRET'ga tushadi (bir xil Meta App ichida ko'p hollarda
+ * ular baribir bir xil bo'ladi).
+ */
+function getInstagramLoginAppId(): string | undefined {
+  return process.env.INSTAGRAM_LOGIN_APP_ID || process.env.INSTAGRAM_APP_ID;
+}
+function getInstagramLoginAppSecret(): string | undefined {
+  return process.env.INSTAGRAM_LOGIN_APP_SECRET || process.env.INSTAGRAM_APP_SECRET;
+}
+
+/**
+ * Qaysi usul bilan ulanganiga qarab Graph API manzili farq qiladi:
+ *  - 'facebook'        → Facebook Page orqali ulangan (eski oqim), token
+ *                         Page Access Token, so'rovlar graph.facebook.com'ga.
+ *  - 'instagram_login' → Instagram orqali to'g'ridan-to'g'ri ulangan
+ *                         (yangi oqim), token IG User Access Token,
+ *                         so'rovlar graph.instagram.com'ga boradi — Meta
+ *                         talabi shunday, aks holda token "invalid" bo'ladi.
+ */
+function igApiHost(authMode?: string | null): string {
+  return authMode === 'instagram_login' ? 'graph.instagram.com' : 'graph.facebook.com';
+}
+
+const IG_OAUTH_STATE_SECRET =
+  process.env.JWT_ACCESS_SECRET || 'dev-only-change-in-production';
+const IG_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
 /**
  * Suhbat "jonli operator" rejimiga o'tganini belgilovchi teg.
@@ -137,6 +184,9 @@ export class InstagramService {
     return {
       accessToken: this.decryptToken(s.instagramAccessToken),
       pageId: s.instagramPageId || null,
+      // 'facebook' (Page orqali) | 'instagram_login' (to'g'ridan-to'g'ri)
+      authMode: s.instagramAuthMode || 'facebook',
+      username: s.instagramUsername || null,
       verifyToken: s.instagramVerifyToken || 'omoncrm_verify',
       botName: s.instagramBotName || 'Travel Bot',
       greetingMessage: s.instagramGreeting || 'Salom! Sizga yordam berishdan mamnunman.',
@@ -179,6 +229,9 @@ export class InstagramService {
       hasAccessToken: !!plain,
       maskedAccessToken: plain ? this.encryption.mask(plain, 6, 4) : null,
       pageId: s.instagramPageId || null,
+      // 'facebook' (Page orqali) | 'instagram_login' (to'g'ridan-to'g'ri Instagram)
+      authMode: s.instagramAuthMode || 'facebook',
+      username: s.instagramUsername || null,
       verifyToken: s.instagramVerifyToken || 'omoncrm_verify',
       botName: s.instagramBotName || 'Travel Bot',
       greetingMessage: s.instagramGreeting || 'Salom! Sizga yordam berishdan mamnunman.',
@@ -214,6 +267,8 @@ export class InstagramService {
   async saveConfig(tenantId: string, data: {
     accessToken?: string;
     pageId?: string;
+    authMode?: 'facebook' | 'instagram_login';
+    instagramUsername?: string;
     verifyToken?: string;
     botName?: string;
     greetingMessage?: string;
@@ -259,6 +314,8 @@ export class InstagramService {
             ? this.encryption.encrypt(String(data.accessToken).trim())
             : cur.instagramAccessToken,
           instagramPageId: data.pageId ?? cur.instagramPageId,
+          instagramAuthMode: data.authMode ?? cur.instagramAuthMode ?? 'facebook',
+          instagramUsername: data.instagramUsername ?? cur.instagramUsername ?? null,
           instagramVerifyToken: data.verifyToken ?? cur.instagramVerifyToken,
           instagramBotName: data.botName ?? cur.instagramBotName,
           instagramGreeting: data.greetingMessage ?? cur.instagramGreeting,
@@ -279,17 +336,27 @@ export class InstagramService {
     // Obuna uchun OCHIQ token kerak (yangi kelgan yoki eskisini ochamiz)
     const accessToken = data.accessToken ?? this.decryptToken(cur.instagramAccessToken);
     const pageId = data.pageId ?? cur.instagramPageId;
+    const authMode = data.authMode ?? cur.instagramAuthMode ?? 'facebook';
     if (accessToken && pageId) {
-      await this.subscribeAppToPage(pageId, accessToken);
+      await this.subscribeAppToPage(pageId, accessToken, authMode);
     }
 
     return this.getConfig(tenantId);
   }
 
-  /** Page/Instagram akkauntini shu Meta ilovamizga webhook uchun obuna qiladi. */
-  private async subscribeAppToPage(pageId: string, accessToken: string) {
+  /**
+   * Page/Instagram akkauntini shu Meta ilovamizga webhook uchun obuna qiladi.
+   *
+   * `authMode` ga qarab to'g'ri Graph API host'i tanlanadi:
+   *  - 'facebook'-da bo'lganidek graph.facebook.com (Page Access Token)
+   *  - 'instagram_login'-da graph.instagram.com (IG User Access Token) —
+   *    Meta talabi shunday, aks holda "Invalid OAuth access token" xatosi
+   *    qaytadi, chunki bu token Facebook Graph'da tanilmaydi.
+   */
+  private async subscribeAppToPage(pageId: string, accessToken: string, authMode?: string) {
     try {
-      const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${pageId}/subscribed_apps` +
+      const host = igApiHost(authMode);
+      const url = `https://${host}/${GRAPH_API_VERSION}/${pageId}/subscribed_apps` +
         `?subscribed_fields=messages,messaging_postbacks` +
         `&access_token=${encodeURIComponent(accessToken)}`;
       const res = await fetch(url, { method: 'POST' });
@@ -301,6 +368,256 @@ export class InstagramService {
       }
     } catch (e: any) {
       this.logger.error('Instagram subscribe_apps error: ' + e.message);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // OAuth — "Instagram orqali to'g'ridan-to'g'ri ulash"
+  // (Instagram Login for Business — Facebook Page shart emas)
+  // ─────────────────────────────────────────────────────────────────
+
+  /** facebook-leads modulidagi bilan bir xil "sozlamalarni yamash" naqshi. */
+  private async patchSettings(tenantId: string, patch: Record<string, any>) {
+    await this.prisma.$transaction(async (tx: any) => {
+      const t = await tx.tenant.findUnique({
+        where: { id: tenantId },
+        select: { settings: true },
+      });
+      const cur: any = t?.settings || {};
+      await tx.tenant.update({
+        where: { id: tenantId },
+        data: { settings: { ...cur, ...patch } },
+      });
+    });
+  }
+
+  private signIgState(payload: Record<string, any>): string {
+    const json = JSON.stringify(payload);
+    const b64 = Buffer.from(json).toString('base64url');
+    const sig = crypto.createHmac('sha256', IG_OAUTH_STATE_SECRET).update(b64).digest('base64url');
+    return `${b64}.${sig}`;
+  }
+
+  private verifyIgState(state: string | undefined): any | null {
+    if (!state) return null;
+    const [b64, sig] = state.split('.');
+    if (!b64 || !sig) return null;
+    const expected = crypto
+      .createHmac('sha256', IG_OAUTH_STATE_SECRET)
+      .update(b64)
+      .digest('base64url');
+    const sigBuf = Buffer.from(sig);
+    const expBuf = Buffer.from(expected);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) return null;
+    try {
+      const payload = JSON.parse(Buffer.from(b64, 'base64url').toString('utf8'));
+      if (!payload?.tenantId || !payload?.ts) return null;
+      if (Date.now() - payload.ts > IG_OAUTH_STATE_TTL_MS) return null;
+      return payload;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * "Instagram orqali ulash" tugmasi bosilganda chaqiriladi. Foydalanuvchini
+   * instagram.com'ning O'ZIGA yo'naltiradigan URL yasaydi — Facebook Login
+   * oynasi UMUMAN ko'rinmaydi, login/parol to'g'ridan-to'g'ri Instagram
+   * sahifasida kiritiladi (bizning serverimiz uni hech qachon ko'rmaydi).
+   */
+  async getOAuthStartUrl(tenantId: string, userId?: string) {
+    const appId = getInstagramLoginAppId();
+    const redirectUri = process.env.INSTAGRAM_LOGIN_REDIRECT_URI;
+    if (!appId || !redirectUri) {
+      throw new BadRequestException(
+        "Serverda INSTAGRAM_LOGIN_APP_ID va INSTAGRAM_LOGIN_REDIRECT_URI env sozlanmagan. " +
+          "Administratorga murojaat qiling.",
+      );
+    }
+
+    const nonce = crypto.randomBytes(16).toString('hex');
+    await this.patchSettings(tenantId, {
+      instagramOAuthNonce: {
+        value: nonce,
+        userId: userId || null,
+        expiresAt: Date.now() + IG_OAUTH_STATE_TTL_MS,
+      },
+    });
+
+    const state = this.signIgState({ tenantId, userId, nonce, ts: Date.now() });
+
+    // Instagram Login for Business uchun talab qilinadigan ruxsatlar:
+    // profil, DM o'qish/yozish va (keyinchalik kerak bo'lsa) izohlarni
+    // boshqarish. `instagram_business_content_publish` shart emas — biz
+    // post joylamaymiz, shuning uchun so'ramaymiz (kamroq ruxsat = admin
+    // uchun oddiyroq tasdiqlash oynasi).
+    const scope = [
+      'instagram_business_basic',
+      'instagram_business_manage_messages',
+      'instagram_business_manage_comments',
+    ].join(',');
+
+    const url =
+      `https://www.instagram.com/oauth/authorize` +
+      `?client_id=${encodeURIComponent(appId)}` +
+      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+      `&state=${encodeURIComponent(state)}` +
+      `&scope=${encodeURIComponent(scope)}` +
+      `&response_type=code`;
+
+    return { nonce, url };
+  }
+
+  async handleOAuthCallback(
+    code: string | undefined,
+    state: string | undefined,
+    oauthError?: string,
+    cookieNonce?: string,
+  ): Promise<string> {
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
+    const redirectBase = `${frontendUrl}/settings?tab=instagram`;
+
+    if (oauthError) {
+      this.logger.warn(`Instagram OAuth: admin rad etdi yoki xato qaytdi: ${oauthError}`);
+      return `${redirectBase}&igLogin=denied`;
+    }
+
+    const payload = this.verifyIgState(state);
+    if (!payload?.tenantId) {
+      this.logger.warn("Instagram OAuth: 'state' yaroqsiz yoki muddati o'tgan");
+      return `${redirectBase}&igLogin=error`;
+    }
+    if (!code) return `${redirectBase}&igLogin=error`;
+
+    // ── CSRF: bir martalik nonce ──
+    {
+      const row = await this.prisma.tenant.findUnique({
+        where: { id: payload.tenantId },
+        select: { settings: true },
+      });
+      const st: any = row?.settings || {};
+      const saved = st.instagramOAuthNonce;
+
+      const baseOk =
+        saved &&
+        typeof saved.value === 'string' &&
+        typeof payload.nonce === 'string' &&
+        saved.value === payload.nonce &&
+        Date.now() <= Number(saved.expiresAt || 0) &&
+        (saved.userId ?? null) === (payload.userId ?? null);
+
+      // Cookie qo'shimcha himoya — majburiy emas (facebook-leads
+      // modulidagi bilan bir xil sabab: turli domenda third-party
+      // cookie bloklanishi mumkin, asosiy himoya imzolangan state).
+      const cookieOk = !cookieNonce || cookieNonce === saved?.value;
+      const nonceOk = baseOk && cookieOk;
+
+      if (saved) {
+        await this.patchSettings(payload.tenantId, { instagramOAuthNonce: null }).catch(
+          swallow('nonce tozalash'),
+        );
+      }
+
+      if (!nonceOk) {
+        this.logger.warn(
+          `Instagram OAuth RAD ETILDI: nonce mos kelmadi yoki allaqachon ishlatilgan (tenant=${payload.tenantId})`,
+        );
+        return `${redirectBase}&igLogin=error`;
+      }
+    }
+
+    const appId = getInstagramLoginAppId();
+    const appSecret = getInstagramLoginAppSecret();
+    const redirectUri = process.env.INSTAGRAM_LOGIN_REDIRECT_URI;
+    if (!appId || !appSecret || !redirectUri) {
+      this.logger.error(
+        'Instagram OAuth: INSTAGRAM_LOGIN_APP_ID/SECRET/REDIRECT_URI env sozlanmagan',
+      );
+      return `${redirectBase}&igLogin=error`;
+    }
+
+    try {
+      // 1) Kod → qisqa muddatli token (Meta talabi: form-urlencoded POST)
+      const form = new URLSearchParams();
+      form.set('client_id', appId);
+      form.set('client_secret', appSecret);
+      form.set('grant_type', 'authorization_code');
+      form.set('redirect_uri', redirectUri);
+      form.set('code', code);
+
+      const tokenRes = await fetch('https://api.instagram.com/oauth/access_token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: form.toString(),
+      });
+      const tokenJson: any = await tokenRes.json().catch(() => ({}));
+      if (!tokenRes.ok || !tokenJson?.access_token) {
+        this.logger.error('Instagram OAuth token xato: ' + JSON.stringify(tokenJson));
+        return `${redirectBase}&igLogin=token_exchange_failed`;
+      }
+      const shortToken: string = tokenJson.access_token;
+      const igUserId: string = String(tokenJson.user_id || '');
+
+      // 2) Qisqa (≈1 soat) → uzoq muddatli (60 kunlik) tokenga almashtirish
+      const longUrl =
+        `https://graph.instagram.com/access_token` +
+        `?grant_type=ig_exchange_token` +
+        `&client_secret=${encodeURIComponent(appSecret)}` +
+        `&access_token=${encodeURIComponent(shortToken)}`;
+      const longRes = await fetch(longUrl);
+      const longJson: any = await longRes.json().catch(() => ({}));
+      if (!longRes.ok || !longJson?.access_token) {
+        this.logger.error(
+          "Instagram OAuth: uzoq muddatli tokenga almashtirish MUVAFFAQIYATSIZ: " +
+            JSON.stringify(longJson),
+        );
+        return `${redirectBase}&igLogin=token_exchange_failed`;
+      }
+      const longToken: string = longJson.access_token;
+
+      // 3) Akkaunt profilini olamiz (username — UI'da ko'rsatish uchun)
+      let username: string | null = null;
+      try {
+        const meRes = await fetch(
+          `https://graph.instagram.com/${GRAPH_API_VERSION}/me` +
+          `?fields=user_id,username,account_type` +
+          `&access_token=${encodeURIComponent(longToken)}`,
+        );
+        const meJson: any = await meRes.json().catch(() => ({}));
+        if (meRes.ok) {
+          username = meJson?.username || null;
+        }
+      } catch {
+        /* profil ixtiyoriy — bo'lmasa ham ulanish davom etadi */
+      }
+
+      if (!igUserId) {
+        this.logger.error('Instagram OAuth: user_id topilmadi');
+        return `${redirectBase}&igLogin=error`;
+      }
+
+      // Bu Instagram akkaunt boshqa tenant'ga ulanmaganini tekshirish
+      // saveConfig ichida (instagramPageId @unique) allaqachon bajariladi.
+      await this.saveConfig(payload.tenantId, {
+        accessToken: longToken,
+        pageId: igUserId,
+        authMode: 'instagram_login',
+        instagramUsername: username || undefined,
+      });
+
+      this.logger.log(
+        `Instagram OAuth: tenant ${payload.tenantId} to'g'ridan-to'g'ri ulandi (@${username || igUserId})`,
+      );
+
+      return `${redirectBase}&igLogin=success${username ? `&igLoginUser=${encodeURIComponent(username)}` : ''}`;
+    } catch (e: any) {
+      if (e instanceof BadRequestException) {
+        // Masalan: shu Instagram akkaunt allaqachon boshqa hisobga ulangan
+        this.logger.warn('Instagram OAuth: ' + e.message);
+        return `${redirectBase}&igLogin=already_connected&igLoginMsg=${encodeURIComponent(e.message)}`;
+      }
+      this.logger.error('Instagram OAuth callback xatosi: ' + e.message);
+      return `${redirectBase}&igLogin=error`;
     }
   }
 
@@ -411,7 +728,7 @@ export class InstagramService {
       await this.switchToHuman(conv);
       await this.deleteSession(tenantId, senderId);
       const note = 'Menejerimiz tez orada javob beradi. Iltimos, biroz kuting.';
-      await this.sendRaw(config.accessToken!, senderId, note);
+      await this.sendRaw(config.accessToken!, senderId, note, config.authMode);
       await this.saveOutbound(conv, note, null);
       if (conv.assignedAgentId) {
         await this.notifications.create({
@@ -451,7 +768,7 @@ export class InstagramService {
       const steps = config.botSteps || [];
       const firstQ = steps.length > 0 ? String.fromCharCode(10) + steps[0].question : '';
       const greet = config.greetingMessage + firstQ;
-      await this.reply(config.accessToken!, senderId, greet);
+      await this.reply(config.accessToken!, senderId, greet, config.authMode);
       await this.saveOutbound(conv, greet, null);
       session.stepIndex = 0;
       await this.saveSession(tenantId, senderId, session);
@@ -501,7 +818,7 @@ export class InstagramService {
     }
 
     if (next) {
-      await this.reply(config.accessToken!, senderId, next);
+      await this.reply(config.accessToken!, senderId, next, config.authMode);
       await this.saveOutbound(conv, next, null);
     }
 
@@ -549,7 +866,7 @@ export class InstagramService {
       : '\n\nMenejerimiz tez orada siz bilan bog\'lanadi.';
     const text = (aiReplyText ? aiReplyText.trim() : 'Kechirasiz, bu savolga aniq javob bera olmayapman.') + phoneLine;
 
-    await this.sendRaw(config.accessToken!, senderId, text);
+    await this.sendRaw(config.accessToken!, senderId, text, config.authMode);
     await this.saveOutbound(conv, text, null);
     await this.switchToHuman(conv);
     await this.deleteSession(tenantId, senderId);
@@ -679,7 +996,7 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech narsa yozma (izoh, mar
     }
 
     if (!replyText) return;
-    await this.sendRaw(config.accessToken, senderId, replyText);
+    await this.sendRaw(config.accessToken, senderId, replyText, config.authMode);
     await this.saveOutbound(conv, replyText, null);
   }
 
@@ -688,10 +1005,10 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech narsa yozma (izoh, mar
   // ═══════════════════════════════════════════════════════════
 
   /** Instagram foydalanuvchi profilini oladi (ism, rasm). Xato bo'lsa — jim. */
-  private async fetchIgProfile(accessToken: string, igsid: string) {
+  private async fetchIgProfile(accessToken: string, igsid: string, authMode?: string) {
     try {
       const res = await fetch(
-        `https://graph.facebook.com/${GRAPH_API_VERSION}/${igsid}` +
+        `https://${igApiHost(authMode)}/${GRAPH_API_VERSION}/${igsid}` +
         `?fields=name,profile_pic&access_token=${encodeURIComponent(accessToken)}`,
       );
       if (!res.ok) return null;
@@ -721,7 +1038,7 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech narsa yozma (izoh, mar
 
     // Profil ma'lumoti (ism/rasm) — bo'lmasa ham suhbat yaratiladi
     const profile = config.accessToken
-      ? await this.fetchIgProfile(config.accessToken, igsid)
+      ? await this.fetchIgProfile(config.accessToken, igsid, config.authMode)
       : null;
 
     // Agar shu IGSID bilan mijoz allaqachon bor bo'lsa — o'sha agentga
@@ -885,7 +1202,7 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech narsa yozma (izoh, mar
     await this.switchToHuman(conv);
     await this.deleteSession(tenantId, conv.externalChatId);
 
-    const ok = await this.sendRaw(config.accessToken, conv.externalChatId, text);
+    const ok = await this.sendRaw(config.accessToken, conv.externalChatId, text, config.authMode);
     if (!ok.success) {
       throw new BadRequestException(`Instagram'ga yuborilmadi: ${ok.error}`);
     }
@@ -894,9 +1211,9 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech narsa yozma (izoh, mar
   }
 
   /** Xom yuborish — natijani qaytaradi (xatoni yutmaydi). */
-  private async sendRaw(accessToken: string, recipientId: string, text: string) {
+  private async sendRaw(accessToken: string, recipientId: string, text: string, authMode?: string) {
     try {
-      const res = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/me/messages`, {
+      const res = await fetch(`https://${igApiHost(authMode)}/${GRAPH_API_VERSION}/me/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + accessToken },
         body: JSON.stringify({
@@ -979,10 +1296,10 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech narsa yozma (izoh, mar
     return client;
   }
 
-  private async reply(accessToken: string, recipientId: string, text: string) {
+  private async reply(accessToken: string, recipientId: string, text: string, authMode?: string) {
     if (!accessToken) { this.logger.warn('Instagram: no accessToken'); return; }
     try {
-      const res = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/me/messages`, {
+      const res = await fetch(`https://${igApiHost(authMode)}/${GRAPH_API_VERSION}/me/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + accessToken },
         body: JSON.stringify({ recipient: { id: recipientId }, message: { text }, messaging_type: 'RESPONSE' }),
@@ -1118,6 +1435,53 @@ export class InstagramController {
   @UseGuards(JwtAuthGuard)
   stats(@CurrentUser() u: any) {
     return this.svc.getStats(u.tenantId);
+  }
+
+  // ── OAuth: "Instagram orqali to'g'ridan-to'g'ri ulash" ──────────────
+  // Facebook Page shart emas — Meta'ning "Instagram Login for Business"
+  // oqimi. Login/parol faqat instagram.com'ning o'zida kiritiladi.
+
+  @ApiOperation({ summary: 'Instagram Login URL olish (to\'g\'ridan-to\'g\'ri ulanish)' })
+  @ApiBearerAuth('JWT')
+  @Get('oauth/start-url')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('TENANT_ADMIN')
+  async getOAuthStartUrl(
+    @CurrentUser() u: any,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const result: any = await this.svc.getOAuthStartUrl(u.tenantId, u.sub);
+
+    // Cookie qo'shimcha himoya sifatida — brauzer bloklasa ham (Safari
+    // ITP / third-party cookie) oqim baribir ishlaydi, asosiy himoya
+    // imzolangan `state` + serverdagi bir martalik nonce.
+    if (result?.nonce) {
+      res.cookie('ig_oauth_nonce', result.nonce, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+        maxAge: 10 * 60 * 1000,
+        path: '/api/v1/instagram',
+      });
+      delete result.nonce;
+    }
+    return result;
+  }
+
+  @Get('oauth/callback')
+  @Public()
+  @SkipThrottle()
+  async oauthCallback(
+    @Query('code') code: string,
+    @Query('state') state: string,
+    @Query('error') error: string,
+    @Req() req: any,
+    @Res() res: Response,
+  ) {
+    const cookieNonce = req.cookies?.ig_oauth_nonce;
+    res.clearCookie('ig_oauth_nonce', { path: '/api/v1/instagram' });
+    const redirectTo = await this.svc.handleOAuthCallback(code, state, error, cookieNonce);
+    return res.redirect(redirectTo);
   }
 }
 

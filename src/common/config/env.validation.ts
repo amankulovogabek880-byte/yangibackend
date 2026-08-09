@@ -37,6 +37,15 @@ const config: EnvConfig = {
     FACEBOOK_OAUTH_REDIRECT_URI: '(https://api.domen.uz/api/v1/facebook-leads/oauth/callback)',
     INSTAGRAM_APP_SECRET: '(Instagram DM uchun)',
     META_SINGLE_APP: 'false',
+    // ── Instagram orqali TO'G'RIDAN-TO'G'RI ulanish (Facebook Page shart emas) ──
+    // Meta App Dashboard → App → Instagram → "API setup with Instagram login"
+    // bo'limida ko'rsatilgan qiymatlar. Agar bo'sh qoldirilsa, tizim
+    // INSTAGRAM_APP_ID / INSTAGRAM_APP_SECRET'ga qaytadi (bir xil Meta App
+    // ichida ular ko'pincha bir xil bo'ladi).
+    INSTAGRAM_LOGIN_APP_ID: "(Instagram to'g'ridan-to'g'ri ulanish uchun)",
+    INSTAGRAM_LOGIN_APP_SECRET: "(bo'sh bo'lsa INSTAGRAM_APP_SECRET ishlatiladi)",
+    INSTAGRAM_LOGIN_REDIRECT_URI:
+      '(https://api.domen.uz/api/v1/instagram/oauth/callback)',
     LEAD_SLA_MINUTES: '15',
   },
 };
@@ -144,6 +153,18 @@ export function validateEnv(): void {
   if (!igSecret && !(singleApp && fbSecret)) {
     warnings.push(
       "INSTAGRAM_APP_SECRET sozlanmagan — Instagram webhook'lari RAD ETILADI. DM'lar CRM'ga tushmaydi.",
+    );
+  }
+
+  // Instagram orqali TO'G'RIDAN-TO'G'RI ulanish ("Instagram Login for
+  // Business") — Facebook Page talab qilmaydigan alohida oqim. App ID
+  // bo'lsa demak admin shu tugmani ko'radi, shuning uchun redirect URI
+  // ham sozlanganini tekshiramiz.
+  const igLoginAppId = process.env.INSTAGRAM_LOGIN_APP_ID || process.env.INSTAGRAM_APP_ID;
+  if (igLoginAppId && !process.env.INSTAGRAM_LOGIN_REDIRECT_URI) {
+    warnings.push(
+      "INSTAGRAM_LOGIN_REDIRECT_URI sozlanmagan — 'Instagram orqali ulash' " +
+        "(to'g'ridan-to'g'ri) tugmasi ishlamaydi.",
     );
   }
 
