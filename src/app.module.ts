@@ -45,6 +45,7 @@ import { ReportsModule } from './modules/reports/reports.module';
 import { OwnerModule } from './modules/owner/owner.module';
 import { FollowUpsModule } from './modules/followups/followups.module';
 import { TasksModule } from './modules/tasks/tasks.module';
+import { MeetingsModule } from './modules/meetings/meetings.module';
 import { LeadsModule } from './modules/leads/leads.module';
 import { CallsModule } from './modules/calls/calls.module';
 import { KpiModule } from './modules/kpi/kpi.module';
@@ -131,6 +132,7 @@ import { JarvisBotModule } from './modules/jarvis-bot/jarvis-bot.module';
     OwnerModule,
     FollowUpsModule,
     TasksModule,
+    MeetingsModule,
     LeadsModule,
     CallsModule,
     KpiModule,

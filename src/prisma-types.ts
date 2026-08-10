@@ -226,6 +226,21 @@ export const TaskStatus = {
 } as const;
 export type TaskStatus = (typeof TaskStatus)[keyof typeof TaskStatus];
 
+export const MeetingType = {
+  MEETING: 'MEETING' as const,
+  CALL: 'CALL' as const,
+  VISIT: 'VISIT' as const,
+  OTHER: 'OTHER' as const,
+} as const;
+export type MeetingType = (typeof MeetingType)[keyof typeof MeetingType];
+
+export const MeetingStatus = {
+  SCHEDULED: 'SCHEDULED' as const,
+  DONE: 'DONE' as const,
+  CANCELLED: 'CANCELLED' as const,
+} as const;
+export type MeetingStatus = (typeof MeetingStatus)[keyof typeof MeetingStatus];
+
 export const NotificationType = {
   LEAD_ASSIGNED: 'LEAD_ASSIGNED' as const,
   LEAD_NEW: 'LEAD_NEW' as const,
@@ -251,6 +266,8 @@ export const NotificationType = {
   APPROVAL_APPROVED: 'APPROVAL_APPROVED' as const,
   APPROVAL_REJECTED: 'APPROVAL_REJECTED' as const,
   CLIENT_ASSIGNED: 'CLIENT_ASSIGNED' as const,
+  MEETING_ASSIGNED: 'MEETING_ASSIGNED' as const,
+  MEETING_REMINDER: 'MEETING_REMINDER' as const,
 } as const;
 export type NotificationType = (typeof NotificationType)[keyof typeof NotificationType];
 
@@ -501,6 +518,11 @@ export namespace Prisma {
   export type FollowUpCreateInput = any;
   export type FollowUpUpdateInput = any;
   export type FollowUpOrderByWithRelationInput = any;
+  export type MeetingWhereInput = any;
+  export type MeetingWhereUniqueInput = any;
+  export type MeetingCreateInput = any;
+  export type MeetingUpdateInput = any;
+  export type MeetingOrderByWithRelationInput = any;
   export type DocumentWhereInput = any;
   export type DocumentWhereUniqueInput = any;
   export type DocumentCreateInput = any;

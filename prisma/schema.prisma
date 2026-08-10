@@ -245,6 +245,9 @@ enum NotificationType {
   APPROVAL_APPROVED
   APPROVAL_REJECTED
   CLIENT_ASSIGNED
+  // ─── v47: Kalendar / Uchrashuvlar ───
+  MEETING_ASSIGNED
+  MEETING_REMINDER
 }
 
 enum NotificationChannel {
@@ -401,6 +404,7 @@ model Tenant {
   apiKeys       ApiKey[]
   webhookLogs   WebhookLog[]
   followUps     FollowUp[]
+  meetings      Meeting[]
   notifications Notification[]
   calls         Call[]
   kpis          Kpi[]
@@ -493,6 +497,7 @@ model User {
   messages        Message[]
   sessions        UserSession[]
   followUps       FollowUp[]
+  meetings        Meeting[]
   notifications   Notification[]
   calls           Call[]            @relation("CallAgent")
   tasks           Task[]            @relation("TaskAssignee")
@@ -669,6 +674,7 @@ model Client {
   conversations Conversation[]
   timeline      ClientTimeline[]
   followUps     FollowUp[]
+  meetings      Meeting[]
   calls         Call[]
   tasks         Task[]
   documents     Document[]
@@ -1258,6 +1264,55 @@ model FollowUp {
   @@index([tenantId, agentId, done])
   @@index([dueAt, done, notifiedAt])
   @@map("followups")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// v47: KALENDAR / UCHRASHUVLAR — AMO/Bitrix uslubidagi kalendar.
+// Har bir yozuv — bitta agentga (va ixtiyoriy bitta mijozga) bog'langan
+// uchrashuv/qo'ng'iroq/tashrif. Belgilangan vaqtdan `reminderMinutesBefore`
+// daqiqa oldin agentga avtomatik eslatma (notification) yuboriladi.
+// ═══════════════════════════════════════════════════════════════
+
+enum MeetingType {
+  MEETING // Uchrashuv
+  CALL    // Qo'ng'iroq
+  VISIT   // Tashrif
+  OTHER   // Boshqa
+}
+
+enum MeetingStatus {
+  SCHEDULED
+  DONE
+  CANCELLED
+}
+
+model Meeting {
+  id          String        @id @default(cuid())
+  tenantId    String
+  tenant      Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agentId     String
+  agent       User          @relation(fields: [agentId], references: [id])
+  createdById String
+  clientId    String?
+  client      Client?       @relation(fields: [clientId], references: [id])
+
+  title       String
+  type        MeetingType   @default(MEETING)
+  status      MeetingStatus @default(SCHEDULED)
+  startAt     DateTime
+  endAt       DateTime?
+  location    String?
+  note        String?       @db.Text
+
+  reminderMinutesBefore Int  @default(30)
+  remindedAt  DateTime?
+
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([tenantId, agentId, startAt])
+  @@index([startAt, status, remindedAt])
+  @@map("meetings")
 }
 
 // ═══════════════════════════════════════════════════════════════
