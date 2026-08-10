@@ -7,6 +7,7 @@ import { RedisClientModule } from './common/cache/redis-client.module';
 import { REDIS_CLIENT } from './common/cache/cache.constants';
 import { RedisThrottlerStorage } from './common/guards/redis-throttler.storage';
 import { CronLockModule } from './common/utils/cron-lock.module';
+import { PollLockModule } from './common/utils/poll-lock.module';
 import { TenantContextMiddleware } from './common/tenant/tenant-context.middleware';
 import { TenantContextInterceptor } from './common/tenant/tenant-context.interceptor';
 import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
@@ -103,6 +104,7 @@ import { JarvisBotModule } from './modules/jarvis-bot/jarvis-bot.module';
 
     // v12.7: cron ishlarini bir nechta instansda takrorlanmasligi uchun
     CronLockModule,
+    PollLockModule,
 
     // Global - tartib muhim (Encryption -> Email -> Realtime -> Notifications)
     EncryptionModule,

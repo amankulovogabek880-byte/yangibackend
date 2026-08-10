@@ -801,7 +801,19 @@ export class InstagramService {
         }
         continue;
       }
-      for (const event of (entry?.messaging || [])) {
+      // v18: mos tenant TOPILGANDA ham bir marta LOG qoldiramiz. Ilgari
+      // faqat "topilmadi" holati log qilinardi — shuning uchun Render
+      // loglarida "pageId=X uchun tenant topilmadi" ko'p uchrasa ham,
+      // bu X o'zining sozlangan Page ID'siga TEGISHLI ekanini yoki
+      // umuman BOSHQA (tekshirilmagan/eski) Page'ga tegishli ekanini
+      // ajratib bo'lmasdi. Endi muvaffaqiyatli moslashuv ham ko'rinadi —
+      // shu bilan "webhook umuman kelmayaptimi" va "kelyapti-yu, lekin
+      // pageId mos kelmayaptimi" ikkalasini loglardan aniq ajratish mumkin.
+      const messagingEvents = entry?.messaging || [];
+      this.logger.log(
+        `Instagram webhook: pageId=${pageId} → tenant=${tenantId} topildi (${messagingEvents.length} ta hodisa)`,
+      );
+      for (const event of messagingEvents) {
         if (event?.message && !event.message.is_echo) {
           await this.handleMessage(tenantId, event).catch((e: any) =>
             this.logger.error('Instagram msg error: ' + e.message)

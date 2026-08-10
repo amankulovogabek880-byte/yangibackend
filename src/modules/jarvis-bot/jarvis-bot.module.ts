@@ -16,6 +16,7 @@ import { CurrentUser, Roles } from '../../common/decorators';
 import { REDIS_CLIENT } from '../../common/cache/cache.constants';
 import { RedisClientModule } from '../../common/cache/redis-client.module';
 import { CronLockService } from '../../common/utils/cron-lock.service';
+import { PollLockService } from '../../common/utils/poll-lock.service';
 import { AiAssistantModule, AiAssistantService } from '../ai-assistant/ai-assistant.module';
 import { BriefingModule, BriefingService } from '../briefing/briefing.module';
 // v42: Jarvis'ga OVOZLI XABAR yuborilsa — qo'ng'iroq yozuvlarini matnga
@@ -131,6 +132,8 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
   // boshlanardi (haqiqiy backoff yo'q edi). Endi tenantId bo'yicha klassda
   // saqlanadi.
   private conflictState = new Map<string, { count: number; lastAt: number }>();
+  // v46 FIX (poll lock): qulf band bo'lgani haqidagi ogohlantirishni throttle qilamiz
+  private lockWaitWarned = new Map<string, number>();
 
   constructor(
     private prisma: PrismaService,
@@ -138,6 +141,8 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
     private briefing: BriefingService,
     private cronLock: CronLockService,
     private transcription: TranscriptionService,
+    // v46 FIX: bir nechta instans bir xil tokenni pollamasin (409 loop tub sababi)
+    private pollLock: PollLockService,
     @Optional() @Inject(REDIS_CLIENT) private readonly redis: Redis | null = null,
   ) {}
 
@@ -161,6 +166,7 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
         await bot.stopPolling();
         this.logger.log(`Jarvis bot to'xtatildi: ${tenantId}`);
       } catch {}
+      await this.pollLock.release(`jarvis-bot:${tenantId}`).catch(() => {});
     }
     this.bots.clear();
   }
@@ -173,6 +179,30 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
       try { await existing.stopPolling(); } catch {}
       this.bots.delete(tenantId);
     }
+
+    // v46 TUZATISH (tub sabab): ilgari faqat DEDUP (processedUpdates) bilan
+    // takroriy xabarning TA'SIRI yashirilardi, lekin 2+ instans BARIBIR bir
+    // xil tokenni pollashda davom etardi — shuning uchun loglarda 409
+    // Conflict cheksiz takrorlanardi (30+ urinish). Endi qulf orqali FAQAT
+    // BITTA instans haqiqiy pollingni boshlaydi; qolganlari band bo'lgan
+    // qulfni davriy tekshirib turadi.
+    const lockName = `jarvis-bot:${tenantId}`;
+    const gotLock = await this.pollLock.acquire(lockName, 30);
+    if (!gotLock) {
+      const now = Date.now();
+      const lastWarned = this.lockWaitWarned.get(tenantId) || 0;
+      if (now - lastWarned > 5 * 60 * 1000) {
+        this.lockWaitWarned.set(tenantId, now);
+        this.logger.log(`Jarvis bot ${tenantId}: boshqa instansda allaqachon ishlamoqda — kutilmoqda`);
+      }
+      setTimeout(() => {
+        this.startBot(tenantId, botId, token).catch((e) =>
+          this.logger.error(`Jarvis bot start (qulf kutish) xato [${tenantId}]: ${e.message}`),
+        );
+      }, 20000);
+      return;
+    }
+
     try {
       const tempBot = new TelegramBot(token, { polling: false });
       await tempBot.deleteWebhook({ drop_pending_updates: true });
@@ -232,6 +262,7 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
     }
     this.botIds.delete(tenantId);
     this.conflictState.delete(tenantId);
+    await this.pollLock.release(`jarvis-bot:${tenantId}`).catch(() => {});
   }
 
   // ─── ULASH KODI (CRM ichida generatsiya qilinadi) ──────────────

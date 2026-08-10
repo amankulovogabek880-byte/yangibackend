@@ -18,11 +18,15 @@ import { normalizeChatId } from './chat-id.util';
 import { uploadBufferToStorage } from '../../common/utils/media-storage';
 import { EncryptionService } from '../../common/encryption/encryption.service';
 import { UserTelegramModule, UserTelegramService } from './user-telegram.module';
+import { PollLockService } from '../../common/utils/poll-lock.service';
 
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger('Telegram');
   private bots = new Map<string, TelegramBot>();
+  // v18: qulf band bo'lgani haqidagi ogohlantirishni throttle qilamiz
+  // (aks holda har 20s'da bir marta log to'lib ketardi)
+  private lockWaitWarned = new Map<string, number>();
   // v17 FIX: ilgari `lastErrorTime`/`retryCount` startBot() ICHIDA `let`
   // sifatida e'lon qilingandi — har safar 409 tufayli qayta ishga
   // tushirilganda YANGI yopiq o'zgaruvchilar (closure) yaratilib, HAR DOIM
@@ -50,6 +54,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     private userTelegram: UserTelegramService,
     // v12.2: Instagram suhbatiga Chat'dan javob yuborish uchun
     private instagram: InstagramService,
+    // v18: bir nechta instans bir xil tokenni pollamasin (409 loop fix)
+    private pollLock: PollLockService,
   ) {}
 
   async onModuleInit() {
@@ -75,6 +81,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         await bot.stopPolling();
         this.logger.log(`Bot stopped on shutdown: ${id}`);
       } catch {}
+      await this.pollLock.release(`telegram-bot:${id}`).catch(() => {});
     }
     this.bots.clear();
   }
@@ -85,6 +92,29 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       try { await existing.stopPolling(); } catch {}
       this.bots.delete(accountId);
     }
+
+    // v18 FIX: bir nechta instans/replika bir xil tokenni bir vaqtda
+    // pollashi 409 Conflict'ga va cheksiz restart tsikliga olib kelardi
+    // (loglarda ko'rilgan holat — 27, 28, 29... urinish). Endi FAQAT
+    // qulfni ushlab turgan instans haqiqiy pollingni boshlaydi; qolganlari
+    // hech qanday TelegramBot yaratmasdan, qulf bo'shashini kutadi.
+    const lockName = `telegram-bot:${accountId}`;
+    const gotLock = await this.pollLock.acquire(lockName, 30);
+    if (!gotLock) {
+      const now = Date.now();
+      const lastWarned = this.lockWaitWarned.get(accountId) || 0;
+      if (now - lastWarned > 5 * 60 * 1000) {
+        this.lockWaitWarned.set(accountId, now);
+        this.logger.log(`Bot ${accountId}: boshqa instansda allaqachon ishlamoqda — kutilmoqda`);
+      }
+      setTimeout(() => {
+        this.startBot(accountId, tenantId, token).catch((e) =>
+          this.logger.error(`Bot start (qulf kutish) xato [${accountId}]: ${e.message}`),
+        );
+      }, 20000);
+      return;
+    }
+
     // Webhookni o'chirish — polling bilan conflict bo'lmasin
     try {
       const tempBot = new TelegramBot(token, { polling: false });
@@ -1547,6 +1577,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       try { await bot.stopPolling(); } catch {}
       this.bots.delete(accountId);
     }
+    // v18: bot uzilganda qulfni ham bo'shatamiz — aks holda shu accountId
+    // uchun qulf 30s TTL tugagunga qadar band bo'lib turadi.
+    await this.pollLock.release(`telegram-bot:${accountId}`).catch(() => {});
     return this.prisma.telegramAccount.update({
       where: { id: accountId },
       data: { isActive: false },
