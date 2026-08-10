@@ -125,6 +125,12 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
   private bots = new Map<string, TelegramBot>();
   // tenantId → JarvisBot.id (tezkor qidiruv uchun)
   private botIds = new Map<string, string>();
+  // v46 FIX: telegram.module.ts'dagi bilan bir xil bag — bu yerda ham
+  // `lastErrorTime` startBot() ICHIDA local `let` edi, shuning uchun har
+  // 409-qayta-ishga-tushirishda yo'qolib, HAR DOIM 15s'dan qayta
+  // boshlanardi (haqiqiy backoff yo'q edi). Endi tenantId bo'yicha klassda
+  // saqlanadi.
+  private conflictState = new Map<string, { count: number; lastAt: number }>();
 
   constructor(
     private prisma: PrismaService,
@@ -199,8 +205,14 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
       if (now - lastErrorTime < 60000) return;
       lastErrorTime = now;
       if (msg.includes('409') || msg.includes('Conflict')) {
-        this.logger.warn(`Jarvis bot ${tenantId}: 409 Conflict — 15s dan keyin restart`);
-        setTimeout(() => { this.startBot(tenantId, botId, token).catch(() => {}); }, 15000);
+        // v46 FIX: haqiqiy o'sib boruvchi backoff (15s → 30s → ... → 120s),
+        // holat tenantId bo'yicha klassda saqlanadi (restart'da yo'qolmaydi).
+        const prev = this.conflictState.get(tenantId);
+        const count = prev && now - prev.lastAt < 5 * 60 * 1000 ? prev.count + 1 : 1;
+        this.conflictState.set(tenantId, { count, lastAt: now });
+        const delay = Math.min(15000 * count, 120000);
+        this.logger.warn(`Jarvis bot ${tenantId}: 409 Conflict (${count}-urinish) — ${delay/1000}s dan keyin restart`);
+        setTimeout(() => { this.startBot(tenantId, botId, token).catch(() => {}); }, delay);
       } else if (msg.includes('ENOTFOUND') || msg.includes('ECONNREFUSED') || msg.includes('ETIMEDOUT')) {
         setTimeout(() => { this.startBot(tenantId, botId, token).catch(() => {}); }, 60000);
       } else {
@@ -219,6 +231,7 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
       this.bots.delete(tenantId);
     }
     this.botIds.delete(tenantId);
+    this.conflictState.delete(tenantId);
   }
 
   // ─── ULASH KODI (CRM ichida generatsiya qilinadi) ──────────────

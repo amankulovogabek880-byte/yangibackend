@@ -27,6 +27,26 @@ async function bootstrap() {
     // Instagram/Meta webhook imzosini (X-Hub-Signature-256) tekshirish uchun zarur.
     rawBody: true,
   });
+  // ─────────────────────────────────────────────────────────────
+  // v17 MUHIM TUZATISH: `enableShutdownHooks()` CHAQIRILMAGANDI.
+  //
+  // Standart holatda NestJS OS signallarini (SIGTERM/SIGINT) UMUMAN
+  // tinglamaydi — shuning uchun Render har bir deploy'da eski jarayonga
+  // SIGTERM yuborganda, `onModuleDestroy()` (Telegram bot'larni
+  // `stopPolling()` qilish, MTProto sessiyalarini yopish) HECH QACHON
+  // ishga tushmasdi. Natijada eski jarayon Telegram bilan getUpdates
+  // ulanishini OCHIQ qoldirib "yiqilardi", yangi jarayon esa xuddi shu
+  // bot tokeni bilan darhol pollingni boshlar edi — ikkalasi bir necha
+  // o'nlab soniya bir vaqtda ishlab, Telegram tarafidan "409 Conflict"
+  // qaytarardi (loglarda ko'rilgan uzluksiz konflikt/qayta-urinish
+  // tsiklining asosiy sababi aynan shu edi, RAM va CPU sarfini oshirardi).
+  //
+  // Endi: `enableShutdownHooks()` yoqilgan — SIGTERM kelganda Nest avval
+  // barcha modullarning `onModuleDestroy()`sini kutib bo'ladi (bot'lar
+  // to'xtaydi, MTProto uzuladi), SHUNDAN KEYIN jarayon chiqadi. Bu deploy
+  // paytidagi eski/yangi jarayon bir-biriga zid kelishini deyarli
+  // yo'qqa chiqaradi.
+  app.enableShutdownHooks();
   const config = app.get(ConfigService);
   const port = config.get<number>('PORT', 3000);
 

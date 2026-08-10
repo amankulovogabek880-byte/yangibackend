@@ -179,6 +179,17 @@ interface BotSession {
 // Sessions stored in Tenant.settings as instagramSessions JSON
 const botSessionsCache = new Map<string, BotSession>(); // local cache for speed
 
+// v17: "pageId uchun tenant topilmadi" ogohlantirishini throttle qilamiz.
+// Ilgari HAR bir webhook uchun alohida log yozilardi — agar noma'lum
+// pageId'ga (masalan boshqa firmaning shu umumiy Meta App orqali ulangan,
+// lekin bu CRM'da ro'yxatdan o'tmagan akkaunti) tez-tez xabar kelsa, log
+// soniyasiga bir necha marta o'sha bir xil qatorni takrorlab, disk/log
+// hajmini keraksiz to'ldirardi. Endi har bir pageId uchun 10 daqiqada
+// FAQAT bir marta yoziladi — xatti-harakat o'zgarmaydi (baribir `continue`
+// qilinadi), faqat log shovqini kamayadi.
+const unknownPageIdWarned = new Map<string, number>();
+const UNKNOWN_PAGE_WARN_TTL_MS = 10 * 60 * 1000;
+
 @Injectable()
 export class InstagramService {
   private readonly logger = new Logger('Instagram');
@@ -776,7 +787,18 @@ export class InstagramService {
       const pageId: string = entry?.id;
       const tenantId = await this.findTenantByPageId(pageId);
       if (!tenantId) {
-        this.logger.warn('Instagram webhook: pageId=' + pageId + ' uchun tenant topilmadi (Sozlamalarda Page ID ni tekshiring)');
+        const now = Date.now();
+        const lastWarned = unknownPageIdWarned.get(pageId) || 0;
+        if (now - lastWarned > UNKNOWN_PAGE_WARN_TTL_MS) {
+          unknownPageIdWarned.set(pageId, now);
+          this.logger.warn('Instagram webhook: pageId=' + pageId + ' uchun tenant topilmadi (Sozlamalarda Page ID ni tekshiring)');
+          // Xotira sizmasin uchun eskirgan yozuvlarni vaqti-vaqti bilan tozalaymiz.
+          if (unknownPageIdWarned.size > 500) {
+            for (const [k, t] of unknownPageIdWarned) {
+              if (now - t > UNKNOWN_PAGE_WARN_TTL_MS) unknownPageIdWarned.delete(k);
+            }
+          }
+        }
         continue;
       }
       for (const event of (entry?.messaging || [])) {

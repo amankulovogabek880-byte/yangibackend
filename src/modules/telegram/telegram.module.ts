@@ -23,6 +23,21 @@ import { UserTelegramModule, UserTelegramService } from './user-telegram.module'
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger('Telegram');
   private bots = new Map<string, TelegramBot>();
+  // v17 FIX: ilgari `lastErrorTime`/`retryCount` startBot() ICHIDA `let`
+  // sifatida e'lon qilingandi — har safar 409 tufayli qayta ishga
+  // tushirilganda YANGI yopiq o'zgaruvchilar (closure) yaratilib, HAR DOIM
+  // 0'dan boshlanardi. Natijada:
+  //   1) "bir xil xatoni 60s'da bir marta log qilish" himoyasi ishlamasdi
+  //      (har yangi closure'da lastErrorTime yana 0),
+  //   2) backoff (15s → 30s → ... → 120s) HECH QACHON o'smasdi — har doim
+  //      qayta 15s'dan boshlanardi.
+  // Bu ikkalasi birgalikda, agar konflikt haqiqatan davom etsa (masalan
+  // Render'da eski/yangi deploy jarayoni bir vaqtda ishlab qolsa), botni
+  // deyarli uzluksiz — soniyada bir necha marta — qayta ishga tushirib,
+  // CPU/RAM sarflardi (aynan loglarda ko'rilgan holat). Endi bu holat
+  // klass darajasida, accountId bo'yicha SAQLANADI — restart bo'lsa ham
+  // yo'qolmaydi, shu bilan backoff haqiqatan ishlaydi.
+  private conflictState = new Map<string, { count: number; lastAt: number }>();
 
   constructor(
     private prisma: PrismaService,
@@ -107,7 +122,6 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       ),
     );
     let lastErrorTime = 0;
-    let retryCount = 0;
 
     bot.on('polling_error', (e: any) => {
       const msg = e?.message || String(e);
@@ -124,15 +138,23 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           try { await this.startBot(accountId, tenantId, token); } catch {}
         }, 60000);
       } else if (msg.includes('409') || msg.includes('Conflict')) {
-        retryCount++;
-        const delay = Math.min(15000 * retryCount, 120000); // max 2 daqiqa
-        this.logger.warn(`Bot ${accountId}: 409 Conflict — ${delay/1000}s dan keyin restart`);
+        // v17 FIX: holat (count/lastAt) endi accountId bo'yicha klassda
+        // saqlanadi — startBot() qayta chaqirilganda YO'QOLMAYDI, shu
+        // bilan backoff haqiqatan 15s → 30s → ... → 120s bo'lib o'sadi.
+        // Agar oxirgi konfliktdan beri 5 daqiqadan ko'proq vaqt o'tgan
+        // bo'lsa — bu YANGI muammo deb hisoblanadi va hisoblagich 1'dan
+        // qayta boshlanadi (eski, allaqachon tuzalgan muammo tufayli
+        // keyingi urinish keraksiz uzoq kutmasin uchun).
+        const prev = this.conflictState.get(accountId);
+        const count = prev && now - prev.lastAt < 5 * 60 * 1000 ? prev.count + 1 : 1;
+        this.conflictState.set(accountId, { count, lastAt: now });
+        const delay = Math.min(15000 * count, 120000); // max 2 daqiqa
+        this.logger.warn(`Bot ${accountId}: 409 Conflict (${count}-urinish) — ${delay/1000}s dan keyin restart`);
         setTimeout(async () => {
           try {
             await bot.stopPolling();
             await new Promise(r => setTimeout(r, 3000));
             await this.startBot(accountId, tenantId, token);
-            retryCount = 0;
           } catch {}
         }, delay);
       } else {
