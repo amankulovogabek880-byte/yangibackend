@@ -37,13 +37,27 @@ const AUTO_TRANSITIONS: Record<string, PipelineStage> = {
 };
 
 // v10 stage display names (stored in CustomStage.name via seed)
+// v37 FIX: "Offisga chaqirildi" va "Avans to'landi" ikkalasi ham
+// DEPOSIT_PAID'ga moslangan edi (ENUM'da faqat 10 ta qiymat bor, nomlar
+// esa 11 ta). Bitta ENUM ikki xil nomga tegishli bo'lgani uchun getBoard()
+// ikkala ustunni ham "pipelineStage === DEPOSIT_PAID" shartiga solishtirar
+// edi — natijada BITTA klient ustida ikkita ustunda (masalan "Offisga
+// chaqirildi" HAM "Avans to'landi") bir vaqtda ko'rinardi (aslida faqat
+// bitta mijoz bo'lsa ham, pipelineda "ikkita" bo'lib ko'rinardi).
+// "Offisga chaqirildi" endi ENUM'ga umuman ulanmaydi (null) — bu ustundagi
+// mijozlar endi FAQAT customStageId orqali aniqlanadi (getBoard'dagi
+// `if (c.customStageId) return c.customStageId === stage.id;` tekshiruvi),
+// bu esa noaniqlikni butunlay yo'q qiladi. DEPOSIT_PAID endi faqat
+// "Avans to'landi"ga tegishli — bu frontenddagi barcha joylarda (helpers.ts,
+// clients/[id]/page.tsx, KalendarTab.tsx) DEPOSIT_PAID uchun ishlatilgan
+// nom bilan ham mos keladi.
 const V10_STAGE_KEYS: Record<string, string> = {
   'Yangi lid': 'NEW_LEAD',
   'Aloqa o\'rnatildi': 'CONTACTED',
   'Aloqa o\'rnatilmadi': 'INTERESTED', // mapped to INTERESTED
   'Taklif yuborildi': 'OFFER_SENT',
   'Qayta aloqa': 'NEGOTIATION',
-  'Offisga chaqirildi': 'DEPOSIT_PAID',
+  // 'Offisga chaqirildi': qasddan ENUM'ga bog'lanmagan (v37 FIX, yuqoridagi izohga qarang).
   'Keldi': 'CONFIRMED',
   'Kelmadi': 'TRAVELING',
   'Avans to\'landi': 'DEPOSIT_PAID',
