@@ -35,27 +35,34 @@ import { swallow } from '../../common/utils/swallow';
  * qayta-qayta urinib, oxiri tashlab yuborardi, va Instagram "ulangan" deb
  * ko'rinsa ham DM'lar hech qachon Chat bo'limiga tushmasdi.
  */
-function getInstagramAppSecret(): string | undefined {
-  const ig = process.env.INSTAGRAM_APP_SECRET;
-  if (ig) return ig;
-  if (process.env.META_SINGLE_APP === 'true' && process.env.FACEBOOK_APP_SECRET) {
-    return process.env.FACEBOOK_APP_SECRET;
-  }
-  // TUZATILDI (v13.1): admin "Instagram orqali ulash" (Instagram Login for
-  // Business) tugmasi orqali ulangan bo'lsa, ilgari faqat
-  // INSTAGRAM_LOGIN_APP_ID/SECRET sozlanardi (OAuth uchun) va
-  // INSTAGRAM_APP_SECRET (webhook imzosi uchun) ALOHIDA env sifatida
-  // sozlanmagan qolardi. Natijada OAuth ulanish MUVAFFAQIYATLI o'tardi
-  // (token olinardi), lekin real DM kelganda webhook imzosi tekshiruvi
-  // "APP_SECRET sozlanmagan" deb HAR DOIM 403 qaytarardi — Meta buni qayta
-  // urinib, oxiri to'xtatib qo'yardi, va admin "Instagram ulangan" deb
-  // ko'rsa ham DM'lar Chat bo'limiga hech qachon tushmasdi.
-  //
-  // Amalda "Instagram API with Instagram Login" bitta Meta App bo'lgani
-  // uchun, webhook'ni ham AYNAN shu App imzolaydi — shuning uchun
-  // INSTAGRAM_LOGIN_APP_SECRET'ga ham fallback qilamiz.
-  if (process.env.INSTAGRAM_LOGIN_APP_SECRET) return process.env.INSTAGRAM_LOGIN_APP_SECRET;
-  return undefined;
+/**
+ * v13.2 TUZATILDI: ilgari bu funksiya faqat BITTA secretni qaytarardi,
+ * ustuvorlik bilan (INSTAGRAM_APP_SECRET → FACEBOOK_APP_SECRET →
+ * INSTAGRAM_LOGIN_APP_SECRET). Bu quyidagi holatda muammo edi:
+ *
+ *   Agar Render'da INSTAGRAM_APP_SECRET ham sozlangan bo'lsa (masalan,
+ *   eski/Facebook-Page oqimidan qolgan qiymat), lekin haqiqiy ulanish
+ *   "Instagram orqali to'g'ridan-to'g'ri" (Instagram Login) usulida
+ *   bo'lsa — Meta webhook'ni INSTAGRAM_LOGIN_APP_SECRET tegishli bo'lgan
+ *   App bilan imzolaydi. Funksiya esa har doim birinchi topilgan
+ *   INSTAGRAM_APP_SECRET'ni qaytargani uchun HMAC solishtiruvi HECH QACHON
+ *   mos kelmasdi → webhook "imzo noto'g'ri" deb DOIMIY rad etilardi →
+ *   Instagram "ulangan" ko'rinsa ham DM'lar Chat bo'limiga tushmasdi.
+ *
+ * ENDI: barcha sozlangan (va bir-biridan farqli) secretlar nomzod
+ * sifatida qaytariladi; `processWebhook` ularning HAR BIRI bilan
+ * tekshiradi va birortasi mos kelsa qabul qiladi (fail-closed —
+ * birortasi ham mos kelmasa hamon 403). Bu qaysi Meta App webhook'ni
+ * imzolayotganini bilmasdan ham to'g'ri ishlashni kafolatlaydi.
+ */
+function getInstagramAppSecretCandidates(): string[] {
+  const candidates = [
+    process.env.INSTAGRAM_APP_SECRET,
+    process.env.INSTAGRAM_LOGIN_APP_SECRET,
+    process.env.META_SINGLE_APP === 'true' ? process.env.FACEBOOK_APP_SECRET : undefined,
+  ].filter((v): v is string => !!v);
+  // Takrorlanuvchi qiymatlarni olib tashlaymiz (ko'p hollarda ular baribir bir xil).
+  return Array.from(new Set(candidates));
 }
 
 // Meta Graph API versiyasi — bitta joyda turadi.
@@ -723,19 +730,32 @@ export class InstagramService {
     if (body?.object !== 'instagram' && body?.object !== 'page') return { ok: true };
     // Meta signature verification (X-Hub-Signature-256 header).
     // Meta imzoni App Secret bilan hisoblaydi (Page Access Token emas!).
-    // ── IMZO TEKSHIRUVI (v13.0) — FAIL-CLOSED ──
+    // ── IMZO TEKSHIRUVI (v13.2) — FAIL-CLOSED, KO'P-SECRET ──
     //
     // ILGARI: `if (signature && appSecret && rawBody)` shartida edi.
     // Ya'ni imzo sarlavhasi YUBORILMASA, tekshiruv butunlay o'tkazib
     // yuborilardi va istalgan odam soxta xabar/lead yarata olardi.
+    // Keyinroq (v13.0-13.1) bitta secret bilan fail-closed qilindi, lekin
+    // noto'g'ri secret ustuvor bo'lib qolsa, HAR BIR haqiqiy webhook ham
+    // rad etilaverardi (pastdagi izohga qarang).
     //
-    // ENDI: imzo yo'q yoki noto'g'ri bo'lsa — 403. Chekinish yo'li yo'q
-    // (development'dagi META_WEBHOOK_SKIP_SIGNATURE production'da
-    //  ishlamaydi — canSkipSignature() ichida qattiq shart bor).
+    // ENDI: sozlangan barcha (INSTAGRAM_APP_SECRET / INSTAGRAM_LOGIN_APP_SECRET
+    // / kerak bo'lsa FACEBOOK_APP_SECRET) secretlar navbat bilan tekshiriladi;
+    // birortasi mos kelsa — qabul qilinadi. Hech biri mos kelmasa yoki
+    // umuman sozlanmagan bo'lsa — 403 (chekinish yo'li yo'q; development'dagi
+    // META_WEBHOOK_SKIP_SIGNATURE production'da ishlamaydi — canSkipSignature()
+    // ichida qattiq shart bor).
     if (!canSkipSignature()) {
-      const sig = verifyMetaSignature(rawBody, signature, getInstagramAppSecret());
-      if (!sig.ok) {
-        this.logger.warn(`Instagram webhook RAD ETILDI: ${sig.reason}`);
+      const candidates = getInstagramAppSecretCandidates();
+      let matched = false;
+      let lastReason = 'APP_SECRET sozlanmagan';
+      for (const secret of candidates) {
+        const sig = verifyMetaSignature(rawBody, signature, secret);
+        if (sig.ok) { matched = true; break; }
+        lastReason = sig.reason || lastReason;
+      }
+      if (!matched) {
+        this.logger.warn(`Instagram webhook RAD ETILDI: ${lastReason} (${candidates.length} secret tekshirildi)`);
         throw new ForbiddenException();
       }
     }

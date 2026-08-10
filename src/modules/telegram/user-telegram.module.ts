@@ -44,6 +44,22 @@ const activeSessions = new Map<string, TelegramClient>();
 // Pending auth state (phone → {phoneCodeHash, client})
 const pendingAuth = new Map<string, { phoneCodeHash: string; client: TelegramClient; phone: string }>();
 
+// v16 FIX: bitta account uchun bir vaqtda faqat BITTA restoreSession() ishlashi
+// kerak. Ilgari bunday himoya yo'q edi — onModuleInit() va 5-daqiqalik
+// healthCheckSessions() bir-biriga tegib qolsa (yoki health-check ikki marta
+// ustma-ust chaqirilsa), BIR XIL account uchun BIR NECHTA TelegramClient
+// (va shu bilan bir nechta TCP socket) ochilib, eskilari hech qachon
+// disconnect qilinmasdan xotirada qolardi — vaqt o'tishi bilan RAM to'lib
+// borishining asosiy sababi shu edi.
+const restoringAccounts = new Set<string>();
+
+// v16 FIX: sessiya BUTUNLAY o'lgan (qayta login talab qiladigan) xatolar.
+// Bunday xato chiqsa — qayta-qayta ulanishga urinish MA'NOSIZ: kalit hech
+// qachon o'zi tuzalmaydi, faqat Telegram serverlariga behuda so'rov
+// yog'diradi va tsikl hosil qiladi (aynan shu narsa loglardagi soniyada
+// bir necha marta takrorlanuvchi "Started reconnecting" yozuvlari sababi).
+const FATAL_SESSION_ERRORS = /AUTH_KEY_UNREGISTERED|AUTH_KEY_DUPLICATED|SESSION_REVOKED|USER_DEACTIVATED|USER_DEACTIVATED_BAN/;
+
 @Injectable()
 export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger('UserTelegramService');
@@ -104,6 +120,11 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
       where: { isPersonal: true, sessionData: { not: null }, isActive: true },
     });
     for (const acc of accounts) {
+      // v16 FIX: agar shu account uchun restoreSession() allaqachon ishlab
+      // turgan bo'lsa (masalan onModuleInit hali tugamagan), qo'shimcha
+      // client ochib yubormaymiz — bu RAM sizib chiqishining sababi edi.
+      if (restoringAccounts.has(acc.id)) continue;
+
       const client = activeSessions.get(acc.id);
       let healthy = false;
       if (client) {
@@ -121,15 +142,43 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * v16 FIX (asosiy tuzatish): ilgari bu funksiya HAR QANDAY xatoni jimgina
+   * yutib yuborardi (`catch {}`) va shu bilan chaqiruvchiga "muvaffaqiyatsiz
+   * bo'ldi" deb qaytarardi — lekin AUTH_KEY_UNREGISTERED kabi FATAL xatolar
+   * bilan oddiy tarmoq xatosi orasida farq qilinmasdi. Natijada:
+   *   - har 5 daqiqada healthCheckSessions() qayta urinardi,
+   *   - bundan tashqari gramjs'ning o'ZINING ichki autoReconnect'i
+   *     (standart yoqilgan) ulanish uzilgach soniyasiga bir necha marta
+   *     avtomatik qayta ulanishga urinardi — AUTH_KEY o'lik bo'lgani uchun
+   *     bu urinishlar HECH QACHON muvaffaqiyatli bo'lmasdi va cheksiz
+   *     tsikl (tight loop) hosil bo'lardi (loglarda ko'rilgan holat),
+   *     bu esa CPU va xotirani asta-sekin band qilib borardi.
+   *
+   * ENDI:
+   *   1) `autoReconnect: false` — gramjs o'zi ichki qayta ulanmaydi, faqat
+   *      bizning 5-daqiqalik nazoratimiz (healthCheckSessions) qayta ulaydi.
+   *   2) FATAL_SESSION_ERRORS aniqlansa — akkaunt darhol `isActive:false`
+   *      qilib o'chiriladi (keyingi health-check'lar uni umuman
+   *      ko'rmaydi — chunki so'rov `isActive:true` bilan filtrlanadi),
+   *      va bu haqda agentga bildirishnoma yuboriladi (qayta login kerak).
+   *   3) restoringAccounts bilan bir account uchun parallel restore
+   *      urinishlarining oldi olinadi.
+   */
   private async restoreSession(acc: any): Promise<TelegramClient | null> {
     if (!acc.sessionData) return null;
+    if (restoringAccounts.has(acc.id)) return null;
+    restoringAccounts.add(acc.id);
+
+    let client: TelegramClient | null = null;
     try {
       const apiId = parseInt(acc.apiId || String(DEFAULT_API_ID));
       const apiHash = acc.apiHash || DEFAULT_API_HASH;
       const session = new StringSession(this.enc.decrypt(acc.sessionData) || '');
-      const client = new TelegramClient(session, apiId, apiHash, {
+      client = new TelegramClient(session, apiId, apiHash, {
         connectionRetries: 3,
         useWSS: false,
+        autoReconnect: false,
       });
       await client.connect();
       if (await client.isUserAuthorized()) {
@@ -138,8 +187,49 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
         this.logger.log(`Session restored: ${acc.name || acc.phoneNumber}`);
         return client;
       }
-    } catch {}
+      // Ulandi, lekin authorized emas — sessiya yaroqsiz, xuddi fatal
+      // xato kabi qayta urinishni to'xtatamiz.
+      await this.disableDeadSession(acc, 'Sessiya avtorizatsiyadan o\'tmadi (qayta login kerak)');
+    } catch (e: any) {
+      const reason = e?.errorMessage || e?.message || String(e);
+      if (FATAL_SESSION_ERRORS.test(reason)) {
+        this.logger.error(
+          `Shaxsiy Telegram sessiyasi (${acc.name || acc.id}) BUTUNLAY o'lgan (${reason}) — qayta urinish to'xtatildi, qayta login talab qilinadi.`,
+        );
+        await this.disableDeadSession(acc, reason);
+      } else {
+        this.logger.warn(`restoreSession vaqtinchalik xato (${acc.id}): ${reason}`);
+      }
+      if (client) {
+        try { await client.disconnect(); } catch {}
+      }
+    } finally {
+      restoringAccounts.delete(acc.id);
+    }
     return null;
+  }
+
+  /** Sessiyani butunlay o'chiradi va agentga bildirishnoma yuboradi — cheksiz retry-loop'ning oldini oladi. */
+  private async disableDeadSession(acc: any, reason: string) {
+    activeSessions.delete(acc.id);
+    try {
+      await this.prisma.telegramAccount.update({
+        where: { id: acc.id },
+        data: { isActive: false },
+      });
+    } catch (e: any) {
+      this.logger.error(`disableDeadSession: DB yangilanmadi (${acc.id}): ${e?.message || e}`);
+    }
+    try {
+      if (acc.userId) {
+        this.realtime.emitToUser(acc.userId, 'telegram:session-dead', {
+          accountId: acc.id,
+          name: acc.name,
+          reason,
+          message: 'Shaxsiy Telegram sessiyangiz uzildi. Iltimos, qayta ulaning (Sozlamalar → Telegram).',
+        });
+      }
+    } catch {}
   }
 
   // ─── Telegramdan profil rasmini yuklab olish va saqlash ───────────────────
@@ -288,6 +378,9 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
     const client = new TelegramClient(session, apiId, apiHash, {
       connectionRetries: 3,
       useWSS: false,
+      // v16: login oqimi qisqa umrli — o'zi avtomatik qayta ulanishiga
+      // hojat yo'q, xatoni to'g'ridan-to'g'ri quyidagi catch band qiladi.
+      autoReconnect: false,
     });
 
     try {
