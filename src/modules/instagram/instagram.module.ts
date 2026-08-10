@@ -641,7 +641,11 @@ export class InstagramService {
         return `${redirectBase}&igLogin=token_exchange_failed`;
       }
       const shortToken: string = tokenJson.access_token;
-      const igUserId: string = String(tokenJson.user_id || '');
+      // ESKI (legacy) ID — /oauth/access_token javobidagi `user_id`.
+      // v13.3 TUZATILDI: bu ID FAQAT zaxira (fallback) sifatida saqlanadi —
+      // pastga qarang, nega bu bilan pageId sifatida ISHLATIB BO'LMASLIGI
+      // tushuntirilgan.
+      const legacyIgUserId: string = String(tokenJson.user_id || '');
 
       // 2) Qisqa (≈1 soat) → uzoq muddatli (60 kunlik) tokenga almashtirish
       const longUrl =
@@ -660,24 +664,63 @@ export class InstagramService {
       }
       const longToken: string = longJson.access_token;
 
-      // 3) Akkaunt profilini olamiz (username — UI'da ko'rsatish uchun)
+      /**
+       * v13.3 MUHIM TUZATISH — "Instagram ulangan, lekin DM'lar
+       * Chat'ga tushmayapti" muammosining ILDIZI shu yerda edi.
+       *
+       * Meta'da Instagram Business akkaunt uchun IKKITA turli ID bor:
+       *   - `user_id` (tokenJson/meJson) — ESKI, deprecated raqamli ID
+       *     (ig_id). Faqat eski/legacy migratsiya uchun qoldirilgan,
+       *     boshqa hech qayerda ishlatilmaydi.
+       *   - `id` (meJson.id) — HAQIQIY Instagram-scoped ID. Meta
+       *     messaging webhook'da (`entry.id` va `recipient.id`)
+       *     ANIQ shu ID'ni yuboradi.
+       *
+       * Ilgari bu yerda `tokenJson.user_id` (legacy) pageId sifatida
+       * saqlanardi. Natijada: Instagram sozlamalarda "ulangan" deb
+       * ko'rinardi, webhook ham muntazam kelardi (Meta uni to'g'ri
+       * qabul qilardi — imzo/token to'g'ri edi), LEKIN har bir kelgan
+       * webhook'dagi `entry.id` saqlangan (legacy) pageId'ga HECH QACHON
+       * mos kelmasdi → `findTenantByPageId` doim `null` qaytarardi →
+       * xabar "notanish pageId" sifatida jimgina tashlab yuborilardi
+       * (bu ogohlantirish ham 10 daqiqada bir marta throttle qilingani
+       * uchun Render loglarida deyarli ko'rinmasdi).
+       *
+       * Bu — Meta'ning o'zining developer forumida ham keng tarqalgan,
+       * tan olingan muammosi (google: "Mismatch Between IDs in Instagram
+       * Business Webhooks and Graph API").
+       *
+       * ENDI: `/me` so'roviga `id` maydonini ham qo'shamiz va ANIQ shuni
+       * pageId sifatida saqlaymiz. `user_id` faqat `id` negadir
+       * qaytmagan taqdirdagi zaxira (fallback) sifatida qoladi.
+       */
       let username: string | null = null;
+      let correctIgId: string = legacyIgUserId; // zaxira, pastda meJson.id bilan almashtiriladi
       try {
         const meRes = await fetch(
           `https://graph.instagram.com/${GRAPH_API_VERSION}/me` +
-          `?fields=user_id,username,account_type` +
+          `?fields=id,user_id,username,account_type` +
           `&access_token=${encodeURIComponent(longToken)}`,
         );
         const meJson: any = await meRes.json().catch(() => ({}));
         if (meRes.ok) {
           username = meJson?.username || null;
+          if (meJson?.id) {
+            correctIgId = String(meJson.id);
+          } else {
+            // `id` maydoni negadir qaytmasa — hech bo'lmasa shuni logga yozamiz,
+            // chunki bu holda webhook baribir mos kelmasligi mumkin.
+            this.logger.warn(
+              'Instagram OAuth: /me javobida "id" maydoni yo\'q, legacy user_id bilan davom etilmoqda (webhook mos kelmasligi mumkin)',
+            );
+          }
         }
       } catch {
-        /* profil ixtiyoriy — bo'lmasa ham ulanish davom etadi */
+        /* profil ixtiyoriy — bo'lmasa ham ulanish davom etadi, legacy ID bilan */
       }
 
-      if (!igUserId) {
-        this.logger.error('Instagram OAuth: user_id topilmadi');
+      if (!correctIgId) {
+        this.logger.error('Instagram OAuth: Instagram akkaunt ID topilmadi');
         return `${redirectBase}&igLogin=error`;
       }
 
@@ -685,7 +728,7 @@ export class InstagramService {
       // saveConfig ichida (instagramPageId @unique) allaqachon bajariladi.
       await this.saveConfig(payload.tenantId, {
         accessToken: longToken,
-        pageId: igUserId,
+        pageId: correctIgId,
         authMode: 'instagram_login',
         instagramUsername: username || undefined,
       });
