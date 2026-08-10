@@ -734,7 +734,7 @@ export class InstagramService {
       });
 
       this.logger.log(
-        `Instagram OAuth: tenant ${payload.tenantId} to'g'ridan-to'g'ri ulandi (@${username || igUserId})`,
+        `Instagram OAuth: tenant ${payload.tenantId} to'g'ridan-to'g'ri ulandi (@${username || correctIgId})`,
       );
 
       return `${redirectBase}&igLogin=success${username ? `&igLoginUser=${encodeURIComponent(username)}` : ''}`;
