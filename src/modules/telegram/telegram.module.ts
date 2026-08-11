@@ -1064,61 +1064,21 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     const isPersonalConv = (conv as any).account?.isPersonal || !conv.accountId;
 
     if (isPersonalConv) {
-      // user-telegram module orqali emas, to'g'ridan telegram-js orqali yuboramiz
-      // (sendMessage bu yerda ichki bot route qiladi, isPersonal bo'lsa MTProto ishlatadi)
-      const personalService = (this as any).prisma; // DI orqali olish uchun indirect trick emas
-      // To'g'ri yechim: MTProto session'dan foydalanib yuboriamiz
-      const acct = await (this.prisma as any).telegramAccount.findFirst({
-        where: { tenantId, userId: agentId, isPersonal: true, isActive: true },
-      });
-
-      if (!acct) throw new BadRequestException(
-        'Shaxsiy Telegram account ulanmagan — shablonni yuborib bo\'lmaydi'
-      );
-
-      // Import TelegramClient on-demand
-      const { TelegramClient } = require('telegram');
-      const { StringSession } = require('telegram/sessions');
-
-      let client2: any;
-      // activeSessions allaqachon telegram-personal module'da boshqariladi,
-      // lekin bu modul alohida — shu sababli acct'dan session olib qayta ulanamiz
-      try {
-        const apiId = parseInt(acct.apiId || process.env.TELEGRAM_API_ID || '2040');
-        const apiHash = acct.apiHash || process.env.TELEGRAM_API_HASH || '';
-        const session = this.enc.decrypt(acct.sessionData) || '';
-        client2 = new TelegramClient(new StringSession(session), apiId, apiHash, {
-          connectionRetries: 3, useWSS: false,
+      // v17 FIX: ilgari bu yerda HAR SAFAR o'zining alohida TelegramClient'i
+      // (activeSessions cache'idan mustaqil) ochilib, hech qachon to'g'ri
+      // yopilmasdan (yoki bir xil session bilan PARALLEL ikkinchi ulanish
+      // hosil qilib) yuborilardi — bundan tashqari account HAM noto'g'ri
+      // (`userId: agentId` — hozir gapirayotgan agentning O'ZI ulagan
+      // accounti, suhbat aslida qaysi accountga tegishli bo'lishidan
+      // qat'iy nazar) tanlanardi. Endi userTelegram.sendPersonalMessage()
+      // orqali — u aynan shu suhbatning conv.accountId'siga tegishli,
+      // xotirada keshlangan (activeSessions) sessiyani ishlatadi.
+      if (filledText.trim()) {
+        const r = await this.userTelegram.sendPersonalMessage(tenantId, agentId, {
+          conversationId,
+          text: filledText,
         });
-        await client2.connect();
-      } catch (e: any) {
-        throw new BadRequestException("Telegram sessionga ulanib bo'lmadi: " + e.message);
-      }
-
-      try {
-        const sent = await client2.sendMessage(conv.externalChatId, { message: filledText });
-        const msg = await this.prisma.message.create({
-          data: {
-            conversationId, agentId,
-            direction: 'OUTBOUND',
-            messageType: 'TEXT',
-            text: filledText,
-            externalMsgId: String((sent as any).id),
-            isDelivered: true, isRead: true,
-          },
-          include: { agent: { select: { id: true, name: true, avatarUrl: true } } },
-        });
-        sentMessages.push(msg);
-
-        await this.prisma.conversation.update({
-          where: { id: conversationId },
-          data: { lastMessageAt: new Date(), lastMessageText: filledText.slice(0, 200) },
-        });
-
-        this.realtime.emitConversationEvent(tenantId, conv.assignedAgentId || agentId, 'message:new', msg);
-        this.realtime.emitToUser(agentId, 'message:new', msg);
-      } finally {
-        try { await client2.disconnect(); } catch {}
+        if (r?.message) sentMessages.push(r.message);
       }
     } else {
       // Bot suhbati — standart sendMessage orqali yuboramiz

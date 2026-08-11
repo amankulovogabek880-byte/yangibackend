@@ -4,8 +4,8 @@ import { Roles } from '../../common/decorators';
 import { verifyMetaSignature, canSkipSignature } from '../../common/utils/meta-signature';
 import {
   Module, Injectable, Controller,
-  Get, Post, Delete, Body, Query, Req, Res,
-  UseGuards, Logger, BadRequestException, ForbiddenException } from '@nestjs/common';
+  Get, Post, Patch, Delete, Body, Query, Param, Req, Res,
+  UseGuards, Logger, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { SkipThrottle } from '@nestjs/throttler';
 import type { Response } from 'express';
@@ -161,6 +161,67 @@ const AI_DAILY_QUOTA = parseInt(process.env.INSTAGRAM_AI_DAILY_LIMIT || '300', 1
 const aiQuotaCache = new Map<string, { count: number; day: string }>();
 
 type BotStep = 'ASK_NAME' | 'ASK_DESTINATION' | 'ASK_PHONE' | 'ASK_DATE' | 'DONE';
+
+/**
+ * v41 TUZATISH: skriptlangan bot Sozlamalar → Instagram bo'limida kiritilgan
+ * CUSTOM savollarni ("botSteps") E'TIBORGA OLMASDI — savollar shu yerda
+ * qattiq kod ichida yozilgan edi (ism → yo'nalish → telefon → sana), faqat
+ * BIRINCHI savol matni sozlamalardan olinardi. Shu bilan birga HECH QANDAY
+ * tekshirish yo'q edi — masalan sana so'ralganda mijoz "salom" deb yozsa
+ * ham, bot buni "sana" sifatida qabul qilib CRM'ga yozib yuborardi.
+ *
+ * Endi: savollar ro'yxati to'liq `config.botSteps`dan olinadi (agar
+ * bo'sh bo'lsa — standart 4 ta savol), va har bir javob turi bo'yicha
+ * TEKSHIRILADI. Noto'g'ri javob kelsa — bot SHU savolni namuna bilan
+ * qayta beradi, keyingi bosqichga o'TMAYDI. Faqat barcha savollar
+ * to'g'ri javoblangandan keyin CRM'ga (Client) yoziladi.
+ */
+const DEFAULT_BOT_STEPS = [
+  { id: 'name', question: 'Ismingizni yozing', field: 'name' },
+  { id: 'destination', question: 'Qayerga sayohat qilmoqchisiz?', field: 'destination' },
+  { id: 'phone', question: 'Telefon raqamingizni yozing (masalan: +998901234567)', field: 'phone' },
+  { id: 'date', question: 'Qachon ketmoqchisiz? (masalan: 15.09.2026 yoki "sentyabr oyida")', field: 'date' },
+];
+
+const BOT_MONTHS_UZ = ['yanvar', 'fevral', 'mart', 'aprel', 'may', 'iyun', 'iyul', 'avgust', 'sentyabr', 'oktyabr', 'noyabr', 'dekabr'];
+const BOT_RELATIVE_DATE_WORDS = ['bugun', 'ertaga', 'indinga', 'hafta', 'oy', 'kun', 'yaqin', 'keyin', 'hozir', 'tez'];
+
+/** Bot savoliga kelgan javobni maydon turiga qarab tekshiradi. */
+function validateBotAnswer(field: string, raw: string): { ok: boolean; value?: string; retryMessage?: string } {
+  const text = (raw || '').trim();
+  switch (field) {
+    case 'phone': {
+      const norm = normalizePhone(text);
+      if (!norm) {
+        return { ok: false, retryMessage: "Telefon raqami noto'g'ri ko'rinadi 🙁 Iltimos, shunday formatda yozing: +998901234567" };
+      }
+      return { ok: true, value: norm };
+    }
+    case 'date': {
+      const lower = text.toLowerCase();
+      const hasDigitDate = /\d{1,2}\s*[.\/\-]\s*\d{1,2}(\s*[.\/\-]\s*\d{2,4})?/.test(text);
+      const hasMonth = BOT_MONTHS_UZ.some((m) => lower.includes(m));
+      const hasRelative = BOT_RELATIVE_DATE_WORDS.some((w) => lower.includes(w));
+      const hasDigits = /\d/.test(text);
+      if (text.length < 2 || (!hasDigitDate && !hasMonth && !hasRelative && !hasDigits)) {
+        return { ok: false, retryMessage: 'Sanani tushunmadim 🙁 Iltimos aniqroq yozing — masalan: "15.09.2026" yoki "sentyabr oyida"' };
+      }
+      return { ok: true, value: text };
+    }
+    case 'name': {
+      if (text.length < 2 || /^\d+$/.test(text)) {
+        return { ok: false, retryMessage: "Ismingizni to'liqroq yozing, iltimos 🙂" };
+      }
+      return { ok: true, value: text };
+    }
+    default: {
+      if (!text) {
+        return { ok: false, retryMessage: 'Iltimos, javob yozing.' };
+      }
+      return { ok: true, value: text };
+    }
+  }
+}
 
 interface BotSession {
   step: BotStep;
@@ -918,6 +979,8 @@ export class InstagramService {
       return;
     }
 
+    const steps: any[] = (Array.isArray(config.botSteps) && config.botSteps.length > 0) ? config.botSteps : DEFAULT_BOT_STEPS;
+
     const key = senderId + ':' + tenantId;
     let session = botSessionsCache.get(key);
     if (!session) {
@@ -926,71 +989,75 @@ export class InstagramService {
     }
 
     if (!session) {
-      session = { step: 'ASK_NAME', instagramUserId: senderId, tenantId, startedAt: new Date() };
+      session = { step: 'ASK_NAME', stepIndex: 0, instagramUserId: senderId, tenantId, startedAt: new Date() };
       botSessionsCache.set(key, session);
       await this.saveSession(tenantId, senderId, session);
-      const steps = config.botSteps || [];
       const firstQ = steps.length > 0 ? String.fromCharCode(10) + steps[0].question : '';
       const greet = config.greetingMessage + firstQ;
       await this.reply(config.accessToken!, senderId, greet, config.authMode);
       await this.saveOutbound(conv, greet, null);
-      session.stepIndex = 0;
-      await this.saveSession(tenantId, senderId, session);
       return;
     }
 
-    let next = '';
-    if (session.step === 'ASK_NAME') {
-      session.name = text;
-      session.step = 'ASK_DESTINATION';
-      await this.saveSession(tenantId, senderId, session);
-      next = 'Rahmat ' + text + '! Qayerga sayohat qilmoqchisiz? (Masalan: Dubay, Turkiya, Tailand)';
-    } else if (session.step === 'ASK_DESTINATION') {
-      session.destination = text;
-      session.step = 'ASK_PHONE';
-      await this.saveSession(tenantId, senderId, session);
-      next = 'Ajoyib! Telefon raqamingizni yuboring (+998XXXXXXXXX)';
-    } else if (session.step === 'ASK_PHONE') {
-      session.phone = text;
-      session.step = 'ASK_DATE';
-      await this.saveSession(tenantId, senderId, session);
-      next = 'Qachon ketmoqchisiz? (oy yoki aniq sana kiriting)';
-    } else if (session.step === 'ASK_DATE') {
-      session.date = text;
-      session.step = 'DONE';
-      next = 'Rahmat ' + (session.name || '') + '! Menejerimiz tez orada siz bilan boglanadi. Yaxshi kun!';
-      const lead = await this.createLead(tenantId, { ...session }, config);
-      // Suhbatni mijozga bog'laymiz — Chat'da kartochka ko'rinadi
-      if (lead?.id) {
-        await this.prisma.conversation.update({
-          where: { id: conv.id },
-          data: {
-            clientId: lead.id,
-            assignedAgentId: conv.assignedAgentId || (lead as any).assignedAgentId || null,
-            firstName: session.name || conv.firstName,
-          },
-        }).catch(swallow('yozuvni yangilash'));
-      }
+    const idx = session.stepIndex ?? 0;
+
+    // Sozlamalarda savollar ro'yxati o'zgargan/qisqargan bo'lishi mumkin —
+    // shu holatda sessiyani tozalab, boshidan boshlaymiz (xato bilan
+    // "qotib" qolmasligi uchun).
+    if (idx >= steps.length) {
       botSessionsCache.delete(key);
       await this.deleteSession(tenantId, senderId);
-    } else {
-      botSessionsCache.delete(key);
-      await this.deleteSession(tenantId, senderId);
-      const fresh: BotSession = { step: 'ASK_NAME', instagramUserId: senderId, tenantId, startedAt: new Date() };
-      botSessionsCache.set(key, fresh);
-      next = config.greetingMessage;
+      return;
     }
 
-    if (next) {
-      await this.reply(config.accessToken!, senderId, next, config.authMode);
-      await this.saveOutbound(conv, next, null);
+    const curStep = steps[idx];
+    const validation = validateBotAnswer(curStep.field, text);
+
+    if (!validation.ok) {
+      // ── Noto'g'ri javob: SHU savolni namuna bilan qayta beramiz,
+      // keyingi bosqichga o'TMAYMIZ, ma'lumot ham saqlanmaydi. ──
+      const retryMsg = validation.retryMessage || curStep.question;
+      await this.reply(config.accessToken!, senderId, retryMsg, config.authMode);
+      await this.saveOutbound(conv, retryMsg, null);
+      return;
     }
+
+    // To'g'ri javob — saqlaymiz va keyingi savolga o'tamiz
+    session[curStep.field] = validation.value;
+    const nextIdx = idx + 1;
+    session.stepIndex = nextIdx;
+    await this.saveSession(tenantId, senderId, session);
+
+    if (nextIdx < steps.length) {
+      const nextQ = steps[nextIdx].question;
+      await this.reply(config.accessToken!, senderId, nextQ, config.authMode);
+      await this.saveOutbound(conv, nextQ, null);
+      return;
+    }
+
+    // ── Barcha savollar TO'G'RI javoblandi — endi CRM'ga yozamiz ──
+    session.step = 'DONE';
+    const done = 'Rahmat ' + (session.name || '') + '! Menejerimiz tez orada siz bilan boglanadi. Yaxshi kun!';
+    const lead = await this.createLead(tenantId, { ...session }, config);
+    // Suhbatni mijozga bog'laymiz — Chat'da kartochka ko'rinadi
+    if (lead?.id) {
+      await this.prisma.conversation.update({
+        where: { id: conv.id },
+        data: {
+          clientId: lead.id,
+          assignedAgentId: conv.assignedAgentId || (lead as any).assignedAgentId || null,
+          firstName: session.name || conv.firstName,
+        },
+      }).catch(swallow('yozuvni yangilash'));
+    }
+    botSessionsCache.delete(key);
+    await this.deleteSession(tenantId, senderId);
+    await this.reply(config.accessToken!, senderId, done, config.authMode);
+    await this.saveOutbound(conv, done, null);
 
     // Bot savollari tugadi → suhbat jonli operatorga o'tadi.
     // Shundan keyin mijoz yozgan har bir xabar Chat'da agentni kutadi.
-    if (session.step === 'DONE') {
-      await this.switchToHuman(conv);
-    }
+    await this.switchToHuman(conv);
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -1318,6 +1385,33 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech narsa yozma (izoh, mar
     }).catch(swallow('yangilash'));
   }
 
+  /**
+   * v41 YANGI: agent Chat'dan javob bergandan yoki bot skripti tugagandan
+   * keyin suhbat abadiy "ig:human" (jonli operator) rejimida qolib
+   * ketardi — ORTGA QAYTARISH IMKONI YO'Q edi. Amalda bu shunday
+   * ko'rinardi: "AI ishlamayapti" — chunki `handleMessage` ichida
+   * `isHumanMode(conv)` tekshiruvi AI/skript tekshiruvidan OLDIN
+   * bo'ladi va inson rejimidagi suhbatda bot/AI umuman ishga
+   * tushmaydi (bu — atayin, mijoz allaqachon jonli agent bilan
+   * gaplashayotgan bo'lsa bot aralashmasligi kerak). Endi shu yerdan
+   * agent/admin xohlasa suhbatni yana bot/AI'ga qaytarishi mumkin.
+   */
+  async resetToBot(tenantId: string, conversationId: string) {
+    const conv = await this.prisma.conversation.findFirst({ where: { id: conversationId, tenantId } });
+    if (!conv) throw new NotFoundException('Suhbat topilmadi');
+    const tags: string[] = Array.isArray(conv.tags) ? conv.tags : [];
+    await this.prisma.conversation.update({
+      where: { id: conv.id },
+      data: { tags: tags.filter((t) => t !== HUMAN_TAG) },
+    });
+    // Eski skript sessiyasi qolib ketgan bo'lishi mumkin — tozalaymiz,
+    // shunda keyingi xabar bilan suhbat (yoki AI) toza holda boshlanadi.
+    const key = conv.externalUserId + ':' + tenantId;
+    botSessionsCache.delete(key);
+    if (conv.externalUserId) await this.deleteSession(tenantId, conv.externalUserId);
+    return { success: true };
+  }
+
   private isHumanMode(conv: any): boolean {
     return Array.isArray(conv?.tags) && conv.tags.includes(HUMAN_TAG);
   }
@@ -1374,10 +1468,42 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech narsa yozma (izoh, mar
     return this.saveOutbound(conv, text, agentId);
   }
 
+  /**
+   * v41 TUZATISH: ilgari tarmoqda bir martalik uzilish (timeout, 5xx,
+   * DNS sakrashi) bo'lsa — xabar UMUMAN yetib bormay, faqat logda
+   * xato qolardi ("qotib qolgan"/yo'qolgan xabar). Endi vaqtinchalik
+   * tarmoq xatolarida 2 marta qisqa kutish bilan qayta urinadi (429/5xx
+   * yoki fetch xatosi). Doimiy xatolarda (masalan noto'g'ri token —
+   * 400/401/403) qayta urinmaydi, chunki natija baribir o'zgarmaydi.
+   */
+  private async igFetchWithRetry(url: string, opts: any, attempts = 3): Promise<{ ok: boolean; status?: number; json?: any; error?: string }> {
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const res = await fetch(url, opts);
+        if (res.ok) {
+          const j = await res.json().catch(() => ({}));
+          return { ok: true, status: res.status, json: j };
+        }
+        // 4xx (401/403/400) — token/so'rov noto'g'ri, qayta urinish foydasiz
+        if (res.status < 500 && res.status !== 429) {
+          const err = await res.json().catch(() => ({}));
+          return { ok: false, status: res.status, json: err };
+        }
+        // 429/5xx — vaqtinchalik, qayta urinamiz
+        if (i < attempts - 1) await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+      } catch (e: any) {
+        if (i === attempts - 1) return { ok: false, error: e.message };
+        await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+      }
+    }
+    return { ok: false, error: 'retry-exhausted' };
+  }
+
   /** Xom yuborish — natijani qaytaradi (xatoni yutmaydi). */
   private async sendRaw(accessToken: string, recipientId: string, text: string, authMode?: string) {
-    try {
-      const res = await fetch(`https://${igApiHost(authMode)}/${GRAPH_API_VERSION}/me/messages`, {
+    const r = await this.igFetchWithRetry(
+      `https://${igApiHost(authMode)}/${GRAPH_API_VERSION}/me/messages`,
+      {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + accessToken },
         body: JSON.stringify({
@@ -1385,18 +1511,14 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech narsa yozma (izoh, mar
           message: { text },
           messaging_type: 'RESPONSE',
         }),
-      });
-      if (!res.ok) {
-        const err: any = await res.json().catch(() => ({}));
-        const m = err?.error?.message || JSON.stringify(err).slice(0, 200);
-        this.logger.error('Instagram send failed: ' + m);
-        return { success: false, error: m };
-      }
-      return { success: true, error: null };
-    } catch (e: any) {
-      this.logger.error('Instagram send error: ' + e.message);
-      return { success: false, error: e.message };
+      },
+    );
+    if (!r.ok) {
+      const m = r.json?.error?.message || r.error || JSON.stringify(r.json || {}).slice(0, 200);
+      this.logger.error('Instagram send failed: ' + m);
+      return { success: false, error: m };
     }
+    return { success: true, error: null };
   }
 
   private async createLead(tenantId: string, s: BotSession, config: any) {
@@ -1462,18 +1584,16 @@ Javobni FAQAT quyidagi JSON formatida qaytar, boshqa hech narsa yozma (izoh, mar
 
   private async reply(accessToken: string, recipientId: string, text: string, authMode?: string) {
     if (!accessToken) { this.logger.warn('Instagram: no accessToken'); return; }
-    try {
-      const res = await fetch(`https://${igApiHost(authMode)}/${GRAPH_API_VERSION}/me/messages`, {
+    const r = await this.igFetchWithRetry(
+      `https://${igApiHost(authMode)}/${GRAPH_API_VERSION}/me/messages`,
+      {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + accessToken },
         body: JSON.stringify({ recipient: { id: recipientId }, message: { text }, messaging_type: 'RESPONSE' }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        this.logger.error('Instagram send failed: ' + JSON.stringify(err));
-      }
-    } catch (e: any) {
-      this.logger.error('Instagram send error: ' + e.message);
+      },
+    );
+    if (!r.ok) {
+      this.logger.error('Instagram send failed: ' + JSON.stringify(r.json || r.error || {}));
     }
   }
 
@@ -1608,6 +1728,14 @@ export class InstagramController {
   @UseGuards(JwtAuthGuard)
   stats(@CurrentUser() u: any) {
     return this.svc.getStats(u.tenantId);
+  }
+
+  @ApiOperation({ summary: "Suhbatni bot/AI rejimiga qaytarish (jonli operatordan chiqarish)" })
+  @ApiBearerAuth('JWT')
+  @Patch('conversations/:id/reset-bot')
+  @UseGuards(JwtAuthGuard)
+  resetToBot(@Param('id') id: string, @CurrentUser() u: any) {
+    return this.svc.resetToBot(u.tenantId, id);
   }
 
   // ── OAuth: "Instagram orqali to'g'ridan-to'g'ri ulash" ──────────────

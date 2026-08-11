@@ -490,6 +490,13 @@ model User {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
+  // v17: agent bir nechta shaxsiy Telegram (MTProto) account ulangan
+  // tenant'da qaysi account orqali YANGI suhbat boshlashni tanlaydi —
+  // tanlov shu yerda DOIMIY saqlanadi (Sozlamalar'dan o'zgartirilishi
+  // mumkin). NULL = hali tanlamagan (yoki tenant'da faqat 1 ta account bor
+  // — bu holda tanlov umuman so'ralmaydi).
+  preferredTelegramAccountId String?
+
   assignedClients Client[]          @relation("AssignedAgent")
   bookings        Booking[]         @relation("BookingAgent")
   invoices        Invoice[]         @relation("InvoiceAgent")

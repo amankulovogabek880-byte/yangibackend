@@ -254,16 +254,123 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // ─── v14: Yagona KOMPANIYA (umumiy) shaxsiy accounti ──────────────────────
-  // Yangi model: har bir agent o'z Telegramini ULAMAYDI. Admin BITTA umumiy
-  // (shaxsiy/MTProto) account ulaydi, hamma agent SHU account orqali ishlaydi.
-  // Shuning uchun account'ni `userId` (egasi) bo'yicha emas, balki tenant
-  // bo'yicha topamiz — kim yuborayotganidan qat'iy nazar bitta umumiy account.
-  private async getSharedAccount(tenantId: string) {
-    return this.prisma.telegramAccount.findFirst({
+  // ─── v17 FIX: KO'PLIKDAGI shaxsiy accountlar ───────────────────────────────
+  // Ilgari (v14) "bitta umumiy KOMPANIYA accounti" modeli bor edi — qaysi
+  // agent yubormasin, HAR DOIM eng oxirgi ulangan accountdan (createdAt
+  // desc) foydalanilardi. Bu 1 ta account uchun to'g'ri ishlar edi, lekin
+  // 2+ ta shaxsiy account ulanganda — ESKI accountga tegishli suhbatga
+  // javob yozilganda ham tizim YANGI accountning sessiyasidan foydalanishga
+  // urinardi (peer topilmaydi yoki noto'g'ri identifikatsiyadan ketadi).
+  //
+  // ENDI ikkita aniq holat ajratilgan:
+  //   1) MAVJUD suhbatga javob → resolveAccountForConversation() — albatta
+  //      o'sha KONKRET suhbatning conv.accountId'siga tegishli accountni
+  //      ishlatadi, boshqasiga "sakramaydi".
+  //   2) YANGI (birinchi) xabar → resolveAccountForNewMessage() — agentning
+  //      User.preferredTelegramAccountId orqali DOIMIY saqlangan tanlovini
+  //      ishlatadi (yoki FAQAT 1 ta account bo'lsa — orqaga mos ravishda
+  //      avtomatik o'shani).
+  private async getActivePersonalAccounts(tenantId: string) {
+    return this.prisma.telegramAccount.findMany({
       where: { tenantId, isPersonal: true, isActive: true, sessionData: { not: null } },
-      orderBy: { createdAt: 'desc' },
+      orderBy: { createdAt: 'asc' },
     });
+  }
+
+  /**
+   * MAVJUD suhbat (conversationId bor) uchun — albatta o'sha suhbatning
+   * conv.accountId'siga tegishli accountni qaytaradi. Agar o'sha account
+   * o'lik/uzilgan bo'lsa — aniq xato qaytariladi, BOSHQA accountga
+   * almashtirilmaydi (bu aynan hal qilinishi kerak bo'lgan muammo edi).
+   */
+  private async resolveAccountForConversation(tenantId: string, conv: any) {
+    if (conv.accountId) {
+      const account = await this.prisma.telegramAccount.findFirst({
+        where: { id: conv.accountId, tenantId, isPersonal: true },
+      });
+      if (!account) {
+        throw new BadRequestException(
+          "Bu suhbatga tegishli Telegram account topilmadi (o'chirilgan bo'lishi mumkin). Sozlamalar → Telegram'ni tekshiring.",
+        );
+      }
+      if (!account.isActive || !account.sessionData) {
+        throw new BadRequestException(
+          `"${account.name || account.phoneNumber || 'Telegram'}" accounti uzilgan. Sozlamalar → Telegram'dan qayta ulang.`,
+        );
+      }
+      return account;
+    }
+
+    // Orqaga moslik: eski (accountId'siz saqlangan) suhbatlar uchun — agar
+    // tenant'da faqat BITTA shaxsiy account ulangan bo'lsa, avvalgidek
+    // o'shani ishlatamiz (xatti-harakat o'zgarmaydi).
+    const accounts = await this.getActivePersonalAccounts(tenantId);
+    if (!accounts.length) return null;
+    if (accounts.length === 1) return accounts[0];
+
+    // 2+ ta account bor, lekin bu ESKI suhbat qaysiga tegishli ekani
+    // noaniq — birinchi ulangan accountni ishlatamiz va DARHOL shu
+    // suhbatga accountId yozib qo'yamiz, shunda bu noaniqlik keyingi
+    // safar takrorlanmaydi (o'z-o'zini tuzatish).
+    const fallback = accounts[0];
+    await this.prisma.conversation.update({
+      where: { id: conv.id },
+      data: { accountId: fallback.id },
+    }).catch(() => {});
+    return fallback;
+  }
+
+  /**
+   * YANGI (birinchi) xabar uchun — conversationId hali yo'q. Agentning
+   * doimiy saqlangan tanlovi (User.preferredTelegramAccountId) yoki shu
+   * chaqiruvda aniq berilgan accountId'ni ishlatadi. Agar tenant'da 2+ ta
+   * FAOL account bor-u, hech qanday tanlov aniqlanmasa — aniq
+   * ACCOUNT_SELECTION_REQUIRED xatosini qaytaradi (frontend buni ushlab,
+   * tanlov oynasini ko'rsatadi). FAQAT 1 ta account bo'lsa — hech qanday
+   * tanlov so'ralmaydi, avvalgidek avtomatik shu account ishlatiladi.
+   */
+  private async resolveAccountForNewMessage(tenantId: string, userId: string, requestedAccountId?: string) {
+    const accounts = await this.getActivePersonalAccounts(tenantId);
+    if (!accounts.length) return null;
+    if (accounts.length === 1) return accounts[0];
+
+    if (requestedAccountId) {
+      const chosen = accounts.find(a => a.id === requestedAccountId);
+      if (!chosen) {
+        throw new BadRequestException("Tanlangan Telegram account topilmadi yoki hozir faol emas");
+      }
+      return chosen;
+    }
+
+    const user = await this.prisma.user.findFirst({
+      where: { id: userId },
+      select: { preferredTelegramAccountId: true } as any,
+    }) as any;
+    const preferred = user?.preferredTelegramAccountId
+      ? accounts.find(a => a.id === user.preferredTelegramAccountId)
+      : undefined;
+    if (preferred) return preferred;
+
+    throw new BadRequestException({
+      statusCode: 400,
+      code: 'ACCOUNT_SELECTION_REQUIRED',
+      message: "Bir nechta Telegram account ulangan. Qaysi biridan foydalanishni tanlang.",
+      accounts: accounts.map(a => ({ id: a.id, name: a.name, phoneNumber: a.phoneNumber })),
+    });
+  }
+
+  /** Berilgan account uchun faol (yoki qayta tiklangan) TelegramClient'ni qaytaradi. */
+  private async getClientForAccount(account: any): Promise<TelegramClient> {
+    let client = activeSessions.get(account.id);
+    if (!client || !(await client.isUserAuthorized().catch(() => false))) {
+      client = (await this.restoreSession(account)) || undefined;
+    }
+    if (!client) {
+      throw new BadRequestException(
+        `"${account.name || account.phoneNumber || 'Telegram'}" sessiyasi yaroqsiz. Sozlamalar → Telegram'dan qayta ulang.`,
+      );
+    }
+    return client;
   }
 
   // ─── v14: Round-robin — yangi lead'ni eng kam bandligi bor agentga berish ──
@@ -881,13 +988,19 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
       return { isOnline: false, lastSeenAt: null };
     }
 
-    const account = await this.getSharedAccount(tenantId);
+    let account: any;
+    try {
+      account = await this.resolveAccountForConversation(tenantId, conv);
+    } catch {
+      return { isOnline: false, lastSeenAt: null };
+    }
     if (!account) return { isOnline: false, lastSeenAt: null };
 
-    let client = activeSessions.get(account.id);
-    if (!client || !(await client.isUserAuthorized().catch(() => false))) {
-      client = (await this.restoreSession(account)) || undefined;
-      if (!client) return { isOnline: false, lastSeenAt: null };
+    let client: TelegramClient;
+    try {
+      client = await this.getClientForAccount(account);
+    } catch {
+      return { isOnline: false, lastSeenAt: null };
     }
 
     try {
@@ -912,44 +1025,45 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
     conversationId?: string; // Mavjud suhbatga yozayotgan bo'lsak — shu orqali yangi dublikat suhbat yaratilmaydi
     text: string;
     clientId?: string;
+    accountId?: string; // v17: yangi suhbat uchun aniq tanlangan shaxsiy account (2+ ta ulangan bo'lsa)
   }) {
     if (!data.text?.trim()) throw new BadRequestException('Xabar matni kerak');
     if (!data.phone && !data.username && !data.userId && !data.conversationId) {
       throw new BadRequestException('Telefon raqami, username, Telegram ID yoki suhbat kerak');
     }
 
-    // v14: agentning O'ZIGA tegishli account emas — KOMPANIYA (umumiy) accounti.
-    // Admin bitta account ulaydi, hamma agent shu orqali yozadi.
-    const account = await this.getSharedAccount(tenantId);
+    // v17 FIX: avval har doim "eng oxirgi ulangan" (umumiy) account
+    // ishlatilardi — endi MAVJUD suhbatga aynan o'sha suhbatga tegishli
+    // account, YANGI suhbatga esa agentning tanlovi (yoki yagona account)
+    // ishlatiladi. Suhbat oldindan bir marta topib olinadi — pastda qayta
+    // so'ralmaydi.
+    let existingConv: any = null;
+    let account: any;
+    if (data.conversationId) {
+      existingConv = await this.prisma.conversation.findFirst({
+        where: { id: data.conversationId, tenantId },
+      });
+      if (!existingConv) throw new NotFoundException('Suhbat topilmadi');
+      account = await this.resolveAccountForConversation(tenantId, existingConv);
+    } else {
+      account = await this.resolveAccountForNewMessage(tenantId, agentId, data.accountId);
+    }
     if (!account) {
       throw new BadRequestException(
-        'Kompaniya Telegram accounti ulanmagan. Admin: Settings → Telegram bo\'limidan ulasin.'
+        'Shaxsiy Telegram account ulanmagan. Admin: Settings → Telegram bo\'limidan ulasin.'
       );
     }
 
     // Get or restore client session
-    let client = activeSessions.get(account.id);
-    if (!client || !(await client.isUserAuthorized().catch(() => false))) {
-      client = await this.restoreSession(account) || undefined;
-      if (!client) {
-        throw new BadRequestException(
-          'Session yaroqsiz. Settings → Telegram dan qayta ulaning'
-        );
-      }
-    }
+    const client = await this.getClientForAccount(account);
 
     try {
       let peer: any;
-      let existingConv: any = null;
 
       // Agar mavjud suhbatga yozayotgan bo'lsak — peer'ni o'sha suhbatning
       // saqlangan externalChatId'sidan olamiz. Bu yangi/dublikat suhbat
       // yaratilib, agentning yozgan xabari "yo'qolib qolish" muammosining oldini oladi.
-      if (data.conversationId) {
-        existingConv = await this.prisma.conversation.findFirst({
-          where: { id: data.conversationId, tenantId },
-        });
-        if (!existingConv) throw new NotFoundException('Suhbat topilmadi');
+      if (existingConv) {
         peer = await client.getInputEntity(existingConv.externalChatId);
       } else if (data.username) {
         peer = await client.getInputEntity(data.username.startsWith('@') ? data.username : `@${data.username}`);
@@ -1102,16 +1216,12 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
     });
     if (!conv) throw new NotFoundException('Suhbat topilmadi');
 
-    const account = await this.getSharedAccount(tenantId);
+    const account = await this.resolveAccountForConversation(tenantId, conv);
     if (!account) {
-      throw new BadRequestException('Kompaniya Telegram accounti ulanmagan');
+      throw new BadRequestException('Shaxsiy Telegram account ulanmagan');
     }
 
-    let client = activeSessions.get(account.id);
-    if (!client || !(await client.isUserAuthorized().catch(() => false))) {
-      client = (await this.restoreSession(account)) || undefined;
-      if (!client) throw new BadRequestException('Session yaroqsiz');
-    }
+    const client = await this.getClientForAccount(account);
 
     const peer = await client.getInputEntity(conv.externalChatId);
     const sent = await client.sendMessage(peer, { message: text });
@@ -1162,15 +1272,12 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
     });
     if (!conv) throw new NotFoundException('Suhbat topilmadi');
 
-    // v14: umumiy KOMPANIYA accounti (agent o'z accountiga ega emas)
-    const account = await this.getSharedAccount(tenantId);
-    if (!account) throw new BadRequestException('Kompaniya Telegram accounti ulanmagan');
+    // v17 FIX: bu MAVJUD suhbatga tegishli — endi tenant'dagi "umumiy" emas,
+    // aynan shu suhbatning conv.accountId'siga tegishli accountdan yuboradi.
+    const account = await this.resolveAccountForConversation(tenantId, conv);
+    if (!account) throw new BadRequestException('Shaxsiy Telegram account ulanmagan');
 
-    let client = activeSessions.get(account.id);
-    if (!client || !(await client.isUserAuthorized().catch(() => false))) {
-      client = await this.restoreSession(account) || undefined;
-      if (!client) throw new BadRequestException('Session yaroqsiz. Settings → Telegram dan qayta ulaning');
-    }
+    const client = await this.getClientForAccount(account);
 
     const peer = await client.getInputEntity(conv.externalChatId);
 
@@ -1320,14 +1427,10 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
   async sendMediaGroup(tenantId: string, agentId: string, conversationId: string, photoUrls: string[], caption?: string) {
     const conv = await this.prisma.conversation.findFirst({ where: { id: conversationId, tenantId } });
     if (!conv) throw new NotFoundException('Suhbat topilmadi');
-    const account = await this.getSharedAccount(tenantId);
-    if (!account) throw new BadRequestException('Kompaniya Telegram accounti ulanmagan');
+    const account = await this.resolveAccountForConversation(tenantId, conv);
+    if (!account) throw new BadRequestException('Shaxsiy Telegram account ulanmagan');
 
-    let client = activeSessions.get(account.id);
-    if (!client || !(await client.isUserAuthorized().catch(() => false))) {
-      client = await this.restoreSession(account) || undefined;
-      if (!client) throw new BadRequestException('Session yaroqsiz');
-    }
+    const client = await this.getClientForAccount(account);
     const peer = await client.getInputEntity(conv.externalChatId);
 
     const axios = require('axios');
@@ -1425,6 +1528,64 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
     return { sent: sent.length, messages: sent };
   }
 
+  // ─── v17: Ko'plikdagi accountlar — tanlov uchun ro'yxat va agent tanlovi ──
+
+  /** Tenant'dagi barcha FAOL shaxsiy accountlar (tanlov oynasi/dropdown uchun). */
+  async listAccountsForSelection(tenantId: string) {
+    const accounts = await this.getActivePersonalAccounts(tenantId);
+    return accounts.map(a => ({
+      id: a.id,
+      name: a.name,
+      phoneNumber: a.phoneNumber,
+      isOnline: activeSessions.has(a.id),
+    }));
+  }
+
+  /**
+   * Agent Inbox'ni ochganda (yoki birinchi marta yangi suhbat boshlaganda)
+   * chaqiriladi: agar 2+ ta account ulangan bo'lsa-yu, agent hali qaysi
+   * biridan foydalanishni tanlamagan bo'lsa — `needsSelection: true`
+   * qaytaradi, frontend shunda tanlov oynasini ko'rsatadi. FAQAT 1 ta
+   * account bo'lsa — tanlov HECH QACHON so'ralmaydi (orqaga moslik).
+   */
+  async getAccountPreference(tenantId: string, userId: string) {
+    const accounts = await this.listAccountsForSelection(tenantId);
+    const user = await this.prisma.user.findFirst({
+      where: { id: userId },
+      select: { preferredTelegramAccountId: true } as any,
+    }) as any;
+    const preferredAccountId =
+      user?.preferredTelegramAccountId && accounts.some(a => a.id === user.preferredTelegramAccountId)
+        ? user.preferredTelegramAccountId
+        : null;
+    return {
+      accounts,
+      preferredAccountId,
+      needsSelection: accounts.length > 1 && !preferredAccountId,
+    };
+  }
+
+  /**
+   * Agent qaysi shaxsiy accountdan foydalanishni tanlaydi — DOIMIY
+   * saqlanadi (User.preferredTelegramAccountId), shundan keyin har doim
+   * shu bitta accountdan yangi suhbat boshlanadi. Sozlamalar'dan
+   * keyinchalik qayta o'zgartirilishi mumkin (shu endpoint qayta chaqiriladi).
+   */
+  async setPreferredAccount(tenantId: string, userId: string, accountId: string) {
+    if (!accountId) throw new BadRequestException('accountId kerak');
+    const account = await this.prisma.telegramAccount.findFirst({
+      where: { id: accountId, tenantId, isPersonal: true, isActive: true },
+    });
+    if (!account) throw new NotFoundException('Bunday Telegram account topilmadi yoki hozir faol emas');
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { preferredTelegramAccountId: accountId } as any,
+    });
+
+    return { ok: true, accountId, name: account.name };
+  }
+
   // ─── Get my personal account status ──────────────────────────────────────
   async getMyAccount(tenantId: string, userId: string) {
     const account = await this.prisma.telegramAccount.findFirst({
@@ -1520,6 +1681,28 @@ export class UserTelegramController {
   @Post('send-media')
   sendMedia(@CurrentUser() u: any, @Body() body: { conversationId: string; fileUrl: string; caption?: string; mediaType?: string }) {
     return this.svc.sendMedia(u.tenantId, u.id || u.sub, body.conversationId, body.fileUrl, body.caption, body.mediaType);
+  }
+
+  // v17: barcha faol shaxsiy accountlar ro'yxati (tanlov oynasi uchun)
+  @ApiOperation({ summary: 'Tenant\'dagi barcha faol shaxsiy Telegram accountlari' })
+  @Get('accounts')
+  listAccounts(@CurrentUser() u: any) {
+    return this.svc.listAccountsForSelection(u.tenantId);
+  }
+
+  // v17: Inbox ochilganda — agentga tanlov kerakligini bilish uchun
+  @ApiOperation({ summary: 'Agentning tanlangan (preferred) shaxsiy accounti va tanlov kerakligi' })
+  @Get('preferred-account')
+  getPreferredAccount(@CurrentUser() u: any) {
+    return this.svc.getAccountPreference(u.tenantId, u.id || u.sub);
+  }
+
+  // v17: agent yangi suhbatlar uchun qaysi accountdan foydalanishni tanlaydi
+  @ApiOperation({ summary: 'Yangi suhbatlar uchun shaxsiy accountni tanlash (doimiy saqlanadi)' })
+  @ApiBody({ schema: { example: { accountId: 'clxxxxxxxxxxxxxxxxxxxxxxxx' } } })
+  @Post('preferred-account')
+  setPreferredAccount(@CurrentUser() u: any, @Body() body: { accountId: string }) {
+    return this.svc.setPreferredAccount(u.tenantId, u.id || u.sub, body.accountId);
   }
 
   // Status
