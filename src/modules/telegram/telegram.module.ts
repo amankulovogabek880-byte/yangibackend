@@ -1348,9 +1348,44 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   /**
    * Bot ulash. userId berilsa - agent shaxsiy boti.
    * Aks holda - tenant-wide (admin uchun).
+   *
+   * v: ADMIN bo'lmagan foydalanuvchi (AGENT/MANAGER) faqat tenant
+   * "telegramMode" sozlamasi PER_AGENT bo'lgandagina o'zi uchun shaxsiy
+   * bot ulay oladi (admin Sozlamalar → Telegram bo'limidan tanlaydi).
+   * Bu tekshiruv FAQAT userId + requesterRole berilganda (ya'ni
+   * "/accounts/personal" orqali, o'zini ulayotganda) ishlaydi — admin
+   * tomonidan kompaniya boti ulash (userId yo'q) yoki adminning o'zi
+   * ulashi (requesterRole === TENANT_ADMIN) hech qanday cheklovsiz qoladi.
    */
-  async connectBot(tenantId: string, token: string, name: string, userId?: string) {
+  async connectBot(
+    tenantId: string,
+    token: string,
+    name: string,
+    userId?: string,
+    requesterRole?: string,
+  ) {
     if (!token?.trim()) throw new BadRequestException('Token kerak');
+
+    if (userId && requesterRole && requesterRole !== 'TENANT_ADMIN') {
+      const tenant = await this.prisma.tenant.findUnique({
+        where: { id: tenantId },
+        select: { settings: true },
+      });
+      const mode = (tenant?.settings as any)?.telegramMode;
+      if (mode !== 'PER_AGENT') {
+        throw new BadRequestException(
+          "Shaxsiy Telegram bot ulash yoqilmagan. Admin Sozlamalar → Telegram bo'limidan " +
+            '"Har bir agent alohida" rejimini tanlashi kerak.',
+        );
+      }
+      const existingMine = await this.prisma.telegramAccount.findFirst({
+        where: { tenantId, userId, isActive: true },
+      });
+      if (existingMine) {
+        throw new BadRequestException('Sizda allaqachon ulangan shaxsiy bot bor. Avval uni uzing.');
+      }
+    }
+
     const tempBot = new TelegramBot(token);
     const info = await tempBot.getMe().catch(() => {
       throw new BadRequestException('Token noto\'g\'ri');
@@ -1525,6 +1560,20 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           : `Telegram xato: ${e.message}`
       );
     }
+  }
+
+  /**
+   * v: Agent PER_AGENT rejimida o'zining shaxsiy botini o'zi uzadi
+   * (admin ishtirokisiz). Faqat so'rovchining O'Z yozuvini topadi va
+   * shu accountId bilan mavjud `disconnectBot` logikasini chaqiradi —
+   * boshqa hech narsa o'zgarmaydi.
+   */
+  async disconnectOwnBot(tenantId: string, userId: string) {
+    const acc = await this.prisma.telegramAccount.findFirst({
+      where: { tenantId, userId, isActive: true },
+    });
+    if (!acc) throw new NotFoundException('Sizning shaxsiy botingiz topilmadi');
+    return this.disconnectBot(tenantId, acc.id);
   }
 
   async disconnectBot(tenantId: string, accountId: string) {
@@ -1718,7 +1767,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   async getAccounts(tenantId: string) {
     return this.prisma.telegramAccount.findMany({
       where: { tenantId },
-      select: { id: true, name: true, botUsername: true, channel: true, isActive: true, createdAt: true },
+      // v: userId ham qaytariladi — frontend shu orqali "bu qaysi agentniki"
+      // va "bu mening shaxsiy botim" ekanini aniqlaydi (token/hech qanday
+      // maxfiy narsa qaytarilmaydi, faqat egasining ID'si).
+      select: { id: true, name: true, botUsername: true, channel: true, isActive: true, createdAt: true, userId: true },
     });
   }
 
@@ -1818,17 +1870,31 @@ export class TelegramController {
    * v8: Agentning shaxsiy boti ulash.
    * Agent o'zining bot tokeniga ega bo'lsa, kompaniya bot'iga teng bo'lmagan
    * holda alohida ulanadi.
+   *
+   * v: ilgari FAQAT TENANT_ADMIN chaqira olardi (va faqat o'zi uchun).
+   * Endi HAR QANDAY login qilgan foydalanuvchi (AGENT/MANAGER ham) shu
+   * orqali O'ZI UCHUN shaxsiy bot ulay oladi — lekin bu faqat tenant
+   * "telegramMode: PER_AGENT" tanlaganda ishlaydi (tekshiruv
+   * `connectBot` ichida, ADMIN uchun cheklovsiz qoladi).
    */
   @Post('accounts/personal')
-  @UseGuards(RolesGuard) @Roles('TENANT_ADMIN')
   connectPersonal(@Body() body: any, @CurrentUser() u: any) {
-    return this.svc.connectBot(u.tenantId, body.token, body.name, u.sub);
+    return this.svc.connectBot(u.tenantId, body.token, body.name, u.sub, u.role);
   }
 
   @Delete('accounts/:id')
   @UseGuards(RolesGuard) @Roles('TENANT_ADMIN')
   disconnect(@Param('id') id: string, @CurrentUser() u: any) {
     return this.svc.disconnectBot(u.tenantId, id);
+  }
+
+  /**
+   * v: Agent PER_AGENT rejimida o'zining shaxsiy botini o'zi uzadi.
+   * Rol cheklovi yo'q — faqat so'rovchining O'Z yozuvi topilib uziladi.
+   */
+  @Delete('accounts/personal/mine')
+  disconnectMine(@CurrentUser() u: any) {
+    return this.svc.disconnectOwnBot(u.tenantId, u.sub);
   }
 
   /**
