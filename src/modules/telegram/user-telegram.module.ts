@@ -1663,9 +1663,18 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   // ─── Get my personal account status ──────────────────────────────────────
+  // TUZATILDI: ilgari `isActive` bo'yicha FILTRLANMASDI — ya'ni "Uzish"
+  // bosilib (`disconnect()` → isActive:false, sessionData:null) qo'yilgan
+  // eski yozuv ham baribir qaytarilardi. Frontend esa "account bor/yo'q"
+  // bo'yicha qaror qabul qiladi (bor bo'lsa faqat "Uzish" ko'rsatiladi,
+  // "+ Ulash" tugmasi FAQAT account YO'Q bo'lganda chiqadi) — natijada
+  // akkauntni uzgandan keyin "+ Ulash" tugmasi hech qachon qayta
+  // ko'rinmasdi va yangi raqam ulab bo'lmasdi. Endi faqat HAQIQATAN
+  // faol (isActive:true) yozuv qaytariladi — uzilgan akkaunt bazada
+  // tarix uchun saqlanib qoladi, lekin bu joyda "yo'q" deb hisoblanadi.
   async getMyAccount(tenantId: string, userId: string) {
     const account = await this.prisma.telegramAccount.findFirst({
-      where: { tenantId, userId, isPersonal: true },
+      where: { tenantId, userId, isPersonal: true, isActive: true },
       select: {
         id: true, name: true, phoneNumber: true, isActive: true, config: true,
         createdAt: true,
