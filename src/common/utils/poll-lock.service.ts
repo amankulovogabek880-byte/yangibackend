@@ -125,8 +125,31 @@ export class PollLockService {
 
   private async acquireDb(name: string, ttlSec: number): Promise<boolean> {
     const key = `polllock:${name}`;
-    const owner = `${process.pid}-${Math.random().toString(36).slice(2)}-${Date.now()}`;
     const now = Date.now();
+
+    // XOTIRA SIZISHI TUZATILDI: agar shu instans ALLAQACHON shu qulfning
+    // egasi bo'lsa (`this.dbLockValue`da yozuv bor) — pastdagi
+    // heartbeat `setInterval` allaqachon ishlab, TTL'ni muntazam
+    // yangilab turibdi. Bunday holatda shunchaki `true` qaytaramiz.
+    //
+    // MUAMMO (bu tekshiruv bo'lmaganda): `acquire()` bir xil `name`
+    // bilan qayta chaqirilganda (masalan telegram.module.ts/
+    // jarvis-bot.module.ts'dagi bot tarmoq xatosi/409 Conflict tufayli
+    // `startBot()`ni qayta ishga tushirsa — bu kunlik holatda bir necha
+    // marta yuz beradi) — pastdagi kod har safar YANGI `setInterval`
+    // yaratardi (`this.timers.set(name, timer)` shunchaki eski timer
+    // REFERENCE'ini almashtirar, lekin uni to'xtatmasdi). Eski
+    // interval hech qachon `clearInterval` qilinmasdan ishlashda davom
+    // etaverardi — har biri har ~5-10 soniyada bazaga so'rov yuborib.
+    // Vaqt o'tishi bilan (har restart/qayta ulanishda яна biттадан)
+    // o'nlab-yuzlab "zombi" intervallar to'planib, xotira va CPU'ni
+    // asta-sekin band qilib borardi — aynan monitoring grafigidagi
+    // soatlab ko'tarilib, so'ng qulab tushish naqshi shundan edi.
+    if (this.dbLockValue.has(name)) {
+      return true;
+    }
+
+    const owner = `${process.pid}-${Math.random().toString(36).slice(2)}-${Date.now()}`;
     const newValue = JSON.stringify({ owner, exp: now + ttlSec * 1000 });
 
     try {

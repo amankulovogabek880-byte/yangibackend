@@ -240,6 +240,30 @@ interface BotSession {
 // Sessions stored in Tenant.settings as instagramSessions JSON
 const botSessionsCache = new Map<string, BotSession>(); // local cache for speed
 
+// XOTIRA SIZISHI TUZATILDI: `botSessionsCache` — BARCHA tenantlar uchun
+// UMUMIY, jarayon xotirasidagi Map. Yozuv faqat bot skripti TUGAGANDA
+// yoki qayta boshlanganda o'chirilardi (yuqoridagi uchta `.delete()`
+// chaqiruviga qarang) — agar mijoz botga yozishni BOSHLAB, keyin javob
+// bermay tashlab ketsa (lidlarda bu odatiy holat), sessiya bu yerda
+// ABADIY qolib ketardi. Bundan tashqari, `saveSession()` DB tarafida
+// tenant boshiga 200 tadan ortiq sessiyani eskisidan o'chirib boradi —
+// lekin bu tozalash shu keshga UMUMAN ta'sir qilmaydi, ya'ni DB'da
+// allaqachon o'chirilgan sessiya keshda "yetim" holda saqlanib qolishi
+// ham mumkin edi. Quyidagi davriy tozalash FAQAT shu tezkor keshdan
+// eskirgan yozuvlarni olib tashlaydi — DB'ga tegmaydi. Xavfsiz: agar
+// mijoz keyinroq qaytib yozsa, `getSession()` DB'dan qayta o'qib,
+// keshni avvalgidek to'ldiradi — xatti-harakat o'zgarmaydi.
+const BOT_SESSION_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 soat
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of botSessionsCache.entries()) {
+    const startedAt = v?.startedAt ? new Date(v.startedAt as any).getTime() : NaN;
+    if (!Number.isFinite(startedAt) || now - startedAt > BOT_SESSION_CACHE_TTL_MS) {
+      botSessionsCache.delete(k);
+    }
+  }
+}, 60 * 60 * 1000);
+
 // v17: "pageId uchun tenant topilmadi" ogohlantirishini throttle qilamiz.
 // Ilgari HAR bir webhook uchun alohida log yozilardi — agar noma'lum
 // pageId'ga (masalan boshqa firmaning shu umumiy Meta App orqali ulangan,

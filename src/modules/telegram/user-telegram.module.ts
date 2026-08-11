@@ -42,7 +42,34 @@ const DEFAULT_API_HASH = process.env.TELEGRAM_API_HASH || 'b18441a1ff607e10a9898
 // Active client sessions (memory cache)
 const activeSessions = new Map<string, TelegramClient>();
 // Pending auth state (phone → {phoneCodeHash, client})
-const pendingAuth = new Map<string, { phoneCodeHash: string; client: TelegramClient; phone: string }>();
+const pendingAuth = new Map<string, { phoneCodeHash: string; client: TelegramClient; phone: string; createdAt: number }>();
+// Telegramning SMS/app kodi odatda bir necha daqiqa amal qiladi — shundan
+// ancha ortiq kutib turgan "tashlab ketilgan" login urinishlarini eskirgan
+// deb hisoblaymiz.
+const PENDING_AUTH_TTL_MS = 10 * 60 * 1000;
+
+// XOTIRA SIZISHI TUZATILDI: `sendCode()` har chaqirilganda ULANGAN
+// (connect() qilingan) TelegramClient yaratib, uni shu Map'da saqlaydi —
+// lekin bu client faqat verifyCode()/verify2FA() MUVAFFAQIYATLI
+// tugaganda `disconnect()` qilinardi. Agar agent kodni noto'g'ri
+// kiritsa va boshqa urinmasa, kod muddati o'tib ketsa, yoki jarayonni
+// shunchaki tashlab ketsa — o'sha ulangan client (soketi va GramJS'ning
+// ichki timer/listenerlari bilan) hech qachon uzilmasdan Map'da
+// ABADIY qolardi. Xuddi shunday, agar agent bir xil raqam uchun
+// "Kod yuborish"ni qayta bossa, eski (hali ulangan) client yangisi
+// bilan JIMGINA almashtirilib, eskisi hech qachon uzilmasdi.
+// Bu — activeSessions/restoreSession() uchun yuqorida (v16 FIX) allaqachon
+// tuzatilgan bilan AYNAN bir xil turdagi sizish, faqat pendingAuth uchun
+// hali tuzatilmagan edi.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, pending] of pendingAuth.entries()) {
+    if (now - pending.createdAt > PENDING_AUTH_TTL_MS) {
+      pendingAuth.delete(key);
+      pending.client.disconnect().catch(() => {});
+    }
+  }
+}, 5 * 60 * 1000);
 
 // v16 FIX: bitta account uchun bir vaqtda faqat BITTA restoreSession() ishlashi
 // kerak. Ilgari bunday himoya yo'q edi — onModuleInit() va 5-daqiqalik
@@ -497,7 +524,15 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
 
       // Store pending auth
       const key = `${userId}:${phone}`;
-      pendingAuth.set(key, { phoneCodeHash, client, phone });
+      // XOTIRA SIZISHI TUZATILDI: agar shu kalit uchun oldingi (masalan
+      // eskirgan yoki tugallanmagan) urinishdan qolgan ULANGAN client
+      // bo'lsa — yangisini yozishdan oldin uni uzamiz, aks holda eski
+      // ulanish hech qachon yopilmasdan xotirada osilib qolardi.
+      const prevPending = pendingAuth.get(key);
+      if (prevPending) {
+        prevPending.client.disconnect().catch(() => {});
+      }
+      pendingAuth.set(key, { phoneCodeHash, client, phone, createdAt: Date.now() });
 
       return { status: 'code_sent', phone, message: `SMS kodi ${phone} raqamiga yuborildi` };
     } catch (e: any) {

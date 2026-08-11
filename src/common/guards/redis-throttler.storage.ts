@@ -38,7 +38,20 @@ export class RedisThrottlerStorage implements ThrottlerStorage {
 
   constructor(
     @Optional() @Inject(REDIS_CLIENT) private readonly redis: Redis | null = null,
-  ) {}
+  ) {
+    // XOTIRA SIZISHI TUZATILDI: pastdagi `cleanup()` metodi eskirgan
+    // yozuvlarni o'chirish uchun yozilgan edi, lekin uni hech kim, hech
+    // qayerda chaqirmasdi (bu klass Nest DI orqali emas, `new
+    // RedisThrottlerStorage(...)` bilan qo'lda yaratiladi — shuning
+    // uchun `OnModuleInit`/Cron kabi Nest lifecycle-hook'lar ham
+    // ishlamaydi). Natijada Redis yo'q rejimda `memory` Map'i har bir
+    // yangi (IP/route bo'yicha) kalit uchun cheksiz o'sardi — hech
+    // qachon torilmasdan. Endi shu yerning o'zida davriy o'z-o'zini
+    // tozalash ishga tushiriladi (bu klassdan FAQAT bitta nusxa
+    // yaratiladi — app.module.ts'dagi ThrottlerModule factory'sida —
+    // shuning uchun bu bir marta ishga tushadigan yagona timer).
+    setInterval(() => this.cleanup(), 5 * 60 * 1000).unref?.();
+  }
 
   async increment(key: string, ttl: number): Promise<ThrottlerStorageRecord> {
     // @nestjs/throttler v5 TTL'ni MILLISEKUNDDA beradi

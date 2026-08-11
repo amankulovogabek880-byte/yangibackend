@@ -56,6 +56,21 @@ const DAILY_QUOTA = parseInt(process.env.AI_ASSISTANT_DAILY_LIMIT || '50', 10);
 /** Redis yo'q bo'lgandagi zaxira kvota hisoblagichi (bitta instans uchun) */
 const memoryQuota = new Map<string, { count: number; resetAt: number }>();
 
+// XOTIRA SIZISHI TUZATILDI: kalit tarkibida sana bor
+// (`ai-assistant:quota:${tenantId}:${userId}:${todayKey()}`), shuning
+// uchun har YANGI kun uchun HAR bir faol foydalanuvchiga alohida yozuv
+// qo'shilardi — va eski kunlarga tegishli yozuvlar hech qachon
+// o'chirilmasdi (kalit endi ishlatilmasa ham, Map'da abadiy qolardi).
+// Bu — kodning boshqa joylarida (rate-limit.guard.ts, static-rate-limit.ts,
+// uploads-access.ts) allaqachon qo'llanilgan xuddi shu naqsh: muddati
+// o'tgan yozuvlarni davriy tozalab turish.
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of memoryQuota.entries()) {
+    if (v.resetAt < now) memoryQuota.delete(k);
+  }
+}, 60 * 60 * 1000);
+
 @Injectable()
 export class AiAssistantService {
   private readonly logger = new Logger('AiAssistant');
