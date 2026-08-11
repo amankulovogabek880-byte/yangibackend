@@ -30,6 +30,20 @@ export class TasksService {
     if (params.bookingId) where.bookingId = params.bookingId;
     if (params.priority) where.priority = params.priority as TaskPriority;
 
+    // v40: bajarilgan (DONE) vazifa 1 kundan keyin ro'yxatdan avtomatik
+    // yo'qoladi — bazadan o'chirilmaydi (tarix saqlanadi), faqat
+    // ro'yxatga chiqmaydi. Agar kimdir aniq `status=DONE` bilan
+    // filtrlab qarasa (masalan tarixni ko'rish uchun), bu cheklov
+    // qo'llanilmaydi — chunki u holda foydalanuvchi ATAYIN bajarilgan
+    // vazifalarni so'rayapti.
+    if (!params.status) {
+      const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      where.NOT = {
+        status: 'DONE',
+        completedAt: { lt: oneDayAgo },
+      };
+    }
+
     const [data, total] = await Promise.all([
       this.prisma.task.findMany({
         where, skip, take,

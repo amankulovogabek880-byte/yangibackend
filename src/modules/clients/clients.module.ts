@@ -109,9 +109,19 @@ export class ClientsController {
     return this.svc.update(u.tenantId, id, u.sub, u.role, body);
   }
 
+  // v40: ?force=true — bookingi bor klientni ham (barcha booking/to'lov/
+  // komissiyasi bilan birga) o'chiradi. Faqat TENANT_ADMIN foydalana oladi
+  // (tekshiruv service ichida) — oddiy chaqiruvda avvalgidek bloklanadi.
   @Delete(':id')
-  delete(@Param('id') id: string, @CurrentUser() u: any) {
-    return this.svc.delete(u.tenantId, id, u.sub, u.role);
+  delete(@Param('id') id: string, @CurrentUser() u: any, @Query('force') force?: string) {
+    return this.svc.delete(u.tenantId, id, u.sub, u.role, force === 'true' || force === '1');
+  }
+
+  // v40: bronni(larni) bekor qilib, klientni qayta "Yangi lid" hovuziga
+  // qaytaradi — bron o'chadi, klient o'chmaydi. Faqat ADMIN/MANAGER.
+  @Post(':id/release-to-pool')
+  releaseToLeadPool(@Param('id') id: string, @CurrentUser() u: any) {
+    return this.svc.releaseToLeadPool(u.tenantId, id, u.sub, u.role);
   }
 
   @Post(':id/notes')

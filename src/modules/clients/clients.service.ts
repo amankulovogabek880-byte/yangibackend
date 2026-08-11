@@ -909,7 +909,45 @@ export class ClientsService {
     return { ok: true, keyInfo: prefs.keyInfo };
   }
 
-  async delete(tenantId: string, id: string, userId: string, role: string) {
+  /**
+   * v40: bookingi bor klientni butunlay o'chirish uchun ichki yordamchi.
+   * Faqat `force: true` bilan chaqiriladi (TENANT_ADMIN tekshiruvi
+   * chaqiruvchi tomonda bajariladi). Booking bilan bog'liq BARCHA
+   * moliyaviy/yordamchi yozuvlarni (to'lov, komissiya, invoys, yo'lovchi,
+   * xizmat, checklist, hujjat, qo'ng'iroq, vazifa) va bookinglarning
+   * o'zini bitta tranzaksiyada tozalaydi — chunki bular Booking'ga
+   * CASCADE bog'lanmagan (moliyaviy tarix tasodifan o'chib ketmasligi
+   * uchun atayin shunday qilingan).
+   */
+  private async purgeClientBookings(clientId: string) {
+    const bookings = await this.prisma.booking.findMany({
+      where: { clientId },
+      select: { id: true },
+    });
+    const bookingIds = bookings.map((b) => b.id);
+    if (bookingIds.length === 0) return;
+
+    await this.prisma.$transaction([
+      this.prisma.payment.deleteMany({ where: { bookingId: { in: bookingIds } } }),
+      this.prisma.commission.deleteMany({ where: { bookingId: { in: bookingIds } } }),
+      this.prisma.passenger.deleteMany({ where: { bookingId: { in: bookingIds } } }),
+      this.prisma.bookingService.deleteMany({ where: { bookingId: { in: bookingIds } } }),
+      this.prisma.bookingChecklist.deleteMany({ where: { bookingId: { in: bookingIds } } }),
+      this.prisma.invoice.deleteMany({ where: { bookingId: { in: bookingIds } } }),
+      this.prisma.call.deleteMany({ where: { bookingId: { in: bookingIds } } }),
+      this.prisma.document.deleteMany({ where: { bookingId: { in: bookingIds } } }),
+      this.prisma.task.deleteMany({ where: { bookingId: { in: bookingIds } } }),
+      this.prisma.booking.deleteMany({ where: { id: { in: bookingIds } } }),
+    ]);
+  }
+
+  /**
+   * v40: `force=true` bo'lsa va chaqiruvchi TENANT_ADMIN bo'lsa — bookingi
+   * bor klient ham, uning barcha bookinglari/to'lovlari/komissiyalari bilan
+   * birga, TAK-TUBI BILAN o'chiriladi. Oddiy (force=false) chaqiruvda
+   * xatti-harakat avvalgidek — bookingi bor klient bloklanadi.
+   */
+  async delete(tenantId: string, id: string, userId: string, role: string, force = false) {
     // Only ADMIN/MANAGER can delete
     if (role === 'AGENT') {
       throw new BadRequestException("Agentlar klientlarni o'chira olmaydi");
@@ -921,12 +959,21 @@ export class ClientsService {
     // BOG'LANMAGAN (atayin — moliyaviy tarix tasodifan o'chib ketmasligi uchun),
     // shuning uchun bookingi bor har qanday klientni o'chirishga urinish har doim
     // "Foreign key constraint" xatosi bilan tugardi va foydalanuvchiga tushunarsiz
-    // ko'rinardi ("ishlamayapti"). Endi buni aniq xabar bilan bloklaymiz.
+    // ko'rinardi ("ishlamayapti"). Endi buni aniq xabar bilan bloklaymiz — MAGAR
+    // admin ?force=true bilan so'ramasa, u holda pastda BARCHASI bilan o'chiriladi.
     const bookingsCount = await this.prisma.booking.count({ where: { clientId: id } });
     if (bookingsCount > 0) {
-      throw new BadRequestException(
-        `Bu klientda ${bookingsCount} ta booking bor — moliyaviy tarixni yo'qotmaslik uchun bookingi bor klientlarni o'chirib bo'lmaydi. Kerak bo'lsa, klientni "Yo'qotildi" bosqichiga o'tkazing.`,
-      );
+      if (!force) {
+        throw new BadRequestException(
+          `Bu klientda ${bookingsCount} ta booking bor — moliyaviy tarixni yo'qotmaslik uchun bookingi bor klientlarni oddiy usulda o'chirib bo'lmaydi. Admin klientni bookinglari bilan birga TO'LIQ o'chira oladi (barchasi yo'qoladi) yoki bronlarni bekor qilib klientni qayta lidlar hovuziga qaytarishi mumkin.`,
+        );
+      }
+      if (role !== 'TENANT_ADMIN') {
+        throw new BadRequestException(
+          "Bookingi bor klientni faqat TENANT_ADMIN (administrator) to'liq o'chira oladi.",
+        );
+      }
+      await this.purgeClientBookings(id);
     }
 
     // Moliyaviy bo'lmagan bog'liq yozuvlarni (suhbat, vazifa, hujjat, qo'ng'iroq,
@@ -944,6 +991,47 @@ export class ClientsService {
     void this.cache.invalidateReports(tenantId);
 
     return { ok: true };
+  }
+
+  /**
+   * v40: "Bronni bekor qilib, lidni qayta hovuzga chiqarish" — klientning
+   * o'zini o'chirmaydi, faqat bookingi (va ular bilan bog'liq to'lov/
+   * komissiya/invoys) larni butunlay o'chiradi hamda klientni yana
+   * "Yangi lid" (NEW_LEAD) bosqichiga, agentdan bo'shatilgan holda,
+   * qaytaradi — go'yo u hech qachon bron qilmagandek. Faqat
+   * ADMIN/MANAGER chaqira oladi (agent bronni bunday o'chira olmaydi).
+   */
+  async releaseToLeadPool(tenantId: string, id: string, userId: string, role: string) {
+    if (role === 'AGENT') {
+      throw new BadRequestException("Agentlar bu amalni bajara olmaydi — faqat administrator/menejer");
+    }
+    await this.findOne(tenantId, id, userId, role); // mavjudligi/ruxsatni tekshiradi
+
+    await this.purgeClientBookings(id);
+
+    const updated = await this.prisma.client.update({
+      where: { id },
+      data: {
+        pipelineStage: 'NEW_LEAD' as PipelineStage,
+        assignedAgentId: null,
+        assignedAt: null,
+        lostReason: null,
+        lastBookingAt: null,
+      },
+    });
+
+    await this.addTimeline(
+      id,
+      'released_to_pool',
+      "Bron(lar) bekor qilindi",
+      "Mijoz barcha bronlaridan ozod qilinib, qayta lidlar hovuziga qaytarildi",
+      { userId },
+    ).catch(() => {});
+
+    await this.recalcStats(id).catch(() => {});
+    void this.cache.invalidateReports(tenantId);
+
+    return updated;
   }
 
   async getTimeline(tenantId: string, id: string, userId: string, role: string) {
