@@ -304,7 +304,7 @@ export class ClientsService {
     return this.decryptClient(client);
   }
 
-  async create(tenantId: string, userId: string, data: any) {
+  async create(tenantId: string, userId: string, data: any, role?: string) {
     // v9-SECURITY: Phone is OPTIONAL for Telegram/Web leads
     // Required: fullName only
     // Phone is required ONLY for direct booking sources
@@ -357,7 +357,18 @@ export class ClientsService {
 
     // Round-Robin: AVTOMATIK agent tayinlash (strategiya tekshirib)
     let assignedAgentId: string | null = data.assignedAgentId || null;
-    if (!assignedAgentId) {
+    if (!assignedAgentId && role === 'AGENT') {
+      // v38: AGENT o'zi mijoz/lead yaratsa (masalan ofisga kelgan mijoz,
+      // qo'lda kiritilgan lead) — bu ALBATTA o'ZINING mijozi bo'lishi kerak.
+      // Ilgari bu yerda ham round-robin ishlab, yangi mijoz BOSHQA agentga
+      // (yoki hech kimga) tushib qolar, yaratgan agent esa uni ro'yxatida
+      // umuman ko'ra olmasdi (chunki AGENT faqat o'ziga tayinlangan
+      // mijozlarni ko'radi). Round-robin faqat tashqi manbalardan (Facebook,
+      // veb-sayt formasi va h.k.) kelgan yoki admin/manager tomonidan
+      // yaratilgan leadlar uchun ishlaydi.
+      assignedAgentId = userId;
+      this.logger.log(`[CLIENTS] O'z-o'ziga tayinlash: Agent ${userId} o'zi mijoz yaratdi | Tenant: ${tenantId}`);
+    } else if (!assignedAgentId) {
       // Strategiyani tekshir
       const tenant = await this.prisma.tenant.findUnique({
         where: { id: tenantId },

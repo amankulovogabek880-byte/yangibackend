@@ -78,7 +78,7 @@ export class ClientsController {
 
   @Post()
   create(@Body() body: any, @CurrentUser() u: any) {
-    return this.svc.create(u.tenantId, u.sub, body);
+    return this.svc.create(u.tenantId, u.sub, body, u.role);
   }
 
   /**
