@@ -976,6 +976,71 @@ export class ClientsService {
   }
 
   /**
+   * v37: Admin/Manager mijozni (leadni) biror agentga tayinlaydi yoki qayta
+   * tayinlaydi. agentId=null — agentdan bo'shatish. `update()` orqali ham
+   * assignedAgentId'ni o'zgartirish mumkin edi, lekin u yerda `assignedAt`
+   * yangilanmaydi, TIMELINE yozuvi qo'shilmaydi va yangi agentga
+   * bildirishnoma yuborilmaydi — shu sabab alohida metod.
+   */
+  async assignAgent(
+    tenantId: string,
+    id: string,
+    userId: string,
+    role: string,
+    agentId: string | null,
+  ) {
+    if (role === 'AGENT') {
+      throw new BadRequestException("Agentlar mijozni boshqa agentga tayinlay olmaydi");
+    }
+
+    const client = await this.prisma.client.findFirst({ where: { id, tenantId } });
+    if (!client) throw new NotFoundException('Mijoz topilmadi');
+
+    let agent: { id: string; name: string } | null = null;
+    if (agentId) {
+      agent = await this.prisma.user.findFirst({
+        where: { id: agentId, tenantId, status: 'ACTIVE' as any },
+        select: { id: true, name: true },
+      });
+      if (!agent) throw new BadRequestException('Agent topilmadi yoki faol emas');
+    }
+
+    const updated = await this.prisma.client.update({
+      where: { id },
+      data: {
+        assignedAgentId: agentId || null,
+        assignedAt: agentId ? new Date() : null,
+      },
+      include: { assignedAgent: { select: { id: true, name: true } } },
+    });
+
+    await this.addTimeline(
+      id,
+      'agent_assigned',
+      agent ? `Agentga tayinlandi: ${agent.name}` : "Agentdan bo'shatildi",
+      undefined,
+      { userId, agentId: agentId || null },
+    );
+
+    // Yangi tayinlangan agentga bildirishnoma (o'zi-o'ziga tayinlamagan bo'lsa)
+    if (agent && agent.id !== userId) {
+      await this.notifications.create({
+        tenantId,
+        userId: agent.id,
+        type: 'LEAD_ASSIGNED',
+        title: '🔥 Sizga mijoz tayinlandi',
+        body: `${client.fullName}${client.phone ? ' • ' + client.phone : ''}`,
+        link: `/clients/${client.id}`,
+        metadata: { clientId: client.id },
+      });
+    }
+
+    void this.cache.invalidateReports(tenantId);
+
+    return updated;
+  }
+
+  /**
    * v5: Open Chat — klient bilan mavjud suhbatni topadi, yo'q bo'lsa yaratadi.
    * Faqat assigned agent va admin ko'ra oladi.
    */

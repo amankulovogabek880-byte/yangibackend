@@ -124,6 +124,19 @@ export class ClientsController {
     return this.svc.setTier(u.tenantId, id, u.sub, u.role, tier);
   }
 
+  /**
+   * v37: Admin/Manager mijozni (leadni) biror agentga tayinlaydi yoki
+   * qayta tayinlaydi. agentId=null yuborilsa — agentdan bo'shatiladi.
+   * Faqat ADMIN/MANAGER chaqira oladi (AGENT o'ziga yoki boshqasiga
+   * mijoz tayinlay olmaydi).
+   */
+  @Patch(':id/assign')
+  @UseGuards(RolesGuard)
+  @Roles('TENANT_ADMIN', 'MANAGER')
+  assignAgent(@Param('id') id: string, @Body('agentId') agentId: string | null, @CurrentUser() u: any) {
+    return this.svc.assignAgent(u.tenantId, id, u.sub, u.role, agentId || null);
+  }
+
   // v14: mijozga ixtiyoriy "key = value" ma'lumotlar (masalan "Qayerga = Istanbul",
   // "Byudjet = 7890"). Server-side merge — offers/travelInfo yo'qolmaydi.
   @Patch(':id/custom-fields')
