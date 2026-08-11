@@ -71,6 +71,26 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// XOTIRA SIZISHI TUZATILDI (v46): `verifyCode()`/`verify2FA()` muvaffaqiyatli
+// login'dan so'ng `activeSessions.set(account.id, client)` deb YANGI client'ni
+// to'g'ridan-to'g'ri yozib qo'yardi — agar shu account.id uchun Map'da
+// ALLAQACHON (masalan avvalgi seans, yoki server qayta ishga tushganda
+// onModuleInit orqali tiklangan) ULANGAN eski client bo'lsa, o'sha eski
+// client hech qachon `disconnect()` qilinmasdan xotirada (o'z soketi,
+// GramJS timer/listenerlari bilan) ABADIY qolardi. Agent Telegram
+// akkauntini bir necha marta qayta ulasa (yoki kodni ikki marta yuborsa),
+// har safar YANGI "zombi" ulanish qo'shilib borar, natijada RAM asta-sekin
+// to'lib, server (Render) xotira limitiga urilib qayta ishga tushardi
+// ("uxlab qolgandek" ko'rinardi). Yechim — restoreSession()/disconnect()da
+// allaqachon qo'llanilgan naqsh: yangisini yozishdan OLDIN eskisini uzamiz.
+function replaceActiveSession(accountId: string, client: TelegramClient) {
+  const prev = activeSessions.get(accountId);
+  if (prev && prev !== client) {
+    prev.disconnect().catch(() => {});
+  }
+  activeSessions.set(accountId, client);
+}
+
 // v16 FIX: bitta account uchun bir vaqtda faqat BITTA restoreSession() ishlashi
 // kerak. Ilgari bunday himoya yo'q edi — onModuleInit() va 5-daqiqalik
 // healthCheckSessions() bir-biriga tegib qolsa (yoki health-check ikki marta
@@ -209,7 +229,7 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
       });
       await client.connect();
       if (await client.isUserAuthorized()) {
-        activeSessions.set(acc.id, client);
+        replaceActiveSession(acc.id, client);
         this.startListening(client, acc);
         this.logger.log(`Session restored: ${acc.name || acc.phoneNumber}`);
         return client;
@@ -608,7 +628,7 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
         },
       });
 
-      activeSessions.set(account.id, client);
+      replaceActiveSession(account.id, client);
       this.startListening(client, account);
       pendingAuth.delete(key);
 
@@ -675,7 +695,7 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
         },
       });
 
-      activeSessions.set(account.id, client);
+      replaceActiveSession(account.id, client);
       this.startListening(client, account);
       pendingAuth.delete(key);
 
