@@ -792,15 +792,36 @@ export class UserTelegramService implements OnModuleInit, OnModuleDestroy {
               if (cl) { clientId = cl.id; clientAgentId = cl.assignedAgentId; }
             }
 
+            // v: PER_AGENT rejimida — bu account biror agentning ShAXSIY
+            // raqami (acc.userId bor). Klient AYNAN o'sha agentning raqamiga
+            // yozgan, shuning uchun kiruvchi xabar to'g'ridan-to'g'ri o'sha
+            // agentga tegishli bo'lishi kerak — round-robin BUTUNLAY
+            // ARALASHMASLIGI kerak (aks holda klient agent-A ning raqamiga
+            // yozgan bo'lsa ham, xabar tasodifan agent-B'ga yoki hatto
+            // admin'ga tushib qolardi — "agent xabar yozsa/kelsa o'zida
+            // ko'rinmayapti, adminga tushyapti" degan xato aynan shundan).
+            // SHARED rejimida (bitta umumiy company account) bu tekshiruv
+            // ishlamaydi — u yerda avvalgi round-robin xatti-harakati
+            // o'zgarishsiz qoladi.
+            let isPerAgentOwnAccount = false;
+            if (acc.userId) {
+              const tenantForMode = await this.prisma.tenant.findUnique({
+                where: { id: tenantId },
+                select: { settings: true },
+              });
+              const mode = (tenantForMode?.settings as any)?.telegramMode;
+              isPerAgentOwnAccount = mode === 'PER_AGENT';
+            }
+
             // v14 ROUND-ROBIN + IZOLYATSIYA: yangi suhbat kimga biriktiriladi?
-            //  1) Mijoz CRM'da allaqachon biror agentga biriktirilgan bo'lsa —
+            //  1) Mavjud suhbat allaqachon biriktirilgan bo'lsa — o'zgarmaydi.
+            //  2) Mijoz CRM'da allaqachon biror agentga biriktirilgan bo'lsa —
             //     o'sha agentga (mijoz doim bitta agent bilan gaplashadi).
-            //  2) Aks holda round-robin — eng kam bandligi bor agentga.
-            // Ilgari HAR DOIM account egasiga (admin'ga) biriktirilardi, shu
-            // sabab "bitta agent yozgan mijozni boshqasi ko'rmasin" talab
-            // buzilardi va hamma admin'ga tushardi.
+            //  3) PER_AGENT rejimida — bu SHAXSIY raqamning egasiga.
+            //  4) Aks holda round-robin — eng kam bandligi bor agentga.
             const assignAgentId = conv?.assignedAgentId
               || clientAgentId
+              || (isPerAgentOwnAccount ? acc.userId : null)
               || await this.pickAgent(tenantId);
 
             // MUAMMO FIX (dublikat suhbatlar): atomik upsert.
