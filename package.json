@@ -2,7 +2,7 @@
   "name": "omoncrm-backend",
   "version": "4.0.0",
   "engines": {
-    "node": ">=20.0.0",
+    "node": ">=20.0.0"
     
   },
   "description": "TourCRM v4 - Production-grade Multi-Tenant SaaS CRM for Travel Agencies",
