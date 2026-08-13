@@ -237,15 +237,36 @@ export async function pickNextAgent(prisma: any, tenantId: string): Promise<stri
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
+    // v14 PERF FIX: ilgari har bir limit qo'yilgan agent uchun ALOHIDA
+    // `client.count()` so'rovi ketma-ket yuborilardi (N+1) — bu funksiya
+    // HAR BIR yangi lead/client yaratilganda chaqirilgani uchun (Facebook,
+    // Instagram, qo'lda qo'shish) bu eng ko'p ishlaydigan joylardan biri
+    // edi. Endi bitta groupBy so'rovi bilan barcha agentlarning bugungi
+    // lead sonini bir martada olamiz — natija bir xil, so'rovlar soni
+    // "N ta agent" o'rniga har doim 1 taga tushadi.
+    const limitedAgentIds = agents
+      .filter((a: any) => a.dailyLeadLimit && a.dailyLeadLimit > 0)
+      .map((a: any) => a.id);
+
+    let todayCountMap = new Map<string, number>();
+    if (limitedAgentIds.length > 0) {
+      const todayCounts = await prisma.client.groupBy({
+        by: ['assignedAgentId'],
+        where: { assignedAgentId: { in: limitedAgentIds }, createdAt: { gte: today } },
+        _count: { id: true },
+      });
+      todayCountMap = new Map(
+        todayCounts.map((c: any) => [c.assignedAgentId as string, c._count.id as number]),
+      );
+    }
+
     const available: any[] = [];
     for (const agent of agents) {
       if (!agent.dailyLeadLimit || agent.dailyLeadLimit === 0) {
         available.push(agent); // 0 = cheksiz
         continue;
       }
-      const todayCount = await prisma.client.count({
-        where: { assignedAgentId: agent.id, createdAt: { gte: today } },
-      });
+      const todayCount = todayCountMap.get(agent.id) || 0;
       if (todayCount < agent.dailyLeadLimit) {
         available.push(agent);
       }

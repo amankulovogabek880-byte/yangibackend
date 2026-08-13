@@ -1130,10 +1130,29 @@ export class ReportsService {
       monthKeys.push(monthKey(d));
     }
 
+    // v14 PERF FIX: ilgari har bir agent × har bir oy uchun butun
+    // `bookings`/`leads` massivi qayta-qayta `.filter()` qilinardi
+    // (agentlar × oylar × yozuvlar soni ko'payishi bilan sekinlashadi).
+    // Endi bookinglar va leadlar BIR MARTA "agentId|oy" kaliti bo'yicha
+    // guruhlanadi (bitta O(n) o'tish), keyin faqat shu tayyor guruhdan
+    // o'qiladi. Natija (rows, totals) avvalgisi bilan AYNAN bir xil.
+    const bookingsByAgentMonth = new Map<string, typeof bookings>();
+    for (const b of bookings) {
+      const key = `${b.agentId}|${monthKey(b.createdAt)}`;
+      const arr = bookingsByAgentMonth.get(key);
+      if (arr) arr.push(b); else bookingsByAgentMonth.set(key, [b]);
+    }
+    const leadsByAgentMonth = new Map<string, typeof leads>();
+    for (const l of leads) {
+      const key = `${l.assignedAgentId}|${monthKey(l.createdAt)}`;
+      const arr = leadsByAgentMonth.get(key);
+      if (arr) arr.push(l); else leadsByAgentMonth.set(key, [l]);
+    }
+
     const result = agents.map((agent) => {
       const rows = monthKeys.map((mk) => {
-        const bks = bookings.filter((b) => b.agentId === agent.id && monthKey(b.createdAt) === mk);
-        const lds = leads.filter((l) => l.assignedAgentId === agent.id && monthKey(l.createdAt) === mk);
+        const bks = bookingsByAgentMonth.get(`${agent.id}|${mk}`) || [];
+        const lds = leadsByAgentMonth.get(`${agent.id}|${mk}`) || [];
         const revenue = bks.reduce((s, b) => s + (b.totalPrice || 0), 0);
         const profit = bks.reduce((s, b) => s + (b.profit || 0), 0);
         const percent = pickPercent(profit);

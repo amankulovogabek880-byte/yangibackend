@@ -66,20 +66,32 @@ export class LeadScoringService {
     return score;
   }
 
+  // v14 PERF FIX: ilgari HAR BIR client uchun alohida `update()` ketma-ket
+  // yuborilardi (1000 ta client = 1000 ta so'rov). Endi avval barcha
+  // score'lar (DB'siz, sof JS hisoblash) oldindan chiqariladi, so'ng bir
+  // xil score'ga ega client'lar guruhlanib, har bir noyob score uchun
+  // BITTA `updateMany` chaqiriladi. Natija (har bir client.leadScore
+  // qiymati) AYNAN bir xil qoladi — faqat so'rovlar soni kamayadi.
   async recalculateAll(tenantId: string): Promise<{ updated: number }> {
     const clients = await this.prisma.client.findMany({
       where: { tenantId },
       select: { id: true, source: true, phone: true, email: true, country: true, utmCampaign: true, telegramUsername: true, createdAt: true },
     });
 
-    let updated = 0;
+    const idsByScore = new Map<number, string[]>();
     for (const client of clients) {
       const score = await this.calculateScore(client);
-      await this.prisma.client.update({
-        where: { id: client.id },
+      if (!idsByScore.has(score)) idsByScore.set(score, []);
+      idsByScore.get(score)!.push(client.id);
+    }
+
+    let updated = 0;
+    for (const [score, ids] of idsByScore.entries()) {
+      const res = await this.prisma.client.updateMany({
+        where: { id: { in: ids } },
         data: { leadScore: score },
       });
-      updated++;
+      updated += res.count;
     }
 
     return { updated };
