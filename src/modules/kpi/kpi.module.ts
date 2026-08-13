@@ -77,7 +77,12 @@ export class KpiService {
     return sorted;
   }
 
-  calculateCommission(revenue: number, tiers: any[]): { percent: number; amount: number } {
+  // v13 FIX: Komissiya DAROMADdan (revenue) emas, balki MARKUP/FOYDAdan
+  // (profit = totalPrice - supplierCost) hisoblanadi. Tier oralig'i ham
+  // shu markup miqdoriga qarab tanlanadi (minRevenue/maxRevenue maydon
+  // nomlari eski JSON formatga mos qolishi uchun o'zgartirilmadi, lekin
+  // endi ular "markup oralig'i"ni bildiradi).
+  calculateCommission(markupAmount: number, tiers: any[]): { percent: number; amount: number } {
     if (!Array.isArray(tiers) || tiers.length === 0) {
       return { percent: 0, amount: 0 };
     }
@@ -85,13 +90,13 @@ export class KpiService {
     const sorted = (tiers || []).sort((a: any, b: any) => a.minRevenue - b.minRevenue);
     
     for (const tier of sorted) {
-      const inRange = revenue >= tier.minRevenue && 
-                      (tier.maxRevenue === null || revenue < tier.maxRevenue);
+      const inRange = markupAmount >= tier.minRevenue && 
+                      (tier.maxRevenue === null || markupAmount < tier.maxRevenue);
       
       if (inRange) {
         return {
           percent: tier.commissionPercent,
-          amount: Math.round((revenue * tier.commissionPercent) / 100),
+          amount: Math.round((markupAmount * tier.commissionPercent) / 100),
         };
       }
     }
@@ -100,7 +105,7 @@ export class KpiService {
     const lastTier = sorted[sorted.length - 1];
     return {
       percent: lastTier?.commissionPercent || 0,
-      amount: Math.round((revenue * (lastTier?.commissionPercent || 0)) / 100),
+      amount: Math.round((markupAmount * (lastTier?.commissionPercent || 0)) / 100),
     };
   }
 

@@ -426,9 +426,30 @@ export class BookingsService {
       if (profit > 0 && updated.agentId) {
         const tenant = await this.prisma.tenant.findUnique({
           where: { id: tenantId },
-          select: { agentCommissionPercent: true, managerCommissionPercent: true } as any,
+          select: { agentCommissionPercent: true, managerCommissionPercent: true, kpiTiers: true } as any,
         }) as any;
-        const agentPct = tenant?.agentCommissionPercent || 10;
+        // v13 FIX: avval flat agentCommissionPercent ishlatilardi, KPI
+        // tierlar hisobga olinmasdi. Endi boshqa hisobotlar (mySalary,
+        // agentSalaries) bilan bir xil qoidaga muvofiq — komissiya foizi
+        // shu bookingning markupi (profit) qaysi tierga tushishiga qarab
+        // aniqlanadi, so'ngra o'sha markupdan olinadi.
+        let agentPct = tenant?.agentCommissionPercent || 10;
+        try {
+          const kpiTiers = Array.isArray(tenant?.kpiTiers)
+            ? tenant.kpiTiers
+            : JSON.parse((tenant?.kpiTiers as string) || '[]');
+          if (Array.isArray(kpiTiers) && kpiTiers.length > 0) {
+            const sorted = [...kpiTiers].sort((a: any, b: any) => a.minRevenue - b.minRevenue);
+            let applied: any = null;
+            for (const tier of sorted) {
+              if (profit >= (tier.minRevenue || 0) && (tier.maxRevenue === null || profit < tier.maxRevenue)) {
+                applied = tier; break;
+              }
+            }
+            if (!applied && sorted.length > 0) applied = sorted[sorted.length - 1];
+            if (applied?.commissionPercent != null) agentPct = applied.commissionPercent;
+          }
+        } catch { /* fall back to flat percent */ }
         const agentAmt = +(profit * agentPct / 100).toFixed(2);
         await this.prisma.commission.upsert({
           where: { bookingId: id },

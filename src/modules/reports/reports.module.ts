@@ -926,11 +926,13 @@ export class ReportsService {
     let kpi = basePercent;
     let appliedTier: string | null = null;
     if (kpiTiers.length > 0) {
+      // v13 FIX: tier daromad (revenue) emas, markup/foyda (profitMonth)
+      // bo'yicha tanlanadi — agent qancha markup qo'ygani asosida.
       const sortedTiers = [...kpiTiers].sort((a: any, b: any) => (a.minRevenue || 0) - (b.minRevenue || 0));
       for (const tier of sortedTiers) {
         if (
-          revenueMonth >= (tier.minRevenue || 0) &&
-          (tier.maxRevenue == null || revenueMonth < tier.maxRevenue)
+          profitMonth >= (tier.minRevenue || 0) &&
+          (tier.maxRevenue == null || profitMonth < tier.maxRevenue)
         ) {
           kpi = tier.commissionPercent || basePercent;
           appliedTier = tier.name || null;
@@ -1020,12 +1022,14 @@ export class ReportsService {
     let appliedTier = null;
     if (kpiTiers.length > 0) {
       // BUG3 FIX: ASC sort (mySalary bilan bir xil)
+      // v13 FIX: tier daromad (revenue) emas, markup/foyda (profit)
+      // bo'yicha tanlanadi.
     const sorted = [...kpiTiers].sort((a: any, b: any) => a.minRevenue - b.minRevenue);
       for (const tier of sorted) {
         // BUG1 FIX: maxRevenue ham tekshiriladi
         if (
-          revenue >= (tier.minRevenue || 0) &&
-          (tier.maxRevenue === null || revenue < tier.maxRevenue)
+          profit >= (tier.minRevenue || 0) &&
+          (tier.maxRevenue === null || profit < tier.maxRevenue)
         ) {
           appliedPercent = tier.commissionPercent || commissionPercent;
           appliedTier = tier.name || null;
@@ -1066,13 +1070,14 @@ export class ReportsService {
       if (!Array.isArray(kpiTiers)) kpiTiers = [];
     } catch { kpiTiers = []; }
 
-    const pickPercent = (revenue: number) => {
+    // v13 FIX: tier daromad (revenue) emas, markup/foyda (profit) bo'yicha tanlanadi.
+    const pickPercent = (markupAmount: number) => {
       let percent = basePercent;
       if (kpiTiers.length > 0) {
         const sorted = [...kpiTiers].sort((a: any, b: any) => a.minRevenue - b.minRevenue);
         let applied: any = null;
         for (const tier of sorted) {
-          if (revenue >= tier.minRevenue && (tier.maxRevenue === null || revenue < tier.maxRevenue)) {
+          if (markupAmount >= tier.minRevenue && (tier.maxRevenue === null || markupAmount < tier.maxRevenue)) {
             applied = tier; break;
           }
         }
@@ -1131,7 +1136,7 @@ export class ReportsService {
         const lds = leads.filter((l) => l.assignedAgentId === agent.id && monthKey(l.createdAt) === mk);
         const revenue = bks.reduce((s, b) => s + (b.totalPrice || 0), 0);
         const profit = bks.reduce((s, b) => s + (b.profit || 0), 0);
-        const percent = pickPercent(revenue);
+        const percent = pickPercent(profit);
         const salary = +(profit * percent / 100).toFixed(2);
         const conversion = lds.length > 0 ? Math.round((bks.length / lds.length) * 100) : 0;
         return {
@@ -1196,7 +1201,10 @@ export class ReportsService {
     const totalProfit = bookings.reduce((s, b) => s + (b.profit || 0), 0);
     const totalRevenue = bookings.reduce((s, b) => s + (b.totalPrice || 0), 0);
     
-    // v9: KPI TIERS - Calculate commission percent based on revenue
+    // v13 FIX: KPI TIERS - komissiya foizi DAROMAD (revenue) emas,
+    // MARKUP/FOYDA (totalProfit = totalPrice - supplierCost) bo'yicha
+    // tanlanadi. Ya'ni agent qancha ustama (markup) qo'ygan bo'lsa,
+    // shunga qarab tier aniqlanadi va o'sha foiz totalProfit'ga qo'llanadi.
     let commissionPercent = Number(tenant?.agentCommissionPercent ?? 10);  
     let appliedTier = null;
     
@@ -1208,13 +1216,13 @@ export class ReportsService {
       if (Array.isArray(kpiTiers) && kpiTiers.length > 0) {
         const sorted = [...kpiTiers].sort((a: any, b: any) => a.minRevenue - b.minRevenue);
         for (const tier of sorted) {
-          if (totalRevenue >= tier.minRevenue && (tier.maxRevenue === null || totalRevenue < tier.maxRevenue)) {
+          if (totalProfit >= tier.minRevenue && (tier.maxRevenue === null || totalProfit < tier.maxRevenue)) {
             commissionPercent = tier.commissionPercent;
             appliedTier = tier;
             break;
           }
         }
-        // If revenue exceeds all tiers, use last tier
+        // Agar markup barcha tierlardan oshsa — oxirgi tier qo'llanadi
         if (!appliedTier && sorted.length > 0) {
           commissionPercent = sorted[sorted.length - 1].commissionPercent;
           appliedTier = sorted[sorted.length - 1];
@@ -1335,11 +1343,12 @@ export class ReportsService {
       const totalProfit  = bStat?._sum?.profit || 0;
 
       // BUG2 FIX: KPI tier foizini aniqlash (ASC sort — BUG3 bilan mos)
+      // v13 FIX: tier daromad (totalRevenue) emas, markup/foyda (totalProfit) bo'yicha tanlanadi.
       let commissionPercent = (tenant as any).agentCommissionPercent || 10;
       if (kpiTiers.length > 0) {
         const sorted = [...kpiTiers].sort((a: any, b: any) => a.minRevenue - b.minRevenue);
         for (const tier of sorted) {
-          if (totalRevenue >= tier.minRevenue && (tier.maxRevenue === null || totalRevenue < tier.maxRevenue)) {
+          if (totalProfit >= tier.minRevenue && (tier.maxRevenue === null || totalProfit < tier.maxRevenue)) {
             commissionPercent = tier.commissionPercent;
             break;
           }
