@@ -52,6 +52,13 @@ const IMPORT_HEADER_ALIASES: Record<string, string[]> = {
   budget: ['byudjet', 'budget', 'бюджет'],
   tags: ['teglar', 'tags', 'метки', 'tegi'],
   agent: ['agent', 'menejer', 'менеджер', 'manager', "mas'ul"],
+  // v34 FIX: "Tier" ustuni ILGARI umuman tanilmasdi — shu sabab import
+  // paytida faylda "Tier"/"Daraja" ustuni bo'lsa ham HECH QACHON
+  // o'qilmasdi (pastga qarang — eski kodda `tier: 'REGULAR'` qattiq
+  // yozib qo'yilgan edi, fayldan qat'i nazar). Bitta account'dan eksport
+  // qilib, boshqasiga import qilganda mijozning VIP/GOLD/SILVER darajasi
+  // shu sabab har doim yo'qolib, "Oddiy"ga tushib qolardi.
+  tier: ['tier', 'daraja', "mijoz darajasi", 'уровень', 'категория', 'level'],
 };
 
 const IMPORT_STAGE_ALIASES: Record<string, string> = {
@@ -80,6 +87,16 @@ const IMPORT_STAGE_ALIASES: Record<string, string> = {
   'sayohatga ketuvchilar': 'CONFIRMED',
   'sayohatdagilar': 'TRAVELING',
   'sayohatdan qaytganlar': 'COMPLETED',
+};
+
+// v34 FIX: fayldagi "Tier" ustunini ENUM qiymatlariga moslashtirish uchun
+// (frontend eksportida emoji bilan keladi, masalan "💎 VIP" — shu sabab
+// oddiy emoji/belgilarni olib tashlab, faqat matnni solishtiramiz).
+const IMPORT_TIER_ALIASES: Record<string, string> = {
+  'oddiy': 'REGULAR', 'regular': 'REGULAR', 'обычный': 'REGULAR',
+  'silver': 'SILVER', 'kumush': 'SILVER', 'серебро': 'SILVER',
+  'gold': 'GOLD', 'oltin': 'GOLD', 'золото': 'GOLD',
+  'vip': 'VIP', 'вип': 'VIP',
 };
 
 const IMPORT_SOURCE_ALIASES: Record<string, string> = {
@@ -536,6 +553,24 @@ export class ClientsService {
   }
 
   /**
+   * v34 FIX: fayldagi "Tier" ustunini o'qiydi. Ilgari bu funksiya UMUMAN
+   * yo'q edi va `importLeads()` ichida `tier: 'REGULAR'` qattiq yozib
+   * qo'yilgan edi — fayldan qanday qiymat kelishidan qat'i nazar HAR
+   * DOIM "Oddiy" bo'lib qolardi. Emoji/bo'sh joylarni tozalab, keyin
+   * ENUM kaliti yoki lug'at orqali moslashtiradi; topilmasa xavfsiz
+   * standart — 'REGULAR'.
+   */
+  private importResolveTier(raw: string): string {
+    if (!raw) return 'REGULAR';
+    // Emoji va harf/raqam bo'lmagan belgilarni olib tashlaymiz (masalan "💎 VIP" → "VIP")
+    const cleaned = raw.replace(/[^\p{L}\p{N}\s]/gu, '').trim();
+    const norm = this.importNormText(cleaned);
+    const upper = cleaned.toUpperCase();
+    if ((TIERS as string[]).includes(upper)) return upper;
+    return IMPORT_TIER_ALIASES[norm] || 'REGULAR';
+  }
+
+  /**
    * Faylda ko'rsatilgan bosqich (stage) matnini topadi:
    * 1) enum kaliti (masalan "CONTACTED")
    * 2) standart o'zbekcha nomlar lug'ati
@@ -578,6 +613,17 @@ export class ClientsService {
     }
     const MAX_ROWS = 10000;
     const ext = (file.originalname || '').split('.').pop()?.toLowerCase();
+
+    // v34 FIX: agar odam PDF/rasm/Word kabi mos kelmaydigan fayl tanlasa,
+    // ilgari umumiy "faylni oqib bolmadi" xatosi chiqardi — sabab
+    // tushunarsiz edi. Endi aniq: "PDF/rasm emas, .xlsx yoki .csv kerak".
+    if (ext && !['xlsx', 'xls', 'csv'].includes(ext)) {
+      throw new BadRequestException(
+        `".${ext}" formatini import qilib bo'lmaydi — faqat .xlsx yoki .csv fayl yuklang. ` +
+        `Agar boshqa account'dan "Yuklab olish" orqali eksport qilgan bo'lsangiz, ` +
+        `pasaytiruvchi ro'yxatdan albatta "Excel (.xlsx)" (yoki CSV) formatini tanlang — "PDF" import uchun yaroqsiz.`,
+      );
+    }
 
     // 1) Faylni o'qish (.xlsx yoki .csv)
     const ExcelJS = await import('exceljs');
@@ -759,7 +805,10 @@ export class ClientsService {
         country: get('country') || null,
         notes: get('notes') || null,
         source: this.importResolveSource(get('source')),
-        tier: 'REGULAR',
+        // v34 FIX: ilgari bu yerda `tier: 'REGULAR'` qattiq yozilgan edi —
+        // fayldagi "Tier" ustuni (VIP/GOLD/SILVER) HECH QACHON o'qilmasdi.
+        // Endi fayldan o'qiladi, topilmasa xavfsiz standart 'REGULAR'.
+        tier: this.importResolveTier(get('tier')) as any,
         language: 'UZ',
         tags,
         assignedAgentId,
