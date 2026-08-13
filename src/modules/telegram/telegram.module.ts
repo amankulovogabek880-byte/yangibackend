@@ -24,6 +24,25 @@ import { PollLockService } from '../../common/utils/poll-lock.service';
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger('Telegram');
   private bots = new Map<string, TelegramBot>();
+  // v20 FIX (XOTIRA/CPU SIZISHI — ASOSIY SABAB): `startBot()` bir nechta
+  // manbadan (onModuleInit, polling_error qayta urinishi, qulf-kutish
+  // setTimeout'i) BIR-BIRINI KUTMASDAN parallel chaqirilishi mumkin edi.
+  // Agar ikkinchi chaqiruv birinchisi hali `await tempBot.deleteWebhook()`
+  // yoki tarmoq so'rovida turganida boshlanib qolsa — ikkalasi ham
+  // `this.bots.get(accountId)`da hali HECH NARSA topmaydi (chunki
+  // birinchisi hali `this.bots.set()`ga yetib bormagan) va ikkalasi ham
+  // YANGI `TelegramBot({polling:true})` yaratadi. Oxirida Map'da faqat
+  // BITTASI qoladi (kim oxirgi bo'lib `set()` qilsa) — qolgan(lar)i esa
+  // hech kim tomonidan `stopPolling()` qilinmagan holda XOTIRADA ABADIY
+  // pollashda qolib ketadi ("orfan" bot). Har bir redeploy/tarmoq
+  // uzilishi/409 xatosi shunday orfan botlar sonini oshirib boradi —
+  // aynan sekin-asta ko'tarilib boruvchi RAM va tizim sekinlashishining
+  // (bir nechta bot bitta xabarni parallel qayta ishlashi) sababi shu edi.
+  // YECHIM: berilgan accountId uchun bir vaqtda FAQAT bitta `startBot()`
+  // ishga tushishi mumkin — qolgan chaqiruvlar xavfsiz o'tkazib yuboriladi
+  // (chunki ularning barchasi allaqachon o'z-o'zini qayta chaqiruvchi
+  // retry/backoff mexanizmiga ega).
+  private startingBots = new Set<string>();
   // v18: qulf band bo'lgani haqidagi ogohlantirishni throttle qilamiz
   // (aks holda har 20s'da bir marta log to'lib ketardi)
   private lockWaitWarned = new Map<string, number>();
@@ -87,6 +106,20 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async startBot(accountId: string, tenantId: string, token: string) {
+    // v20 FIX: qayta-kirish (re-entrancy) himoyasi — yuqoridagi izohga qarang.
+    if (this.startingBots.has(accountId)) {
+      this.logger.log(`Bot ${accountId}: startBot() allaqachon jarayonda — takroriy chaqiruv o'tkazib yuborildi (orfan bot yaratilmasin uchun)`);
+      return;
+    }
+    this.startingBots.add(accountId);
+    try {
+      await this.startBotInner(accountId, tenantId, token);
+    } finally {
+      this.startingBots.delete(accountId);
+    }
+  }
+
+  private async startBotInner(accountId: string, tenantId: string, token: string) {
     const existing = this.bots.get(accountId);
     if (existing) {
       try { await existing.stopPolling(); } catch {}

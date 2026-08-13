@@ -124,6 +124,16 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger('JarvisBot');
   // tenantId → aktiv TelegramBot instansi (har biri FAQAT o'z tenantId'sini biladi)
   private bots = new Map<string, TelegramBot>();
+  // v20 FIX (XOTIRA/CPU SIZISHI — ASOSIY SABAB, telegram.module.ts'dagi
+  // bilan bir xil muammo): `startBot()` bir nechta manbadan (onModuleInit,
+  // polling_error qayta urinishi, qulf-kutish setTimeout'i) bir-birini
+  // KUTMASDAN parallel chaqirilishi mumkin edi — natijada ba'zan IKKITA
+  // TelegramBot(polling:true) bir vaqtda yaratilib, faqat BITTASI
+  // `this.bots` Map'ida qolardi, ikkinchisi esa hech qachon
+  // `stopPolling()` qilinmagan holda xotirada abadiy pollashda qolib
+  // ketardi ("orfan" bot — doimiy ulanish + xotira + CPU). Endi berilgan
+  // tenantId uchun bir vaqtda FAQAT bitta `startBot()` ishlaydi.
+  private startingBots = new Set<string>();
   // tenantId → JarvisBot.id (tezkor qidiruv uchun)
   private botIds = new Map<string, string>();
   // v46 FIX: telegram.module.ts'dagi bilan bir xil bag — bu yerda ham
@@ -174,6 +184,20 @@ export class JarvisBotService implements OnModuleInit, OnModuleDestroy {
   // ─── BOT HAYOT SIKLI ────────────────────────────────────────────
 
   private async startBot(tenantId: string, botId: string, token: string) {
+    // v20 FIX: qayta-kirish (re-entrancy) himoyasi — yuqoridagi izohga qarang.
+    if (this.startingBots.has(tenantId)) {
+      this.logger.log(`Jarvis bot ${tenantId}: startBot() allaqachon jarayonda — takroriy chaqiruv o'tkazib yuborildi (orfan bot yaratilmasin uchun)`);
+      return;
+    }
+    this.startingBots.add(tenantId);
+    try {
+      await this.startBotInner(tenantId, botId, token);
+    } finally {
+      this.startingBots.delete(tenantId);
+    }
+  }
+
+  private async startBotInner(tenantId: string, botId: string, token: string) {
     const existing = this.bots.get(tenantId);
     if (existing) {
       try { await existing.stopPolling(); } catch {}
