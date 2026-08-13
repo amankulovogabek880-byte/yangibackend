@@ -39,7 +39,16 @@ const LANGUAGES: Language[] = ['UZ', 'RU', 'EN'];
 // (o'zbekcha/ruscha/inglizcha) — shuning uchun sinonimlar lug'ati orqali
 // moslashtiriladi.
 const IMPORT_HEADER_ALIASES: Record<string, string[]> = {
-  fullName: ["to'liq ism", 'toliq ism', 'ism', 'f.i.o', 'fio', 'name', 'full name', 'client', 'имя', 'фио', 'клиент', 'mijoz', 'mijoz ismi'],
+  // v41 FIX: "Mijozlar" sahifasidagi CSV eksport ustun nomi "F.I.SH."
+  // (Familiya-Ism-Sharif) — bu yerda ilgari "fish"/"f.i.sh" umuman
+  // yo'q edi. Natijada: bitta account'dan CSV eksport qilib, boshqa
+  // account'ga import qilmoqchi bo'lganda "Ism ustuni topilmadi" xatosi
+  // chiqardi (chunki "FISH" so'zi "fio"/"f.i.o" ichida uchramaydi).
+  // Endi "fish"/"f.i.sh" ham tanilgan sinonim.
+  fullName: [
+    "to'liq ism", 'toliq ism', 'ism', 'f.i.o', 'fio', 'f.i.sh', 'fish', "f.i.sh.",
+    'name', 'full name', 'client', 'имя', 'фио', 'клиент', 'mijoz', 'mijoz ismi',
+  ],
   phone: ['telefon', 'telefon raqami', 'tel', 'raqam', 'phone', 'phone number', 'телефон', 'номер'],
   phone2: ['telefon2', "qo'shimcha telefon", 'qoshimcha telefon', 'phone2', 'телефон2'],
   email: ['email', 'e-mail', 'почта'],
@@ -1376,7 +1385,12 @@ export class ClientsService {
 
     const clients = await this.prisma.client.findMany({
       where,
-      include: { assignedAgent: { select: { name: true } } },
+      // v41 FIX: customStage ilgari include qilinmagan edi — shu sabab
+      // maxsus (Kanban) bosqichdagi mijozlar eksportda har doim xom
+      // "NEW_LEAD" bo'lib chiqardi (chunki pipelineStage import paytida
+      // NEW_LEAD'da qoldiriladi, haqiqiy bosqich nomi customStageId orqali
+      // saqlanadi — pastga qarang: importResolveKnownStage izohi).
+      include: { assignedAgent: { select: { name: true } }, customStage: { select: { name: true } } },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -1388,7 +1402,9 @@ export class ClientsService {
         c.phone || '',
         c.email || '',
         c.source || '',
-        c.pipelineStage || '',
+        // v41 FIX: maxsus bosqich mavjud bo'lsa — uning haqiqiy nomi
+        // (masalan "Meeting(office/zoom)"), aks holda standart enum.
+        ((c as any).customStage?.name || c.pipelineStage || '').toString().replace(/,/g, ';'),
         c.tier || '',
         c.country || '',
         (c.assignedAgent?.name || '').replace(/,/g, ';'),

@@ -1807,14 +1807,33 @@ export class ReportsService {
         b.createdAt.toLocaleDateString('uz-UZ'), b.totalPrice, b.profit || 0, b.status, b.agent?.name,
       ]);
     } else if (type === 'clients') {
+      // v41 FIX: ilgari BU YERDA ikkita muammo bor edi:
+      //  1) `createdAt: { gte: fromDate, lte: toDate }` — from/to berilmasa
+      //     standart oxirgi 1 oy bilan chegaralanardi, shu sabab eski
+      //     mijozlar "hammasi"ni yuklab olishda tushib qolardi.
+      //  2) `take: 1000` — 1000 dan ortiq mijozi bor tenant'lar uchun
+      //     qolganlari kesilib qolardi.
+      //  3) faqat `c.pipelineStage` (xom ENUM) chiqarilardi — maxsus
+      //     (Kanban) bosqichdagi mijozlar har doim "NEW_LEAD" bo'lib
+      //     ko'rinardi, chunki haqiqiy bosqich nomi customStageId orqali
+      //     saqlanadi (pipelineStage import paytida ataylab NEW_LEAD'da
+      //     qoldiriladi — clients.service.ts izohiga qarang).
+      // Endi: mijozlar uchun sana oralig'i FAQAT foydalanuvchi aniq
+      // from/to bergandagina qo'llanadi (masalan hisobot ekranida oy
+      // tanlansa); "Mijozlar" turini standart holida yuklab olishda —
+      // hammasi (10 000 tagacha) tushadi. Bosqich ustuni ham avval
+      // customStage nomini, topilmasa pipelineStage enumini ko'rsatadi.
+      const clientsWhere: any = { tenantId };
+      if (from || to) clientsWhere.createdAt = { gte: fromDate, lte: toDate };
       const items = await this.prisma.client.findMany({
-        where: { tenantId, createdAt: { gte: fromDate, lte: toDate } },
-        include: { assignedAgent: { select: { name: true } } },
-        orderBy: { createdAt: 'desc' }, take: 1000,
+        where: clientsWhere,
+        include: { assignedAgent: { select: { name: true } }, customStage: { select: { name: true } } },
+        orderBy: { createdAt: 'desc' }, take: 10000,
       });
       headers = ['#', 'Ism', 'Telefon', 'Email', 'Manba', 'Stage', 'Tier', 'Agent', 'Sana'];
       rows = items.map((c, i) => [
-        i+1, (c as any).fullName, c.phone, c.email, c.source, c.pipelineStage, c.tier,
+        i+1, (c as any).fullName, c.phone, c.email, c.source,
+        (c as any).customStage?.name || c.pipelineStage, c.tier,
         (c as any).assignedAgent?.name, c.createdAt.toLocaleDateString('uz-UZ'),
       ]);
     } else if (type === 'payments') {
