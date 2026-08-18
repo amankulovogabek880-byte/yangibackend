@@ -770,14 +770,25 @@ export class FacebookLeadsService {
         if (value === phone || value === email) continue;
         if (PHONE_KEYS.includes(key) || EMAIL_KEYS.includes(key)) continue;
         const parts = key.split('_');
-        const looksLikeName = parts.some(
-          (p) =>
-            p.startsWith('ism') ||
-            p.startsWith('name') ||
-            p === 'fio' ||
-            p === 'имя' ||
-            p === 'фио',
-        );
+        const looksLikeName =
+          parts.some(
+            (p) =>
+              p.startsWith('ism') ||
+              p.startsWith('name') ||
+              p === 'fio' ||
+              p === 'имя' ||
+              p === 'фио',
+          ) ||
+          // TUZATILDI: ba'zi formalarda Meta so'zlar orasiga "_" qo'ymay
+          // kalit yaratadi (masalan "sizningismingiz"), shu sabab yuqoridagi
+          // so'z-boshi tekshiruvi ishlamay qolardi va ism umuman
+          // topilmasdi. Endi butun kalit ichida "ism"/"name" qatnashini
+          // ham tekshiramiz — bu holatda ham ism aniqlanadi.
+          key.includes('ism') ||
+          key.includes('name') ||
+          key.includes('fio') ||
+          key.includes('имя') ||
+          key.includes('фио');
         if (looksLikeName) {
           fullName = value;
           break;
@@ -880,6 +891,7 @@ export class FacebookLeadsService {
         formId: ev.formId,
         adId: ev.adId,
         extraAnswers,
+        fullName,
       });
       return { client };
     }
@@ -923,6 +935,7 @@ export class FacebookLeadsService {
             formId: ev.formId,
             adId: ev.adId,
             extraAnswers,
+            fullName,
           });
           return { client };
         }
@@ -1018,6 +1031,7 @@ export class FacebookLeadsService {
       formId?: string | null;
       adId?: string | null;
       extraAnswers: { label: string; value: string }[];
+      fullName?: string | null;
     },
   ) {
     await this.prisma.clientTimeline
@@ -1043,14 +1057,41 @@ export class FacebookLeadsService {
       })
       .catch(swallow('mijoz tarixi'));
 
-    // "Yo'qotilgan" bosqichda bo'lsa qayta tiklaymiz — bu tayyor sotuv
-    if (existing.pipelineStage === 'LOST') {
+    // TUZATILDI: eski leadlar "Facebook Lead" placeholder nom bilan
+    // yaratilgan bo'lishi mumkin (forma ismni "maxsus savol" sifatida
+    // yuborgan, lekin o'shanda kod uni tanimagan). Endi shu mijoz
+    // qaytadan murojaat qilsa va formada haqiqiy ism kelsa — mijoz
+    // nomini shu yerda yangilaymiz, aks holda u doim "Facebook Lead"
+    // bo'lib qolaveradi.
+    const dataToUpdate: Record<string, any> = {};
+    const isPlaceholderName =
+      !existing.fullName || existing.fullName.trim() === 'Facebook Lead';
+    if (isPlaceholderName && meta.fullName && meta.fullName !== 'Facebook Lead') {
+      dataToUpdate.fullName = meta.fullName;
+    }
+
+    // "Yo'qotilgan" bosqichda bo'lsa qayta tiklaymiz — bu tayyor sotuv.
+    // Xuddi shunday, agar mijoz hali umuman ishlanmagan bo'lsa (nomi
+    // placeholder edi) — voronkani "Yangi lid" bosqichiga qaytaramiz,
+    // shunda u yangi lead sifatida to'g'ri ko'rinadi.
+    if (existing.pipelineStage === 'LOST' || isPlaceholderName) {
+      dataToUpdate.pipelineStage = 'NEW_LEAD';
+      dataToUpdate.pipelineStageAt = new Date();
+    }
+
+    if (Object.keys(dataToUpdate).length > 0) {
       await this.prisma.client
         .update({
           where: { id: existing.id },
-          data: { pipelineStage: 'NEW_LEAD', pipelineStageAt: new Date() },
+          data: dataToUpdate,
         })
         .catch(swallow('yangilash'));
+      if (dataToUpdate.fullName) {
+        existing.fullName = dataToUpdate.fullName;
+      }
+      if (dataToUpdate.pipelineStage) {
+        existing.pipelineStage = dataToUpdate.pipelineStage;
+      }
     }
 
     if (existing.assignedAgentId) {
