@@ -596,13 +596,13 @@ export class FacebookLeadsService {
           if (!claimed?.count) continue; // boshqa instans ulgurdi
 
           try {
-            const client = await this.handleLeadgen(ev);
+            const { client, skipReason } = await this.handleLeadgen(ev);
             await this.db.facebookLeadEvent.update({
               where: { id: ev.id },
               data: {
                 status: client === null ? 'SKIPPED' : 'DONE',
                 clientId: client?.id || null,
-                lastError: null,
+                lastError: client === null ? skipReason || null : null,
                 processedAt: new Date(),
               },
             });
@@ -688,20 +688,71 @@ export class FacebookLeadsService {
     return { fields, formName: json?.form_name || '', rawFieldData };
   }
 
-  /** Metaning standart maydonlarini bizning schema'ga moslaydi. */
+  /**
+   * Metaning standart maydonlarini bizning schema'ga moslaydi.
+   *
+   * TUZATILDI: ilgari faqat qattiq belgilangan kalit so'zlar
+   * (`phone_number`, `phone`, `telefon`...) bo'yicha qidirilardi. Agar
+   * forma "maxsus savol" (custom question) ishlatsa — masalan
+   * "Telefon raqamingizni qoldiring" — Meta bu maydonga savol matnidan
+   * chiqarilgan BUTUNLAY BOSHQA `name` beradi (masalan
+   * `telefon_raqamingizni_qoldiring`) va ro'yxatda topilmagani uchun
+   * telefon/email HECH QACHON aniqlanmasdi — lead "SKIPPED" bo'lib,
+   * mijoz umuman yaratilmasdi. Bu deyarli BARCHA custom-savolli
+   * formalarni buzardi.
+   *
+   * Endi: avval nomga qarab aniq moslikni qidiramiz (tezroq va aniqroq),
+   * topilmasa — barcha maydon qiymatlarini ko'rib chiqib, qiymat
+   * o'zi telefon yoki emailga o'xshasa (raqamlar soni yoki @ belgisi
+   * bo'yicha), o'shani ishlatamiz. Shu bilan maydon nomi qanday
+   * bo'lishidan qat'i nazar, mijoz aloqa ma'lumoti yo'qolmaydi.
+   */
   private mapFacebookFields(raw: Record<string, string>) {
     const pick = (...keys: string[]): string | null => {
       for (const k of keys) if (raw[k]) return raw[k];
       return null;
     };
+
+    const PHONE_KEYS = [
+      'phone_number', 'phone', 'mobile_phone', 'mobile', 'tel',
+      'telefon', 'telefon_raqami', 'telefon_raqamingiz', 'raqam',
+      'телефон', 'номер', 'номер_телефона',
+    ];
+    const EMAIL_KEYS = ['email', 'work_email', 'e_mail', 'pochta', 'почта'];
+
+    const looksLikeEmail = (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim());
+    const looksLikePhone = (v: string) => {
+      const digits = v.replace(/[^\d]/g, '');
+      return digits.length >= 7 && digits.length <= 15;
+    };
+
+    let phone = pick(...PHONE_KEYS);
+    let email = pick(...EMAIL_KEYS);
+
+    // ── Zaxira: nom bo'yicha topilmasa, qiymat naqshiga qarab qidiramiz ──
+    if (!phone || !email) {
+      for (const [key, value] of Object.entries(raw)) {
+        if (!value) continue;
+        if (PHONE_KEYS.includes(key) || EMAIL_KEYS.includes(key)) continue; // allaqachon tekshirilgan
+        if (!email && looksLikeEmail(value)) {
+          email = value;
+          continue;
+        }
+        if (!phone && looksLikePhone(value)) {
+          phone = value;
+        }
+      }
+    }
+
     const fullName =
       pick('full_name', 'name', 'ism', 'имя') ||
       [pick('first_name'), pick('last_name')].filter(Boolean).join(' ').trim() ||
       null;
+
     return {
       fullName: fullName || 'Facebook Lead',
-      phone: pick('phone_number', 'phone', 'telefon', 'телефон'),
-      email: pick('email', 'work_email', 'pochta'),
+      phone,
+      email,
       city: pick('city', 'shahar', 'город'),
     };
   }
@@ -735,9 +786,12 @@ export class FacebookLeadsService {
 
   /**
    * Bitta navbat yozuvini to'liq qayta ishlaydi.
-   * @returns yaratilgan/topilgan mijoz, yoki `null` (o'tkazib yuborildi)
+   * @returns `{ client, skipReason }` — client `null` bo'lsa, `skipReason`
+   *   nima uchun o'tkazib yuborilganini tushuntiradi (admin UI'da ko'rinadi).
    */
-  private async handleLeadgen(ev: any): Promise<any | null> {
+  private async handleLeadgen(
+    ev: any,
+  ): Promise<{ client: any | null; skipReason?: string }> {
     const tenantId: string = ev.tenantId;
     const leadgenId: string = ev.leadgenId;
 
@@ -758,10 +812,16 @@ export class FacebookLeadsService {
     const extraAnswers = this.extractExtraAnswers(rawFieldData);
 
     if (!phone && !email) {
-      this.logger.warn(
-        `Facebook lead ${leadgenId}: na telefon, na email topilmadi — o'tkazib yuborildi`,
-      );
-      return null;
+      // Admin buni "Xato bo'lgan leadlar" bo'limida ko'radi — qaysi
+      // maydon nomlari kelgani ko'rsatilsa, forma savollarini nomlash
+      // muammosini tezda topish mumkin bo'ladi.
+      const fieldNames = Object.keys(raw).join(', ') || '(bo\'sh)';
+      const skipReason =
+        `Formada telefon yoki email topilmadi. Kelgan maydonlar: ${fieldNames}. ` +
+        `Agar mijoz telefon raqamini yozgan bo'lsa, forma savoli nomi ` +
+        `tanish ro'yxatda yo'q — dasturchi bilan bog'laning.`;
+      this.logger.warn(`Facebook lead ${leadgenId}: ${skipReason}`);
+      return { client: null, skipReason };
     }
 
     const normalizedPhone = normalizePhone(phone);
@@ -778,13 +838,14 @@ export class FacebookLeadsService {
     }
 
     if (existing) {
-      return this.handleReturningClient(tenantId, existing, {
+      const client = await this.handleReturningClient(tenantId, existing, {
         leadgenId,
         formName,
         formId: ev.formId,
         adId: ev.adId,
         extraAnswers,
       });
+      return { client };
     }
 
     // ── Yangi mijoz ──
@@ -820,13 +881,14 @@ export class FacebookLeadsService {
           },
         });
         if (again) {
-          return this.handleReturningClient(tenantId, again, {
+          const client = await this.handleReturningClient(tenantId, again, {
             leadgenId,
             formName,
             formId: ev.formId,
             adId: ev.adId,
             extraAnswers,
           });
+          return { client };
         }
       }
       throw e;
@@ -896,7 +958,7 @@ export class FacebookLeadsService {
     });
 
     this.logger.log(`Yangi Facebook lead: ${client.id} — ${fullName}`);
-    return client;
+    return { client };
   }
 
   private buildTimelineDescription(
