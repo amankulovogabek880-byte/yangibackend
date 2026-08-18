@@ -1426,6 +1426,11 @@ export class FacebookLeadsService {
       'instagram_basic',
       'instagram_manage_messages',
       'pages_messaging',
+      // TUZATILDI: Page Business Manager orqali boshqarilsa va
+      // foydalanuvchiga BM ichida ("Full control") huquq berilgan bo'lsa —
+      // bu ruxsat bo'lmasa `/me/accounts` bunday Page'larni UMUMAN
+      // ko'rsatmaydi (creator bo'lmagan har qanday admin uchun ham).
+      'business_management',
     ].join(',');
 
     const url =
@@ -1441,6 +1446,91 @@ export class FacebookLeadsService {
       `&response_type=code`;
 
     return { nonce, url };
+  }
+
+  /**
+   * FALLBACK: Business Manager orqali Page topish.
+   *
+   * `/me/accounts` foydalanuvchi Page'da to'g'ridan-to'g'ri admin bo'lgan
+   * hollarda ishlaydi. Lekin Page Business Manager orqali boshqarilsa va
+   * foydalanuvchiga faqat BM ichida ("Full control") huquq berilgan bo'lsa —
+   * u Page'ning o'ziga creator/admin sifatida qo'shilmagan, shuning uchun
+   * `/me/accounts` uni ko'rsatmaydi.
+   *
+   * Bu funksiya foydalanuvchining barcha Business'larini (`/me/businesses`)
+   * so'raydi, so'ng har bir Business uchun ham o'zi egalik qiladigan
+   * (`owned_pages`), ham mijoz sifatida ulangan (`client_pages`) Page'larni
+   * yig'adi — creator bo'lmagan, lekin BM orqali to'liq huquq berilgan
+   * HAR QANDAY admin uchun ham ishlaydi.
+   */
+  private async getPagesViaBusinessManager(
+    userToken: string,
+  ): Promise<Array<{ id: string; name: string; access_token: string }>> {
+    try {
+      const bizUrl =
+        `https://graph.facebook.com/${GRAPH_API_VERSION}/me/businesses` +
+        `?fields=id,name` +
+        `&access_token=${encodeURIComponent(userToken)}`;
+      const bizRes = await fetch(bizUrl);
+      const bizJson: any = await bizRes.json().catch(() => ({}));
+      if (!bizRes.ok) {
+        this.logger.warn(
+          "Facebook OAuth /me/businesses xato (business_management ruxsati yo'qmi?): " +
+            JSON.stringify(bizJson),
+        );
+        return [];
+      }
+
+      const businesses: Array<{ id: string; name: string }> = bizJson?.data || [];
+      if (businesses.length === 0) return [];
+
+      // id bo'yicha dedupe — bitta Page bir nechta Business orqali
+      // (masalan, owned + client) ikki marta qaytishi mumkin.
+      const pagesById = new Map<string, { id: string; name: string; access_token: string }>();
+
+      for (const biz of businesses) {
+        for (const edge of ['owned_pages', 'client_pages']) {
+          try {
+            const pUrl =
+              `https://graph.facebook.com/${GRAPH_API_VERSION}/${biz.id}/${edge}` +
+              `?fields=id,name,access_token` +
+              `&access_token=${encodeURIComponent(userToken)}`;
+            const pRes = await fetch(pUrl);
+            const pJson: any = await pRes.json().catch(() => ({}));
+            if (!pRes.ok) {
+              this.logger.warn(
+                `Business Manager ${edge} so'rovi xato (business=${biz.id}): ` +
+                  JSON.stringify(pJson),
+              );
+              continue;
+            }
+            const list: Array<{ id: string; name: string; access_token?: string }> =
+              pJson?.data || [];
+            for (const p of list) {
+              // access_token qaytmasa (masalan, cheklangan Task huquqi) —
+              // bu Page'ni hozircha ulab bo'lmaydi, ro'yxatga qo'shmaymiz.
+              if (p.id && p.access_token) {
+                pagesById.set(p.id, {
+                  id: p.id,
+                  name: p.name,
+                  access_token: p.access_token,
+                });
+              }
+            }
+          } catch (e: any) {
+            this.logger.warn(
+              `Business Manager ${edge} so'rovida tarmoq xatosi (business=${biz.id}): ` +
+                e.message,
+            );
+          }
+        }
+      }
+
+      return Array.from(pagesById.values());
+    } catch (e: any) {
+      this.logger.warn('Facebook OAuth Business Manager fallback xatosi: ' + e.message);
+      return [];
+    }
   }
 
   async handleOAuthCallback(
@@ -1586,8 +1676,32 @@ export class FacebookLeadsService {
         return `${redirectBase}&fb=${fbCode}&fbMsg=${encodeURIComponent(message)}`;
       }
 
-      const pages: Array<{ id: string; name: string; access_token: string }> =
+      let pages: Array<{ id: string; name: string; access_token: string }> =
         pagesJson?.data || [];
+
+      // ── FALLBACK: Business Manager orqali Page qidirish ──
+      //
+      // `/me/accounts` faqat Page'ning o'zida TO'G'RIDAN-TO'G'RI admin
+      // sifatida qo'shilgan foydalanuvchilarni qaytaradi. Agar Page
+      // Business Manager orqali boshqarilsa va foydalanuvchiga huquq
+      // BM ichida ("Full control") berilgan bo'lsa — u Page'ga creator
+      // sifatida qo'shilmagan, shuning uchun ro'yxat bo'sh qaytadi.
+      //
+      // Bu yerda foydalanuvchining barcha Business'larini va ularga
+      // tegishli (o'zi egalik qiladigan + mijoz sifatida ulangan)
+      // Page'larni so'raymiz — creator bo'lmagan, lekin BM orqali
+      // to'liq huquq berilgan HAR QANDAY admin uchun ham ishlaydi.
+      if (pages.length === 0) {
+        this.logger.warn(
+          `Facebook OAuth: /me/accounts bo'sh qaytdi (tenant=${payload.tenantId}), Business Manager orqali qidirilmoqda...`,
+        );
+        pages = await this.getPagesViaBusinessManager(userToken);
+        if (pages.length > 0) {
+          this.logger.log(
+            `Facebook OAuth: Business Manager orqali ${pages.length} ta Page topildi (tenant=${payload.tenantId})`,
+          );
+        }
+      }
 
       if (pages.length === 0) {
         this.logger.warn(
