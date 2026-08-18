@@ -681,7 +681,13 @@ export class FacebookLeadsService {
     const fields: Record<string, string> = {};
     const rawFieldData: any[] = Array.isArray(json?.field_data) ? json.field_data : [];
     for (const f of rawFieldData) {
-      const key = String(f?.name || '').toLowerCase();
+      // Meta savol matnidan `name` chiqarganda ba'zan oxirida "?" qoldiradi
+      // (masalan "ismingiz?"). Buni tozalamasak, "telefon_raqamingiz" yoki
+      // "ism" kabi tanish kalitlar bilan HECH QACHON mos kelmaydi.
+      const key = String(f?.name || '')
+        .toLowerCase()
+        .trim()
+        .replace(/[?？！!:：]+$/g, '');
       const value = Array.isArray(f?.values) ? f.values.join(', ') : f?.values;
       if (key && value) fields[key] = String(value);
     }
@@ -744,10 +750,40 @@ export class FacebookLeadsService {
       }
     }
 
-    const fullName =
-      pick('full_name', 'name', 'ism', 'имя') ||
+    let fullName =
+      pick(
+        'full_name', 'fullname', 'name', 'ism', 'ismingiz', 'ismi',
+        "to'liq_ism", 'toliq_ism', 'fio', 'имя', 'фио',
+      ) ||
       [pick('first_name'), pick('last_name')].filter(Boolean).join(' ').trim() ||
       null;
+
+    // ── Zaxira: forma "maxsus savol" ishlatgan bo'lsa (masalan
+    // "Ismingiz?"), Meta unga tanish ro'yxatda yo'q `name` beradi.
+    // Ism har xil matn bo'lishi mumkin (telefon/emaildagidek raqam/@
+    // naqshi yo'q), shuning uchun qiymatga emas — maydon KALITIGA
+    // qarab qidiramiz: "ism" yoki "name" so'zi bilan boshlanadigan/
+    // tugaydigan har qanday maydon.
+    if (!fullName) {
+      for (const [key, value] of Object.entries(raw)) {
+        if (!value) continue;
+        if (value === phone || value === email) continue;
+        if (PHONE_KEYS.includes(key) || EMAIL_KEYS.includes(key)) continue;
+        const parts = key.split('_');
+        const looksLikeName = parts.some(
+          (p) =>
+            p.startsWith('ism') ||
+            p.startsWith('name') ||
+            p === 'fio' ||
+            p === 'имя' ||
+            p === 'фио',
+        );
+        if (looksLikeName) {
+          fullName = value;
+          break;
+        }
+      }
+    }
 
     return {
       fullName: fullName || 'Facebook Lead',
